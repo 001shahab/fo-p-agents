@@ -102,19 +102,24 @@ if _langdetect is not None:
 # Output schema
 # ===========================================================================
 
-# Appended to the right of the original columns of every source file.
+# Appended to the right of the original columns of every source file. The order is
+# deliberate: the answer comes first, then the evidence behind it, then provenance. A
+# reader opening the file lands on the enriched description in the column immediately
+# after their own data rather than having to hunt for it.
 ENRICHMENT_COLUMNS: Tuple[str, ...] = (
-    "Row_Id",
-    "Row_Type",
-    "Is_Duplicate",
-    "Duplicate_Of",
-    "Source_Description_Raw",
-    "Source_Description_Normalized",
-    "Detected_Language",
-    "Language_Confidence",
+    # The result.
     "Enriched_Purchase_Description",
     "Enriched_Description_Short",
     "Item_Or_Service",
+    "AI_Confidence",
+    "Confidence_Band",
+    # How to read a blank result.
+    "Row_Type",
+    "Detected_Language",
+    # Supporting evidence.
+    "Source_Description_Raw",
+    "Source_Description_Normalized",
+    "Language_Confidence",
     "Translation_Method",
     "Translation_Coverage",
     "Unresolved_Tokens",
@@ -128,11 +133,22 @@ ENRICHMENT_COLUMNS: Tuple[str, ...] = (
     "Match_Method",
     "Match_Score",
     "Enrichment_Method",
-    "AI_Confidence",
-    "Confidence_Band",
+    # Provenance and traceability.
+    "Is_Duplicate",
+    "Duplicate_Of",
+    "Row_Id",
     "Agent_Version",
     "Lexicon_Version",
     "Run_Id",
+)
+
+# Emitted when the caller asks for a narrow deliverable rather than the full audit trail.
+MINIMAL_ENRICHMENT_COLUMNS: Tuple[str, ...] = (
+    "Enriched_Purchase_Description",
+    "Enriched_Description_Short",
+    "Item_Or_Service",
+    "AI_Confidence",
+    "Row_Type",
 )
 
 # Common core of the unified table consumed by Agents 2 to 4.
@@ -212,7 +228,12 @@ class Settings:
     fuzzy_threshold: float = 0.62
     semantic_threshold: float = 0.45
     max_description_words: int = 12
+    minimal_columns: bool = False
     model: ModelConfig = field(default_factory=ModelConfig)
+
+    @property
+    def enrichment_columns(self) -> Tuple[str, ...]:
+        return MINIMAL_ENRICHMENT_COLUMNS if self.minimal_columns else ENRICHMENT_COLUMNS
 
 
 # ===========================================================================
@@ -2519,6 +2540,26 @@ class Agent1:
         )
         return (record.table_key, record.logical.get("document_id", "")) + volatile
 
+    @staticmethod
+    def _restates_line(
+        key: str, amount: Optional[float], line_texts: Sequence[str], line_amounts: set
+    ) -> bool:
+        """Detect a summary row that repeats a line already counted in this document.
+
+        Summary blocks abbreviate the article name, so "PALVELUMAKSU" restates the line
+        "PALVELUMAKSU Kortti- ja latauspalvelu". Matching on the full string alone misses
+        those and counts the same purchase twice, so a repeated amount or a name that
+        prefixes an existing line both qualify.
+        """
+        if amount is not None and round(amount, 2) in line_amounts:
+            return True
+        if not key:
+            return False
+        return any(
+            existing == key or existing.startswith(key + " ") or key.startswith(existing + " ")
+            for existing in line_texts
+        )
+
     def _classify_rows(self) -> None:
         """Separate genuine purchase lines from headers, subtotals and totals.
 
@@ -2535,26 +2576,34 @@ class Agent1:
                 counts[record.row_type] += 1
 
         for group in grouped.values():
-            seen_lines: Dict[Tuple[str, str], LineRecord] = {}
+            line_amounts: set = set()
+            line_texts: List[str] = []
             header_assigned = False
+            total_seen = False
+
             for record in group:
                 text = self._primary_text(record)
+                key = lookup_key(text)
                 amount = parse_amount(record.logical.get("amount"))
-                signature = (lookup_key(text), f"{amount:.2f}" if amount is not None else "")
 
                 if not is_blank(record.logical.get("line_number")):
                     record.row_type = "LINE"
-                    seen_lines.setdefault(signature, record)
                 elif self.lexicon.looks_like_total(text):
                     record.row_type = "TOTAL"
+                    total_seen = True
                 elif not header_assigned:
                     record.row_type = "HEADER"
                     header_assigned = True
-                elif signature in seen_lines:
+                elif total_seen or self._restates_line(key, amount, line_texts, line_amounts):
                     record.row_type = "SUBTOTAL"
                 else:
                     record.row_type = "LINE"
-                    seen_lines.setdefault(signature, record)
+
+                if record.row_type == "LINE":
+                    if amount is not None:
+                        line_amounts.add(round(amount, 2))
+                    if key:
+                        line_texts.append(key)
                 counts[record.row_type] += 1
 
         self.stats["row_types"] = dict(sorted(counts.items()))
@@ -2836,7 +2885,7 @@ class Agent1:
             path = results / f"{AGENT_ID}_{stem}.csv"
             self._write_csv(
                 path,
-                list(table.columns) + list(ENRICHMENT_COLUMNS),
+                list(table.columns) + list(self.settings.enrichment_columns),
                 [
                     {**record.raw, **self._enrichment_row(record)}
                     for record in sorted(records, key=lambda item: item.row_index)
@@ -2851,6 +2900,8 @@ class Agent1:
             key=lambda item: (item.source_key, item.source_file, item.row_index),
         )
 
+        # The unified table is the handoff to Agents 2-4, so it always carries the full
+        # column set; --minimal only narrows the per-source files a human reads.
         unified_path = results / f"{AGENT_ID}_unified_lines.csv"
         self._write_csv(
             unified_path,
@@ -3012,6 +3063,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-words", type=int, default=12, help="Word budget for a generated description"
     )
     parser.add_argument(
+        "--minimal",
+        action="store_true",
+        help="Append only the headline enrichment columns to each source file",
+    )
+    parser.add_argument(
         "--non-interactive", action="store_true", help="Never prompt; use defaults and arguments"
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Show debug logging")
@@ -3119,6 +3175,7 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         fuzzy_threshold=args.fuzzy_threshold,
         semantic_threshold=args.semantic_threshold,
         max_description_words=max(4, args.max_words),
+        minimal_columns=bool(args.minimal),
         model=model,
     )
 

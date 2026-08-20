@@ -107,12 +107,24 @@ Written to `results/`:
 | `agent1_unified_lines.jsonl` | Same rows with the full nested evidence bundle |
 | `agent1_run_manifest.json` | Input hashes, configuration, statistics and vocabulary version |
 
-Key appended columns:
+The appended columns are ordered so the result comes first, then the evidence behind it,
+then provenance. In a per-source file the first five columns after your own data are
+always `Enriched_Purchase_Description`, `Enriched_Description_Short`, `Item_Or_Service`,
+`AI_Confidence` (0-100) and `Confidence_Band`. For `invoice_line_data.xlsx`, whose data
+ends at column O, that puts the enriched description in column P and the short form in
+column Q.
 
-`Enriched_Purchase_Description`, `Enriched_Description_Short`, `Item_Or_Service`,
-`AI_Confidence` (0-100), `Confidence_Band`, `Detected_Language`, `Translation_Method`,
-`Translation_Coverage`, `Unresolved_Tokens`, `Match_Tier`, `Match_Score`,
-`Matched_Source_System`, `Row_Type`, `Is_Duplicate`, `Run_Id`, `Lexicon_Version`.
+`Row_Type` and `Detected_Language` follow, because they explain a blank result: only rows
+typed `LINE` are enriched, so headers, subtotals and totals are deliberately left empty
+rather than described as if they were purchases.
+
+The remaining columns carry the audit trail — `Translation_Method`,
+`Translation_Coverage`, `Unresolved_Tokens`, `Evidence_Sources`, `Match_Tier`,
+`Match_Score`, `Matched_Source_System`, `Is_Duplicate`, `Duplicate_Of`, `Row_Id`,
+`Run_Id` and `Lexicon_Version`.
+
+Pass `--minimal` to append only the five headline columns to the per-source files. The
+unified table always carries the full set, since Agents 2 to 4 depend on it.
 
 ### Configuration
 
