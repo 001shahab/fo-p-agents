@@ -128,6 +128,11 @@ Each backend has its own key, base URL and model name, so both can be configured
 and the switch chooses between them. `BASE_URL` accepts either an API root
 (`https://host/v1`) or a fully qualified endpoint (`https://host/v1/chat/completions`).
 
+Both backends run GPT-5.1 - `gpt-5.1` directly and `azure.gpt-5.1` through the shared
+service - so output is comparable between local development and deployment. Requests are
+issued at temperature 0 for reproducibility; if the model rejects a sampling parameter,
+the agent drops it and reissues the request rather than failing the run.
+
 The language model is **off by default**. The agent produces complete output without it;
 enabling it only improves coverage of phrases the vocabulary cannot resolve.
 

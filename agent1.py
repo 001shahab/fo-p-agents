@@ -65,6 +65,13 @@ LOGGER = logging.getLogger("agent1")
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
 AGENT_ID = "agent1"
 
+# Used when the environment does not name a model explicitly. Both backends run the
+# same generation of model so that output is comparable between local development and
+# the shared service; only the deployment prefix differs.
+DEFAULT_OPENAI_MODEL = "gpt-5.1"
+DEFAULT_AZURE_MODEL = "azure.gpt-5.1"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+
 
 # ===========================================================================
 # Optional dependencies
@@ -263,14 +270,14 @@ def resolve_model_config(env: Dict[str, str], use_llm: bool) -> ModelConfig:
             provider="azure",
             api_key=get("AZURE_OPENAI_API_KEY") or get("OPENAI_API_KEY"),
             base_url=get("AZURE_OPENAI_BASE_URL") or get("BASE_URL"),
-            model=get("AZURE_OPENAI_MODEL") or get("MODEL_NAME"),
+            model=get("AZURE_OPENAI_MODEL") or get("MODEL_NAME") or DEFAULT_AZURE_MODEL,
         )
     else:
         config = ModelConfig(
             provider="openai",
             api_key=get("OPENAI_API_KEY"),
-            base_url=get("OPENAI_BASE_URL") or get("BASE_URL", "https://api.openai.com/v1"),
-            model=get("OPENAI_MODEL") or get("MODEL_NAME", "gpt-4o-mini"),
+            base_url=get("OPENAI_BASE_URL") or get("BASE_URL", DEFAULT_OPENAI_BASE_URL),
+            model=get("OPENAI_MODEL") or get("MODEL_NAME") or DEFAULT_OPENAI_MODEL,
         )
 
     config.batch_size = _safe_int(get("LLM_BATCH_SIZE"), 20)
@@ -1430,7 +1437,14 @@ class LanguageModelClient:
         return answers
 
     def _post(self, payload: Dict[str, Any]) -> Optional[str]:
-        """Issue the request with bounded exponential backoff."""
+        """Issue the request, degrading unsupported parameters and backing off on errors.
+
+        Model generations differ in which sampling parameters they accept: newer models
+        reject an explicit ``temperature`` outright. Rather than fail the run, a rejected
+        parameter is dropped and the request is reissued immediately. Determinism is
+        preserved wherever the parameter is honoured, and the on-disk cache keeps output
+        stable across runs where it is not.
+        """
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.config.api_key}",
@@ -1438,37 +1452,87 @@ class LanguageModelClient:
         if self.config.provider == "azure":
             headers["api-key"] = self.config.api_key
 
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request_payload = dict(payload)
         url = self.config.endpoint()
+        attempt = 0
 
-        for attempt in range(3):
-            try:
-                self.calls += 1
-                raw = self._send(url, headers, body)
-                data = json.loads(raw)
-                return data["choices"][0]["message"]["content"]
-            except Exception as error:  # noqa: BLE001 - any transport error is retryable
-                wait = 2 ** (attempt + 1)
-                if attempt == 2:
-                    LOGGER.warning("Model request failed after 3 attempts: %s", error)
+        while attempt < 3:
+            body = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
+            self.calls += 1
+            status, raw = self._send(url, headers, body)
+
+            if status == 200:
+                try:
+                    data = json.loads(raw)
+                    return data["choices"][0]["message"]["content"]
+                except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+                    LOGGER.warning("Unexpected response shape from the model: %s", error)
                     return None
-                LOGGER.debug("Model request failed (%s); retrying in %ss", error, wait)
-                time.sleep(wait)
+
+            if status == 400 and self._degrade(request_payload, raw):
+                # A parameter was removed; retry at once rather than burning an attempt.
+                continue
+
+            attempt += 1
+            if attempt >= 3 or status in {401, 403, 404}:
+                LOGGER.warning(
+                    "Model request failed (HTTP %s): %s", status, _summarise_error(raw)
+                )
+                return None
+
+            wait = 2**attempt
+            LOGGER.debug("Model request failed (HTTP %s); retrying in %ss", status, wait)
+            time.sleep(wait)
         return None
 
-    def _send(self, url: str, headers: Dict[str, str], body: bytes) -> str:
-        if _requests is not None:
-            response = _requests.post(
-                url, headers=headers, data=body, timeout=self.config.timeout
-            )
-            response.raise_for_status()
-            return response.text
+    # Parameters that may be dropped if the model rejects them, in removal order.
+    _OPTIONAL_PARAMETERS = ("temperature", "response_format", "top_p", "seed")
 
+    def _degrade(self, payload: Dict[str, Any], error_body: str) -> bool:
+        """Remove a parameter the model rejected. True when the request is worth retrying."""
+        message = error_body.lower()
+        if not any(
+            hint in message
+            for hint in ("unsupported", "not supported", "unrecognized", "invalid_request", "does not support")
+        ):
+            return False
+        for parameter in self._OPTIONAL_PARAMETERS:
+            if parameter in payload and parameter in message:
+                payload.pop(parameter)
+                LOGGER.info(
+                    "Model %s rejected '%s'; reissuing the request without it",
+                    self.config.model,
+                    parameter,
+                )
+                return True
+        return False
+
+    def _send(self, url: str, headers: Dict[str, str], body: bytes) -> Tuple[int, str]:
+        """Perform one HTTP request, returning the status code and the raw body.
+
+        Transport failures are reported as status 0 so the caller can treat them as
+        retryable without distinguishing exception types across the two backends.
+        """
+        if _requests is not None:
+            try:
+                response = _requests.post(
+                    url, headers=headers, data=body, timeout=self.config.timeout
+                )
+            except Exception as error:  # noqa: BLE001 - connection and timeout errors
+                return 0, str(error)
+            return response.status_code, response.text
+
+        from urllib import error as urllib_error
         from urllib import request as urllib_request
 
         req = urllib_request.Request(url, data=body, headers=headers, method="POST")
-        with urllib_request.urlopen(req, timeout=self.config.timeout) as response:
-            return response.read().decode("utf-8", errors="replace")
+        try:
+            with urllib_request.urlopen(req, timeout=self.config.timeout) as response:
+                return response.status, response.read().decode("utf-8", errors="replace")
+        except urllib_error.HTTPError as error:
+            return error.code, error.read().decode("utf-8", errors="replace")
+        except Exception as error:  # noqa: BLE001 - connection and timeout errors
+            return 0, str(error)
 
     def close(self) -> None:
         """Persist the cache so a repeated run makes no further requests."""
@@ -1479,6 +1543,21 @@ class LanguageModelClient:
             json.dumps(self._cache, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+
+
+def _summarise_error(body: str) -> str:
+    """Reduce an API error body to its message, falling back to a truncated payload."""
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return normalise_text(body)[:300]
+    if isinstance(parsed, dict):
+        error = parsed.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return normalise_text(str(error["message"]))[:300]
+        if isinstance(error, str):
+            return normalise_text(error)[:300]
+    return normalise_text(body)[:300]
 
 
 def _extract_json_object(content: str) -> Dict[str, Any]:
