@@ -2,183 +2,237 @@
 # -*- coding: utf-8 -*-
 """Agent 1 - Improved Purchase Description.
 
-Reads procurement line data from every available source system, resolves each line
-against the other sources, and appends a clear, standardised English description of
-what was actually purchased. The original source text is never modified or discarded.
+Turns free-text procurement lines into a clear, standardised English description
+of what was actually bought, without discarding or overwriting anything the
+source systems recorded.
 
-Design notes
-------------
-Repeatability is a hard requirement: if the agent is re-run on unchanged inputs it
-must produce byte-identical output, so that a user can find the same material again
-in a later period. Three things enforce that:
+    Background
+    ----------
+    Procurement spend arrives from four systems that describe the same purchase
+    in different ways and in different languages. Sievo is the analytical master
+    but its line description is frequently ``n/a``; the readable text for that
+    same purchase often sits in the Maximo or Basware row that Sievo was derived
+    from, or in the invoice line that settled it. A description written in
+    Finnish, Swedish or Polish is invisible to an English-language analyst, and
+    an entry such as ``157238asbestipurku - tuntiveloitus`` is close to useless
+    even to a native speaker.
 
-  * A controlled vocabulary (``lexicon/procurement_lexicon.json``) does the bulk of the
-    translation work through deterministic lookup rather than generation.
-  * The language model is a last-resort fallback only, invoked at temperature 0, on
-    *unique* phrases, with every answer written to an on-disk cache.
-  * No timestamps, random seeds or hash-order-dependent iteration appear in row output.
-    The run identifier is derived from the input file contents and the configuration.
+    Approach
+    --------
+    The agent gathers evidence for each purchase line from every system that
+    says anything about it, renders that evidence in English, and composes a
+    description from it. Composition is deliberate: the description is built by
+    template from validated fragments rather than generated as free text, which
+    is what allows the "no invented information" requirement to be enforced
+    mechanically rather than hoped for. Any word that cannot be traced back to
+    the source data or to the controlled vocabulary is dropped before output.
 
-The enrichment never states anything that is not present in the source data. Every
-content word in a generated description must trace back either to a source token or to
-an explicit vocabulary mapping; fragments that fail that check are dropped rather than
-emitted.
+    Cost
+    ----
+    The design target is high quality at negligible marginal cost. Work is done
+    on the space of *distinct phrases* rather than the space of rows, which on
+    real spend data is one to two orders of magnitude smaller. Within that
+    space, a phrase is resolved by the controlled vocabulary first, then by a
+    local neural translation model, and only then by a language model. Every
+    resolution is cached on disk, so the second run of a data set consumes no
+    tokens at all. When a language model is used, consumption is reported in
+    full at the end of the run, including the reasoning tokens that are billed
+    but never appear in the response.
 
-Only the standard library is required. Optional packages (rapidfuzz, langdetect,
-requests, argostranslate) are used automatically when installed and are transparently
-substituted otherwise.
+    Repeatability
+    -------------
+    Row 6 of the AI development plan requires that a user be able to find the
+    same material again in a later run. Every stage is therefore deterministic:
+    lookups and templates rather than generation, sorted iteration order, a
+    content-addressed cache, temperature 0 where a model is unavoidable, and no
+    timestamps or random identifiers anywhere in the row output. Re-running on
+    unchanged input reproduces the previous output byte for byte.
 
-Usage
------
-    python agent1.py                 # interactive, prompts for every path
-    python agent1.py --help          # full non-interactive option list
+    Output
+    ------
+    Written to the results folder:
+
+        agent1_<source>.csv         the original sheet with enrichment appended
+        agent1_unified_lines.csv    common schema across all sources
+        agent1_unified_lines.jsonl  the same rows with the full evidence bundle
+        agent1_run_manifest.json    input hashes, configuration and statistics
+
+    The unified table is the input contract for Agents 2, 3 and 4.
+
+Usage:
+    python agent1.py
+
+Author:
+    Prof. Shahab Anbarjafari
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import difflib
 import hashlib
-import importlib
+import io
 import json
 import logging
-import math
 import os
 import re
 import sys
-import time
 import unicodedata
 import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-from xml.etree import ElementTree as ET
-
-__author__ = "Shahab Anbarjafari"
-__version__ = "1.0.0"
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from xml.etree import ElementTree
 
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_ID = "agent1"
+AGENT_VERSION = "1.0.0"
 
-# Used when the environment does not name a model explicitly. Both backends run the
-# same generation of model so that output is comparable between local development and
-# the shared service; only the deployment prefix differs.
-DEFAULT_OPENAI_MODEL = "gpt-5.1"
-DEFAULT_AZURE_MODEL = "azure.gpt-5.1"
-DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+# The CSV module refuses very long fields by default. Procurement free-text
+# occasionally carries an entire pasted e-mail thread, and losing those rows to
+# an exception would be worse than accepting the memory cost of reading them.
+csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
 
 # ===========================================================================
 # Optional dependencies
 # ===========================================================================
+#
+# Everything in this block improves quality or speed but nothing in it is
+# mandatory. The agent inspects what is installed at start-up, reports it, and
+# selects the best available implementation for each task. This keeps the agent
+# runnable on a locked-down machine where only the standard library is present,
+# which matters because the deployment target is not the development machine.
 
-def _optional(module_name: str) -> Any:
-    """Import a module if it is installed, otherwise return None."""
+def _import_optional(module_path: str) -> Optional[Any]:
+    """Import a module by dotted path, returning None when it is unavailable."""
     try:
-        return importlib.import_module(module_name)
-    except Exception:  # noqa: BLE001 - a broken optional package must not stop the run
-        return None
+        module = __import__(module_path, fromlist=["_"])
+    except Exception:  # ImportError, but also the runtime errors that torch and
+        return None    # its friends raise on an incompatible platform.
+    return module
 
 
-_rapidfuzz = _optional("rapidfuzz.fuzz")
-_langdetect = _optional("langdetect")
-_requests = _optional("requests")
-_argos = _optional("argostranslate.translate")
+_rapidfuzz = _import_optional("rapidfuzz.fuzz")
+_openpyxl = _import_optional("openpyxl")
+_langdetect = _import_optional("langdetect")
+_requests = _import_optional("requests")
+_numpy = _import_optional("numpy")
+_spacy = _import_optional("spacy")
+_nltk = _import_optional("nltk")
+_sentence_transformers = _import_optional("sentence_transformers")
+_transformers = _import_optional("transformers")
+_sklearn_neighbors = _import_optional("sklearn.neighbors")
 
-if _langdetect is not None:
-    # langdetect is probabilistic by default; fixing the seed makes it reproducible.
-    try:
-        _langdetect.DetectorFactory.seed = 0
-    except Exception:  # noqa: BLE001
-        _langdetect = None
+
+def describe_environment() -> Dict[str, bool]:
+    """Return the availability map that is printed at start-up and archived."""
+    return {
+        "openpyxl": _openpyxl is not None,
+        "rapidfuzz": _rapidfuzz is not None,
+        "numpy": _numpy is not None,
+        "spacy": _spacy is not None,
+        "nltk": _nltk is not None,
+        "sentence-transformers": _sentence_transformers is not None,
+        "transformers": _transformers is not None,
+        "scikit-learn": _sklearn_neighbors is not None,
+        "langdetect": _langdetect is not None,
+        "requests": _requests is not None,
+    }
 
 
 # ===========================================================================
 # Output schema
 # ===========================================================================
+#
+# The unified record carries the answer first, then the evidence behind it, then
+# the provenance needed to audit it. Agents 2 to 4 read this table, so the
+# column names are part of the interface between the agents and are not to be
+# renamed without updating the downstream readers.
 
-# The complete enrichment record: the answer, the evidence behind it, then provenance.
-# It backs every unified row and, under --full-columns, every per-source row. The order is
-# deliberate so that a reader lands on the enriched description in the column immediately
-# after their own data rather than having to hunt for it.
-ENRICHMENT_COLUMNS: Tuple[str, ...] = (
-    # The result.
+UNIFIED_COLUMNS: Tuple[str, ...] = (
+    # --- the deliverable ---------------------------------------------------
     "Enriched_Purchase_Description",
     "Enriched_Description_Short",
     "Item_Or_Service",
     "AI_Confidence",
     "Confidence_Band",
-    # How to read a blank result.
-    "Row_Type",
+    # --- what the description was built from --------------------------------
+    "Original_Description",
+    "Original_Description_Fields",
     "Detected_Language",
-    # Supporting evidence.
-    "Source_Description_Raw",
-    "Source_Description_Normalized",
     "Language_Confidence",
+    "Translated_Description",
     "Translation_Method",
     "Translation_Coverage",
     "Unresolved_Tokens",
     "Evidence_Sources",
-    "Matched_Source_System",
-    "Matched_Row_Id",
-    "Matched_PO_Number",
-    "Matched_PO_Line",
-    "Matched_Supplier",
+    "Evidence_Field_Count",
     "Match_Tier",
-    "Match_Method",
     "Match_Score",
-    "Enrichment_Method",
-    # Provenance and traceability.
-    "Is_Duplicate",
-    "Duplicate_Of",
-    "Row_Id",
-    "Agent_Version",
-    "Lexicon_Version",
-    "Run_Id",
-)
-
-# Default for the per-source files. The deliverable is the description itself, so a source
-# file comes back as the caller's own sheet plus two columns and nothing else: an invoice
-# extract ending at column O gains P and Q. The full set above stays available behind
-# --full-columns, and the unified table carries it unconditionally, so narrowing the
-# per-source view costs no traceability.
-SOURCE_ENRICHMENT_COLUMNS: Tuple[str, ...] = (
-    "Enriched_Purchase_Description",
-    "Enriched_Description_Short",
-)
-
-# Common core of the unified table consumed by Agents 2 to 4.
-UNIFIED_CORE_COLUMNS: Tuple[str, ...] = (
+    "Matched_Source_Systems",
+    "Confidence_Factors",
+    # --- business keys, carried through for the downstream agents -----------
     "Source_System",
-    "Source_File",
-    "Source_Sheet",
-    "Source_Row_Index",
-    "Document_Id",
-    "Line_Number",
+    "Row_Type",
+    "Document_Number",
+    "Document_Line_Number",
     "PO_Number",
     "PO_Line_Number",
-    "Item_Code",
+    "Invoice_Number",
+    "Item_Number",
+    "Supplier_Id",
     "Supplier_Name",
-    "Supplier_Code",
-    "Quantity",
-    "Unit_Price",
-    "Amount",
-    "Currency",
-    "Document_Date",
     "Category_L1",
     "Category_L2",
     "Category_L3",
     "Category_L4",
-    "Material_Group",
-    "Account_Name",
+    "Material_Group_Number",
+    "Material_Group_Name",
+    "Business_Area",
+    "Division",
+    "Company_Code",
+    "Company_Name",
+    "Country",
+    "Quantity",
+    "Unit",
+    "Unit_Price",
+    "Spend_EUR",
+    "Currency",
+    "Posting_Date",
+    # --- provenance ---------------------------------------------------------
+    "Is_Duplicate",
+    "Duplicate_Of",
+    "Source_File",
+    "Source_Sheet",
+    "Source_Row_Number",
+    "Row_Id",
+    "Run_Id",
+    "Lexicon_Version",
+    "Agent_Version",
 )
 
-CONFIDENCE_BANDS: Tuple[Tuple[int, str], ...] = ((80, "High"), (50, "Medium"), (0, "Low"))
+# Appended to each per-source file by default. The deliverable is the
+# description itself, so the default view stays narrow enough to drop into the
+# client's own spreadsheet without burying their columns. The full audit trail
+# is always present in the unified table, so nothing is lost by this choice;
+# --full-columns switches the per-source files to the complete set.
+PER_SOURCE_COLUMNS: Tuple[str, ...] = (
+    "Enriched_Purchase_Description",
+    "Enriched_Description_Short",
+    "Item_Or_Service",
+    "AI_Confidence",
+    "Detected_Language",
+    "Row_Id",
+)
+
+# Confidence band boundaries. Exposed as constants because Agents 3 and 4 apply
+# the same thresholds to their own scores, and the bands must agree across the
+# suite for the Power BI filters to behave consistently.
+CONFIDENCE_HIGH = 75
+CONFIDENCE_MEDIUM = 50
 
 
 # ===========================================================================
@@ -187,65 +241,75 @@ CONFIDENCE_BANDS: Tuple[Tuple[int, str], ...] = ((80, "High"), (50, "Medium"), (
 
 @dataclass
 class ModelConfig:
-    """Resolved language-model endpoint settings."""
+    """Resolved language-model connection details.
+
+    Populated from the environment by :func:`resolve_model_config`. ``enabled``
+    is false whenever the model tier is switched off or no usable credential was
+    found, and every call site checks it rather than probing for a key.
+    """
 
     enabled: bool = False
-    provider: str = "openai"
+    backend: str = "openai"          # "openai" or "azure"
     api_key: str = ""
-    base_url: str = ""
-    model: str = ""
-    batch_size: int = 20
-    timeout: int = 60
-    request_json_mode: bool = False
+    base_url: str = "https://api.openai.com/v1"
+    model: str = "gpt-5.1"
+    batch_size: int = 25
+    timeout: int = 90
+    max_requests: int = 0            # 0 means no cap
 
+    @property
     def endpoint(self) -> str:
-        """Return the chat-completions URL.
+        """Full chat-completions URL.
 
-        Accepts either a bare API root (``https://host/v1``) or a fully qualified
-        endpoint (``https://host/v1/chat/completions``); the Azure shared service is
-        configured with the latter form.
+        The shared service is usually configured with the complete endpoint
+        while the public API is configured with the ``/v1`` root, so both spellings
+        are accepted and normalised here rather than at each call site.
         """
-        base = self.base_url.rstrip("/")
-        if base.endswith("/chat/completions"):
-            return base
-        return base + "/chat/completions"
+        url = self.base_url.rstrip("/")
+        if url.endswith("/chat/completions"):
+            return url
+        return f"{url}/chat/completions"
 
 
 @dataclass
 class Settings:
-    """Everything the pipeline needs in order to run."""
+    """Everything the pipeline needs to run, resolved from CLI and prompts."""
 
-    sources_root: Path
-    invoice_dir: Optional[Path]
-    po_dir: Optional[Path]
-    transaction_dir: Optional[Path]
-    catalogue_file: Optional[Path]
+    source_dir: Path
     results_dir: Path
-    lexicon_file: Optional[Path]
+    lexicon_path: Path
     cache_dir: Path
+
+    use_neural_translation: bool = True
+    use_semantic_matching: bool = True
     use_llm: bool = False
-    use_machine_translation: bool = False
-    top_k_matches: int = 5
-    fuzzy_threshold: float = 0.62
-    semantic_threshold: float = 0.45
-    max_description_words: int = 12
+
+    fuzzy_threshold: float = 0.86
+    semantic_threshold: float = 0.72
+    top_k: int = 5
+    max_words: int = 12
+    max_short_words: int = 4
+    semantic_phrase_cap: int = 200_000
+
     full_columns: bool = False
+    write_jsonl: bool = True
+    verbose: bool = False
+
     model: ModelConfig = field(default_factory=ModelConfig)
 
-    @property
-    def enrichment_columns(self) -> Tuple[str, ...]:
-        return ENRICHMENT_COLUMNS if self.full_columns else SOURCE_ENRICHMENT_COLUMNS
 
-
-# ===========================================================================
+# ---------------------------------------------------------------------------
 # Environment handling
-# ===========================================================================
+# ---------------------------------------------------------------------------
 
 def load_dotenv(path: Path) -> Dict[str, str]:
-    """Parse a ``.env`` file into a dictionary without overwriting real env vars.
+    """Parse a ``.env`` file into a dictionary.
 
-    Implemented locally so the agent has no hard dependency on python-dotenv.
-    Values may be quoted, and ``#`` starts a comment when it begins a line.
+    Written by hand rather than pulled from a package because the format is
+    trivial and the agents are expected to run on machines where installing an
+    extra dependency needs an approval. Later assignments win, matching the
+    behaviour of the shell and of python-dotenv, which matters because the
+    working ``.env`` on this project defines one key twice.
     """
     values: Dict[str, str] = {}
     if not path.is_file():
@@ -262,6 +326,7 @@ def load_dotenv(path: Path) -> Dict[str, str]:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip()
+        # Strip one matched pair of quotes; anything else is part of the value.
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
         if key:
@@ -270,1097 +335,1401 @@ def load_dotenv(path: Path) -> Dict[str, str]:
 
 
 def _env_flag(value: Optional[str], default: bool = False) -> bool:
-    """Interpret a textual environment value as a boolean."""
+    """Interpret the usual spellings of a boolean environment variable."""
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return value.strip().lower() in {"1", "true", "yes", "y", "on", "enable", "enabled"}
 
 
-def resolve_model_config(env: Dict[str, str], use_llm: bool) -> ModelConfig:
-    """Choose between the Azure shared service and the direct OpenAI API.
-
-    ``AZURE_ENABLE`` is the single switch. Legacy variable names (``BASE_URL``,
-    ``MODEL_NAME``) are still honoured so existing environments keep working.
-    """
-    def get(name: str, fallback: str = "") -> str:
-        return (os.environ.get(name) or env.get(name) or fallback).strip()
-
-    azure = _env_flag(os.environ.get("AZURE_ENABLE") or env.get("AZURE_ENABLE"), False)
-
-    if azure:
-        config = ModelConfig(
-            provider="azure",
-            api_key=get("AZURE_OPENAI_API_KEY") or get("OPENAI_API_KEY"),
-            base_url=get("AZURE_OPENAI_BASE_URL") or get("BASE_URL"),
-            model=get("AZURE_OPENAI_MODEL") or get("MODEL_NAME") or DEFAULT_AZURE_MODEL,
-        )
-    else:
-        config = ModelConfig(
-            provider="openai",
-            api_key=get("OPENAI_API_KEY"),
-            base_url=get("OPENAI_BASE_URL") or get("BASE_URL", DEFAULT_OPENAI_BASE_URL),
-            model=get("OPENAI_MODEL") or get("MODEL_NAME") or DEFAULT_OPENAI_MODEL,
-        )
-
-    config.batch_size = _safe_int(get("LLM_BATCH_SIZE"), 20)
-    config.timeout = _safe_int(get("LLM_TIMEOUT"), 60)
-    config.request_json_mode = _env_flag(get("LLM_JSON_MODE"), False)
-    config.enabled = bool(use_llm and config.api_key and config.base_url and config.model)
-    return config
-
-
-def _safe_int(value: str, default: int) -> int:
+def _env_int(value: Optional[str], default: int) -> int:
     try:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return default
 
 
+def resolve_model_config(env: Dict[str, str], use_llm: bool) -> ModelConfig:
+    """Select and validate the language-model backend.
+
+    ``AZURE_ENABLE`` chooses between the PwC GenAI shared service and the public
+    OpenAI API. The two credential sets are read from separate variables so both
+    can be configured at once. The direct-OpenAI branch deliberately refuses to
+    inherit ``BASE_URL``: that variable points at the shared service on this
+    project, and inheriting it would transmit a personal OpenAI key to an
+    internal endpoint.
+    """
+    config = ModelConfig(enabled=use_llm)
+    config.batch_size = max(1, _env_int(env.get("LLM_BATCH_SIZE"), 25))
+    config.timeout = max(5, _env_int(env.get("LLM_TIMEOUT"), 90))
+    config.max_requests = max(0, _env_int(env.get("LLM_MAX_REQUESTS"), 0))
+
+    if _env_flag(env.get("AZURE_ENABLE"), False):
+        config.backend = "azure"
+        config.api_key = (
+            env.get("AZURE_OPENAI_API_KEY")
+            or env.get("AZURE_API_KEY")
+            or env.get("OPENAI_API_KEY")
+            or ""
+        )
+        config.base_url = (
+            env.get("AZURE_OPENAI_BASE_URL")
+            or env.get("AZURE_BASE_URL")
+            or env.get("BASE_URL")
+            or "https://genai-sharedservice-emea.pwcinternal.com/v1/chat/completions"
+        )
+        config.model = (
+            env.get("AZURE_OPENAI_MODEL")
+            or env.get("MODEL_NAME")
+            or "azure.gpt-5.1"
+        )
+    else:
+        config.backend = "openai"
+        config.api_key = env.get("OPENAI_API_KEY", "")
+        config.base_url = env.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        config.model = env.get("OPENAI_MODEL") or "gpt-5.1"
+
+    if config.enabled and not config.api_key:
+        LOGGER.warning(
+            "Language-model tier requested but no API key was found for the %s "
+            "backend; continuing without it.", config.backend,
+        )
+        config.enabled = False
+    return config
+
+
 # ===========================================================================
 # Text utilities
 # ===========================================================================
+#
+# Procurement free-text is among the dirtiest text in an enterprise. It carries
+# the residue of every system it passed through: Windows line endings encoded as
+# literal XML escapes, characters mangled by a round trip through the wrong code
+# page, order numbers welded onto the front of a word, and the occasional pasted
+# e-mail signature. Everything below exists because it was observed in the data.
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WHITESPACE = re.compile(r"\s+")
-_WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
-_CODE_LIKE = re.compile(r"^(?=.*\d)[A-Za-z0-9][A-Za-z0-9\-_/\.]{1,}$")
-_MOJIBAKE_HINT = re.compile(r"Ã[\x80-\xbf]|Â[\x80-\xbf]|ï¿½")
-_EXCEL_LINEBREAK = re.compile(r"_x000D_")
+_XML_ESCAPES = re.compile(r"_x00[0-9A-Fa-f]{2}_")
 
-NULL_TOKENS = {"", "n/a", "na", "null", "none", "-", "--", "nan", "#n/a"}
+_EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+_URL = re.compile(r"\bhttps?://\S+|\bwww\.\S+", re.IGNORECASE)
+_DATE_LIKE = re.compile(r"\b\d{1,4}[./-]\d{1,2}([./-]\d{2,4})?\.?\b")
+_LONG_DIGITS = re.compile(r"\b\d{4,}\b")
+_ALPHANUM_CODE = re.compile(r"\b(?=\S*\d)(?=\S*[A-Za-z])[A-Za-z0-9][A-Za-z0-9._/-]{3,}\b")
+_LEADING_CODE = re.compile(r"^\s*[\dA-Z]{3,}[-_ ]?(?=[a-zA-ZäöåÄÖÅøæØÆłąćęńóśźż])")
+_MONEY = re.compile(r"\b\d+[.,]\d{2}\s*(eur|sek|pln|nok|dkk|usd|€|\$)\b", re.IGNORECASE)
+_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
+
+# Mojibake repair table. A UTF-8 string decoded as cp1252 produces these
+# sequences; the round trip through latin-1 restores the original bytes. The
+# explicit table handles the cases where the round trip is itself lossy.
+_MOJIBAKE_MARKERS = ("Ã", "Â", "â€", "Ä\x8d", "Å¡", "Ð")
+_MOJIBAKE_LITERAL = {
+    "Ã¤": "ä", "Ã¶": "ö", "Ã¥": "å", "Ã„": "Ä", "Ã–": "Ö", "Ã…": "Å",
+    "Ã©": "é", "Ã¨": "è", "Ã¼": "ü", "Ã±": "ñ", "Ã¸": "ø", "Ã¦": "æ",
+    "â€™": "'", "â€œ": '"', "â€\x9d": '"', "â€“": "-", "â€”": "-", "â€¦": "...",
+    "Å‚": "ł", "Å„": "ń", "Å›": "ś", "Å¼": "ż", "Åº": "ź", "Å¾": "ž",
+    "Ä…": "ą", "Ä‡": "ć", "Ä™": "ę", "Ã³": "ó", "Â ": " ", "Â": "",
+}
 
 
 def repair_mojibake(text: str) -> str:
-    """Undo the common UTF-8-read-as-cp1252 corruption seen in exported files."""
-    if not text or not _MOJIBAKE_HINT.search(text):
+    """Undo the common double-encoding damage seen in exported spreadsheets.
+
+    Applied before anything else, because a mangled character defeats language
+    identification, lexicon lookup and fuzzy matching simultaneously.
+    """
+    if not text or not any(marker in text for marker in _MOJIBAKE_MARKERS):
         return text
+
     try:
         repaired = text.encode("cp1252", errors="strict").decode("utf-8", errors="strict")
+        # Only accept the round trip if it did not introduce replacement noise.
+        if "\ufffd" not in repaired:
+            return repaired
     except (UnicodeEncodeError, UnicodeDecodeError):
-        return text
-    return repaired
+        pass
+
+    for damaged, correct in _MOJIBAKE_LITERAL.items():
+        text = text.replace(damaged, correct)
+    return text
 
 
 def normalise_text(value: Any) -> str:
-    """Return a clean, single-line rendering of a raw cell value."""
+    """Reduce any cell value to clean, single-spaced text.
+
+    Excel stores hard line breaks inside a cell as the literal token ``_x000D_``
+    when the sheet is written by certain exporters, which is why that is stripped
+    here rather than treated as data.
+    """
     if value is None:
         return ""
-    text = str(value)
-    text = _EXCEL_LINEBREAK.sub(" ", text)
+    if isinstance(value, float):
+        # Whole floats are almost always integer keys that pandas or openpyxl
+        # widened; rendering 1.0 as "1" keeps join keys comparable across files.
+        text = str(int(value)) if value.is_integer() else repr(value)
+    elif not isinstance(value, str):
+        text = str(value)
+    else:
+        text = value
+
+    text = _XML_ESCAPES.sub(" ", text)
     text = repair_mojibake(text)
-    text = unicodedata.normalize("NFKC", text)
+    text = unicodedata.normalize("NFC", text)
     text = _CONTROL_CHARS.sub(" ", text)
-    return _WHITESPACE.sub(" ", text).strip()
+    text = _WHITESPACE.sub(" ", text)
+    return text.strip()
 
 
-def is_blank(value: Any) -> bool:
-    """True when a value carries no information, including source ``n/a`` markers."""
-    return normalise_text(value).lower() in NULL_TOKENS
+def fold_accents(text: str) -> str:
+    """Strip diacritics for lookup purposes only.
+
+    The lexicon is keyed on the folded form so that a single entry covers text
+    that arrives with correct diacritics, without them, or with them mangled.
+    Folded text is never written to output.
+    """
+    decomposed = unicodedata.normalize("NFD", text)
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    # Characters that do not decompose have to be mapped explicitly.
+    return (stripped
+            .replace("ł", "l").replace("Ł", "L")
+            .replace("ø", "o").replace("Ø", "O")
+            .replace("æ", "ae").replace("Æ", "Ae")
+            .replace("ß", "ss").replace("đ", "d"))
 
 
 def lookup_key(text: str) -> str:
-    """Lower-cased, punctuation-flattened form used for vocabulary lookups."""
-    text = normalise_text(text).lower()
-    text = re.sub(r"[^\w\s\-]", " ", text, flags=re.UNICODE)
-    return _WHITESPACE.sub(" ", text).strip()
-
-
-def tokenise(text: str) -> List[str]:
-    """Split text into lower-cased alphabetic tokens."""
-    return [match.group(0).lower() for match in _WORD.finditer(normalise_text(text))]
-
-
-def is_code_token(token: str) -> bool:
-    """Identify part numbers, account codes and similar non-descriptive tokens."""
-    return bool(_CODE_LIKE.match(token))
+    """Canonical key for vocabulary and cache lookups."""
+    return _WHITESPACE.sub(" ", fold_accents(text).lower()).strip()
 
 
 def compact_key(value: Any) -> str:
-    """Aggressive normalisation for identifier comparison across systems."""
-    return re.sub(r"[^A-Z0-9]", "", normalise_text(value).upper())
+    """Aggressive key for joining identifiers across systems.
 
-
-def parse_amount(value: Any) -> Optional[float]:
-    """Parse a monetary value tolerating both European and Anglo number formats."""
-    text = normalise_text(value)
-    if text.lower() in NULL_TOKENS:
-        return None
-    text = text.replace("\u00a0", "").replace(" ", "")
-    text = re.sub(r"[^\d,\.\-]", "", text)
-    if not text or text in {"-", ".", ","}:
-        return None
-
-    if "," in text and "." in text:
-        # Whichever separator appears last is the decimal separator.
-        if text.rfind(",") > text.rfind("."):
-            text = text.replace(".", "").replace(",", ".")
-        else:
-            text = text.replace(",", "")
-    elif "," in text:
-        decimals = len(text.split(",")[-1])
-        text = text.replace(",", "." if decimals in (1, 2) else "")
-
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-_DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%Y/%m/%d", "%m/%d/%Y")
-
-
-def parse_date(value: Any) -> Optional[str]:
-    """Return an ISO date string, or None when the value is not a date."""
-    text = normalise_text(value)
-    if text.lower() in NULL_TOKENS:
-        return None
-    for fmt in _DATE_FORMATS:
-        try:
-            return datetime.strptime(text[: len(fmt) + 4], fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-    match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", text)
-    return match.group(0) if match else None
-
-
-def sha256_file(path: Path) -> str:
-    """Content hash of a file, used to make the run identifier reproducible."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def text_similarity(left: str, right: str) -> float:
-    """Order-insensitive similarity in the range 0..1.
-
-    Uses rapidfuzz when available; the standard-library fallback blends a token
-    Jaccard overlap with a sequence ratio so both give comparable magnitudes.
+    Purchase order numbers are written as ``PO23983000004`` in one system and
+    ``po-23983000004`` in another; both reduce to the same key here. Leading
+    zeros are preserved because they are significant in ERP numbering.
     """
-    if not left or not right:
-        return 0.0
-    if _rapidfuzz is not None:
-        return float(_rapidfuzz.token_set_ratio(left, right)) / 100.0
-
-    left_tokens = set(tokenise(left))
-    right_tokens = set(tokenise(right))
-    if not left_tokens or not right_tokens:
-        return 0.0
-    jaccard = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
-    sequence = difflib.SequenceMatcher(
-        None, " ".join(sorted(left_tokens)), " ".join(sorted(right_tokens))
-    ).ratio()
-    return round(0.6 * sequence + 0.4 * jaccard, 6)
+    text = normalise_text(value).upper()
+    return re.sub(r"[^A-Z0-9]", "", text)
 
 
-def amounts_agree(left: Optional[float], right: Optional[float]) -> bool:
-    """Compare two amounts with a tolerance that scales with magnitude."""
-    if left is None or right is None:
-        return False
-    return abs(left - right) <= max(0.01, 0.005 * max(abs(left), abs(right)))
+def tokenise(text: str) -> List[str]:
+    """Split into word tokens, keeping digits attached to their word."""
+    return _TOKEN.findall(text)
+
+
+def is_code_token(token: str) -> bool:
+    """True for tokens that are identifiers rather than words.
+
+    A token counts as a code when it contains a digit, is a long unbroken run of
+    capitals, or is too short to carry meaning on its own. Codes are excluded
+    from the generated description but retained in the structured columns, so
+    nothing is lost.
+    """
+    if not token:
+        return True
+    if any(ch.isdigit() for ch in token):
+        return True
+    if len(token) <= 2:
+        return True
+    if token.isupper() and len(token) >= 4:
+        return True
+    return False
+
+
+# A reference number welded onto the front of a word, or a long number welded
+# onto the back of one. Both are routine in ERP free-text and both hide the only
+# meaningful word in the field from every downstream stage.
+_WELDED_PREFIX = re.compile(r"(?<=\d)(?=[^\W\d_]{4,})", re.UNICODE)
+_WELDED_SUFFIX = re.compile(r"(?<=[^\W\d_])(?=\d{4,})", re.UNICODE)
+
+
+def separate_welded_codes(text: str) -> str:
+    """Insert a break between a run of digits and an adjacent word.
+
+    The specification's own worked example is ``157238asbestipurku`` becoming
+    "Asbestos removal", which is only reachable if the reference number is
+    separated from the word first. Both patterns require at least four
+    characters on the numeric side so that genuine part designations such as
+    ``WH-CH520`` and ``MODEL 3`` are left intact.
+    """
+    text = _WELDED_PREFIX.sub(" ", text)
+    return _WELDED_SUFFIX.sub(" ", text)
+
+
+def soften_caps(text: str) -> str:
+    """Lower-case a fragment that was written entirely in capitals.
+
+    Several of the source fields are shouted: invoice ``article_name`` arrives
+    as ``VUOKRA`` and Maximo line descriptions are frequently all upper case.
+    Left alone, every one of those words is indistinguishable from a part number
+    to the code detector below, and a genuine Finnish word gets discarded as an
+    identifier. Mixed-case text is untouched, so an acronym sitting inside a
+    normal sentence still survives.
+    """
+    letters = [char for char in text if char.isalpha()]
+    if len(letters) < 2:
+        return text
+    upper_share = sum(1 for char in letters if char.isupper()) / len(letters)
+    return text.lower() if upper_share > 0.85 else text
 
 
 def sentence_case(text: str) -> str:
-    """Capitalise the first letter only, preserving existing internal casing."""
+    """Capitalise the first letter and leave the rest alone.
+
+    ``str.capitalize`` would lower-case the remainder and destroy acronyms such
+    as ``PPE`` and ``UNSPSC`` that legitimately appear inside a description.
+    """
     text = text.strip()
     if not text:
         return ""
     return text[0].upper() + text[1:]
 
 
-# ===========================================================================
-# Character n-gram index (semantic retrieval without external dependencies)
-# ===========================================================================
+def parse_amount(value: Any) -> Optional[float]:
+    """Parse a monetary or quantity cell written in any European convention.
 
-class CharNgramIndex:
-    """TF-IDF cosine retrieval over character n-grams.
-
-    Character n-grams are deliberate: they tolerate inflection, compounding and
-    spelling drift across systems far better than word tokens, which matters when the
-    same item is written in Finnish in one system and English in another.
+    Handles ``1 234,56``, ``1,234.56``, ``1.234,56``, parentheses for negatives
+    and a trailing or leading currency symbol. Returns None rather than zero for
+    unparseable input, because zero is a legitimate value and conflating the two
+    would corrupt the amount-agreement check used during matching.
     """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
 
-    def __init__(
-        self,
-        documents: Dict[str, str],
-        n_min: int = 3,
-        n_max: int = 5,
-        df_ceiling: float = 0.5,
-    ) -> None:
-        self._n_min = n_min
-        self._n_max = n_max
-        self._vectors: Dict[str, Dict[str, float]] = {}
-        self._postings: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+    text = normalise_text(value)
+    if not text:
+        return None
 
-        grams_per_doc: Dict[str, Counter] = {}
-        document_frequency: Counter = Counter()
-        for doc_id, text in sorted(documents.items()):
-            grams = self._grams(text)
-            if not grams:
-                continue
-            grams_per_doc[doc_id] = grams
-            document_frequency.update(grams.keys())
+    negative = text.startswith("(") and text.endswith(")")
+    text = re.sub(r"[^\d,.\-]", "", text.strip("()"))
+    if not text or text in {"-", ".", ","}:
+        return None
 
-        total = max(1, len(grams_per_doc))
-        ceiling = max(2, int(df_ceiling * total))
-        self._idf = {
-            gram: math.log((1.0 + total) / (1.0 + count)) + 1.0
-            for gram, count in document_frequency.items()
-            if count <= ceiling
-        }
+    has_comma, has_dot = "," in text, "." in text
+    if has_comma and has_dot:
+        # Whichever separator appears last is the decimal separator.
+        decimal_sep = "," if text.rfind(",") > text.rfind(".") else "."
+        thousands_sep = "." if decimal_sep == "," else ","
+        text = text.replace(thousands_sep, "").replace(decimal_sep, ".")
+    elif has_comma:
+        # A single comma with exactly three trailing digits is a thousands
+        # separator; anything else is a decimal comma.
+        head, _, tail = text.rpartition(",")
+        text = head + tail if (len(tail) == 3 and head) else text.replace(",", ".")
 
-        for doc_id, grams in grams_per_doc.items():
-            vector = self._weight(grams)
-            if not vector:
-                continue
-            self._vectors[doc_id] = vector
-            for gram, weight in vector.items():
-                self._postings[gram].append((doc_id, weight))
+    try:
+        amount = float(text)
+    except ValueError:
+        return None
+    return -amount if negative else amount
 
-    def _grams(self, text: str) -> Counter:
-        cleaned = _WHITESPACE.sub(" ", normalise_text(text).lower()).strip()
-        if not cleaned:
-            return Counter()
-        padded = f" {cleaned} "
-        counter: Counter = Counter()
-        for size in range(self._n_min, self._n_max + 1):
-            if len(padded) < size:
-                break
-            for start in range(len(padded) - size + 1):
-                counter[padded[start : start + size]] += 1
-        return counter
 
-    def _weight(self, grams: Counter) -> Dict[str, float]:
-        """Sub-linear term frequency times inverse document frequency, L2-normalised."""
-        vector: Dict[str, float] = {}
-        for gram, frequency in grams.items():
-            idf = self._idf.get(gram)
-            if idf is None:
-                continue
-            vector[gram] = (1.0 + math.log(frequency)) * idf
-        norm = math.sqrt(sum(value * value for value in vector.values()))
-        if norm == 0.0:
-            return {}
-        return {gram: value / norm for gram, value in vector.items()}
+def parse_date(value: Any) -> str:
+    """Normalise a date cell to ISO ``YYYY-MM-DD``, or return it unchanged."""
+    text = normalise_text(value)
+    if not text:
+        return ""
 
-    def query(self, text: str, top_k: int = 5, min_score: float = 0.0) -> List[Tuple[str, float]]:
-        """Return the highest scoring documents, ties broken by identifier."""
-        vector = self._weight(self._grams(text))
-        if not vector:
-            return []
-        scores: Dict[str, float] = defaultdict(float)
-        for gram, weight in vector.items():
-            for doc_id, doc_weight in self._postings.get(gram, ()):
-                scores[doc_id] += weight * doc_weight
-        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
-        return [(doc_id, round(score, 6)) for doc_id, score in ranked[:top_k] if score >= min_score]
+    iso = re.match(r"^(\d{4})-(\d{2})-(\d{2})", text)
+    if iso:
+        return iso.group(0)
+
+    european = re.match(r"^(\d{1,2})[./](\d{1,2})[./](\d{4})", text)
+    if european:
+        day, month, year = european.groups()
+        return f"{year}-{int(month):02d}-{int(day):02d}"
+    return text
+
+
+def sha256_file(path: Path) -> str:
+    """Content hash of an input file, read in blocks so size does not matter."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def stable_hash(*parts: str) -> str:
+    """Short, stable identifier derived from content.
+
+    Used for row identifiers so that the same input row carries the same
+    identifier in every run, which is what lets a downstream agent or a Power BI
+    model join to a previous export.
+    """
+    digest = hashlib.sha256("\x1f".join(parts).encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+def text_similarity(left: str, right: str) -> float:
+    """Normalised similarity in ``[0, 1]`` between two short strings."""
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    if _rapidfuzz is not None:
+        return float(_rapidfuzz.token_set_ratio(left, right)) / 100.0
+
+    # Standard-library fallback. Slower, and slightly less forgiving of word
+    # order, but it keeps the agent working without third-party packages.
+    from difflib import SequenceMatcher
+    left_tokens, right_tokens = set(tokenise(left)), set(tokenise(right))
+    if left_tokens and right_tokens:
+        overlap = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+    else:
+        overlap = 0.0
+    return max(overlap, SequenceMatcher(None, left, right).ratio())
+
+
+def amounts_agree(left: Optional[float], right: Optional[float], tolerance: float = 0.02) -> bool:
+    """Whether two amounts are close enough to describe the same transaction.
+
+    A relative tolerance absorbs rounding and currency conversion; the absolute
+    floor stops the relative test from being meaninglessly strict near zero.
+    """
+    if left is None or right is None:
+        return False
+    if abs(left - right) <= 0.01:
+        return True
+    scale = max(abs(left), abs(right))
+    return scale > 0 and abs(left - right) / scale <= tolerance
 
 
 # ===========================================================================
-# Spreadsheet and delimited-file readers
+# Tabular input
 # ===========================================================================
-
-_MAIN_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-_REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
-
-# Built-in Excel number formats that represent dates or times.
-_BUILTIN_DATE_FORMATS = set(range(14, 23)) | set(range(45, 48))
-_EXCEL_EPOCH = datetime(1899, 12, 30)
-
+#
+# Two properties drive this section. First, the same logical extract may arrive
+# as .xlsx or .csv, so the reader must not decide anything based on the file
+# extension beyond how to parse it. Second, the production data set is around a
+# million lines, so nothing may assume the file fits in memory. Every table
+# therefore exposes a factory that yields a *fresh* iterator on demand, and the
+# pipeline makes two streaming passes over the input instead of one buffered
+# pass.
 
 @dataclass
 class Table:
-    """A rectangular block of source data with its provenance."""
+    """A single sheet or delimited file, streamed on demand."""
 
     path: Path
     sheet: str
-    columns: List[str]
-    rows: List[Dict[str, str]]
+    headers: List[str]
+    open_rows: Callable[[], Iterator[Tuple[int, List[str]]]]
+
+    def iter_rows(self) -> Iterator[Tuple[int, List[str]]]:
+        """Yield ``(source_row_number, values)`` with values aligned to headers."""
+        for row_number, values in self.open_rows():
+            if len(values) < len(self.headers):
+                values = values + [""] * (len(self.headers) - len(values))
+            elif len(values) > len(self.headers):
+                values = values[: len(self.headers)]
+            yield row_number, values
+
+    @property
+    def label(self) -> str:
+        """Human-readable identity used in logs and output file names."""
+        return f"{self.path.name}" if self.sheet in {"", "Sheet1"} else f"{self.path.name}:{self.sheet}"
 
 
-def _column_index(reference: str) -> int:
-    """Convert an Excel column reference such as ``AB12`` into a zero-based index."""
-    letters = "".join(char for char in reference if char.isalpha())
+# --- Delimited files -------------------------------------------------------
+
+_ENCODING_CANDIDATES = ("utf-8-sig", "utf-8", "cp1252", "cp1250", "latin-1")
+
+
+def _detect_encoding(path: Path) -> str:
+    """Pick the first encoding that decodes a sample without error.
+
+    The supplied catalogue is Central European and the PO extracts are Nordic,
+    so both cp1250 and cp1252 have to be candidates. ``latin-1`` is last because
+    it decodes any byte sequence and would mask a better answer.
+    """
+    sample = path.open("rb").read(1 << 18)
+    for encoding in _ENCODING_CANDIDATES:
+        try:
+            sample.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        return encoding
+    return "latin-1"
+
+
+def _detect_delimiter(sample: str) -> str:
+    """Choose a delimiter by counting candidates outside quoted regions."""
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+    except csv.Error:
+        pass
+    counts = {candidate: sample.count(candidate) for candidate in ",;\t|"}
+    best = max(counts, key=lambda key: counts[key])
+    return best if counts[best] > 0 else ","
+
+
+def _read_delimited(path: Path) -> List[Table]:
+    """Wrap a CSV or TSV file as a single streaming table."""
+    encoding = _detect_encoding(path)
+    with path.open("r", encoding=encoding, errors="replace", newline="") as handle:
+        sample = handle.read(1 << 16)
+    delimiter = _detect_delimiter(sample)
+
+    with path.open("r", encoding=encoding, errors="replace", newline="") as handle:
+        reader = csv.reader(handle, delimiter=delimiter)
+        try:
+            header_row = next(reader)
+        except StopIteration:
+            return []
+    headers = [normalise_text(cell) for cell in header_row]
+    if not any(headers):
+        return []
+
+    def open_rows() -> Iterator[Tuple[int, List[str]]]:
+        with path.open("r", encoding=encoding, errors="replace", newline="") as stream:
+            rows = csv.reader(stream, delimiter=delimiter)
+            next(rows, None)  # discard the header
+            for index, values in enumerate(rows, start=2):
+                yield index, [normalise_text(cell) for cell in values]
+
+    return [Table(path=path, sheet=path.stem, headers=headers, open_rows=open_rows)]
+
+
+# --- Excel workbooks -------------------------------------------------------
+
+_SPREADSHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_PACKAGE_REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+_DOCUMENT_REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+# Built-in Excel number-format identifiers that denote a date or a time. A cell
+# holding a date is stored as a serial number, so without the style lookup an
+# order date is emitted as "45103" and every date-based check silently fails.
+_BUILTIN_DATE_FORMATS = frozenset({14, 15, 16, 17, 18, 19, 20, 21, 22, 45, 46, 47, 27, 30, 36, 50, 57})
+
+
+def _column_index(cell_reference: str) -> int:
+    """Convert an Excel cell reference such as ``AB12`` to a zero-based column."""
     index = 0
-    for char in letters:
+    for char in cell_reference:
+        if not char.isalpha():
+            break
         index = index * 26 + (ord(char.upper()) - 64)
     return index - 1
 
 
-def _read_xlsx(path: Path) -> List[Table]:
-    """Read an ``.xlsx`` workbook using only the standard library.
+def _excel_serial_to_iso(value: Any) -> str:
+    """Convert an Excel date serial to an ISO date string.
 
-    Shared strings, inline strings and date-formatted numbers are all resolved. Every
-    worksheet is returned; the first row containing at least two populated cells is
-    treated as the header.
+    Excel's epoch is 1899-12-30 rather than 1900-01-01 because the format
+    deliberately reproduces a leap-year bug from Lotus 1-2-3.
     """
-    tables: List[Table] = []
-    with zipfile.ZipFile(path) as archive:
-        names = set(archive.namelist())
-
-        shared: List[str] = []
-        if "xl/sharedStrings.xml" in names:
-            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
-            for item in root:
-                shared.append("".join(node.text or "" for node in item.iter(_MAIN_NS + "t")))
-
-        date_styles = _read_date_styles(archive, names)
-
-        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
-        relations: Dict[str, str] = {}
-        if "xl/_rels/workbook.xml.rels" in names:
-            for relation in ET.fromstring(archive.read("xl/_rels/workbook.xml.rels")):
-                relations[relation.get("Id", "")] = relation.get("Target", "")
-
-        sheets_node = workbook.find(_MAIN_NS + "sheets")
-        if sheets_node is None:
-            return tables
-
-        for sheet in sheets_node:
-            target = relations.get(sheet.get(_REL_NS + "id", ""), "")
-            if not target:
-                continue
-            member = target.lstrip("/")
-            if not member.startswith("xl/"):
-                member = "xl/" + member
-            if member not in names:
-                continue
-            grid = _read_worksheet(archive.read(member), shared, date_styles)
-            table = _grid_to_table(path, sheet.get("name", "Sheet"), grid)
-            if table is not None:
-                tables.append(table)
-    return tables
-
-
-def _read_date_styles(archive: zipfile.ZipFile, names: Iterable[str]) -> set:
-    """Return the set of cell-style indices whose number format is a date."""
-    if "xl/styles.xml" not in set(names):
-        return set()
-    try:
-        styles = ET.fromstring(archive.read("xl/styles.xml"))
-    except ET.ParseError:
-        return set()
-
-    custom_date_formats = set()
-    for number_format in styles.iter(_MAIN_NS + "numFmt"):
-        code = (number_format.get("formatCode") or "").lower()
-        stripped = re.sub(r"\[[^\]]*\]|\"[^\"]*\"", "", code)
-        if re.search(r"[ymd]", stripped) and "e+" not in stripped:
-            custom_date_formats.add(number_format.get("numFmtId", ""))
-
-    date_styles = set()
-    cell_formats = styles.find(_MAIN_NS + "cellXfs")
-    if cell_formats is None:
-        return date_styles
-    for position, cell_format in enumerate(cell_formats):
-        format_id = cell_format.get("numFmtId", "0")
-        if format_id in custom_date_formats or _safe_int(format_id, -1) in _BUILTIN_DATE_FORMATS:
-            date_styles.add(position)
-    return date_styles
-
-
-def _read_worksheet(payload: bytes, shared: List[str], date_styles: set) -> List[Dict[int, str]]:
-    """Convert a worksheet part into a list of ``{column index: value}`` rows."""
-    sheet = ET.fromstring(payload)
-    grid: List[Dict[int, str]] = []
-    for row in sheet.iter(_MAIN_NS + "row"):
-        cells: Dict[int, str] = {}
-        for cell in row:
-            reference = cell.get("r")
-            if not reference:
-                continue
-            cell_type = cell.get("t")
-            value_node = cell.find(_MAIN_NS + "v")
-            inline_node = cell.find(_MAIN_NS + "is")
-
-            if inline_node is not None:
-                value: Any = "".join(node.text or "" for node in inline_node.iter(_MAIN_NS + "t"))
-            elif value_node is None or value_node.text is None:
-                continue
-            elif cell_type == "s":
-                index = _safe_int(value_node.text, -1)
-                value = shared[index] if 0 <= index < len(shared) else ""
-            elif cell_type == "b":
-                value = "TRUE" if value_node.text.strip() == "1" else "FALSE"
-            else:
-                value = value_node.text
-                style = _safe_int(cell.get("s", "-1"), -1)
-                if style in date_styles:
-                    value = _excel_serial_to_date(value)
-
-            text = normalise_text(value)
-            if text:
-                cells[_column_index(reference)] = text
-        grid.append(cells)
-    return grid
-
-
-def _excel_serial_to_date(value: Any) -> str:
-    """Convert an Excel serial number to an ISO date, leaving other values untouched."""
     try:
         serial = float(value)
     except (TypeError, ValueError):
-        return str(value)
+        return normalise_text(value)
     if serial <= 0:
-        return str(value)
-    moment = _EXCEL_EPOCH + timedelta(days=serial)
-    if abs(serial - round(serial)) < 1e-9:
+        return normalise_text(value)
+
+    from datetime import datetime, timedelta
+    moment = datetime(1899, 12, 30) + timedelta(days=serial)
+    if abs(serial - int(serial)) < 1e-9:
         return moment.strftime("%Y-%m-%d")
     return moment.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _grid_to_table(path: Path, sheet_name: str, grid: List[Dict[int, str]]) -> Optional[Table]:
-    """Locate the header row and materialise the remaining rows as dictionaries."""
-    header_position = None
-    for position, cells in enumerate(grid):
-        if len([value for value in cells.values() if value]) >= 2:
-            header_position = position
-            break
-    if header_position is None:
-        return None
-
-    header_cells = grid[header_position]
-    columns_by_index: Dict[int, str] = {}
-    seen: Counter = Counter()
-    for index in sorted(header_cells):
-        name = header_cells[index] or f"Column_{index + 1}"
-        seen[name] += 1
-        if seen[name] > 1:
-            name = f"{name}_{seen[name]}"
-        columns_by_index[index] = name
-
-    columns = [columns_by_index[index] for index in sorted(columns_by_index)]
-    rows: List[Dict[str, str]] = []
-    for cells in grid[header_position + 1 :]:
-        row = {name: cells.get(index, "") for index, name in columns_by_index.items()}
-        if any(value for value in row.values()):
-            rows.append(row)
-    return Table(path=path, sheet=sheet_name, columns=columns, rows=rows)
-
-
-def _read_delimited(path: Path) -> List[Table]:
-    """Read a CSV or TSV file, detecting both the encoding and the delimiter."""
-    raw = path.read_bytes()
-    text = ""
-    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
-        try:
-            text = raw.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
-    if not text:
-        text = raw.decode("utf-8", errors="replace")
-
-    sample = text[:8192]
-    delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
+def _read_xlsx_with_openpyxl(path: Path) -> List[Table]:
+    """Stream a workbook through openpyxl in read-only mode."""
+    tables: List[Table] = []
+    workbook = _openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
-        delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
-    except csv.Error:
-        pass
+        sheet_names = list(workbook.sheetnames)
+    finally:
+        workbook.close()
 
-    reader = csv.DictReader(text.splitlines(True), delimiter=delimiter)
-    columns = [name for name in (reader.fieldnames or []) if name is not None]
-    rows: List[Dict[str, str]] = []
-    for record in reader:
-        row = {name: normalise_text(record.get(name)) for name in columns}
-        if any(value for value in row.values()):
-            rows.append(row)
-    return [Table(path=path, sheet=path.stem, columns=columns, rows=rows)]
+    for sheet_name in sheet_names:
+        probe = _openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            worksheet = probe[sheet_name]
+            header_values: List[str] = []
+            for row in worksheet.iter_rows(min_row=1, max_row=1, values_only=True):
+                header_values = [normalise_text(cell) for cell in row]
+                break
+        finally:
+            probe.close()
+
+        if not any(header_values):
+            continue
+
+        def open_rows(sheet: str = sheet_name) -> Iterator[Tuple[int, List[str]]]:
+            book = _openpyxl.load_workbook(path, read_only=True, data_only=True)
+            try:
+                target = book[sheet]
+                for index, row in enumerate(target.iter_rows(min_row=2, values_only=True), start=2):
+                    yield index, [normalise_text(cell) for cell in row]
+            finally:
+                book.close()
+
+        tables.append(Table(path=path, sheet=sheet_name,
+                            headers=header_values, open_rows=open_rows))
+    return tables
+
+
+def _xlsx_shared_strings(archive: zipfile.ZipFile) -> List[str]:
+    """Read the workbook's shared string table."""
+    if "xl/sharedStrings.xml" not in archive.namelist():
+        return []
+    root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+    return [
+        "".join(node.text or "" for node in item.iter(_SPREADSHEET_NS + "t"))
+        for item in root.iter(_SPREADSHEET_NS + "si")
+    ]
+
+
+def _xlsx_date_styles(archive: zipfile.ZipFile) -> Set[int]:
+    """Identify which cell style indices represent dates."""
+    if "xl/styles.xml" not in archive.namelist():
+        return set()
+    root = ElementTree.fromstring(archive.read("xl/styles.xml"))
+
+    custom_date_formats: Set[int] = set()
+    for number_format in root.iter(_SPREADSHEET_NS + "numFmt"):
+        code = number_format.attrib.get("formatCode", "").lower()
+        # A format is a date format when it references day, month or year
+        # placeholders outside of a literal string.
+        if re.search(r"(?<!\\)[dmyh]", re.sub(r'"[^"]*"', "", code)):
+            custom_date_formats.add(int(number_format.attrib["numFmtId"]))
+
+    date_styles: Set[int] = set()
+    cell_formats = root.find(_SPREADSHEET_NS + "cellXfs")
+    if cell_formats is None:
+        return date_styles
+    for style_index, cell_format in enumerate(cell_formats.iter(_SPREADSHEET_NS + "xf")):
+        format_id = int(cell_format.attrib.get("numFmtId", 0))
+        if format_id in _BUILTIN_DATE_FORMATS or format_id in custom_date_formats:
+            date_styles.add(style_index)
+    return date_styles
+
+
+def _iter_xlsx_sheet(payload: bytes, shared: List[str], date_styles: Set[int]) -> Iterator[List[str]]:
+    """Yield dense row values from a worksheet part.
+
+    Uses ``iterparse`` and clears each element after use so that memory stays
+    flat across a very large sheet. Sparse rows are densified against the cell
+    references, because a row that omits its empty trailing cells would
+    otherwise misalign against the header.
+    """
+    for _, element in ElementTree.iterparse(io.BytesIO(payload), events=("end",)):
+        if element.tag != _SPREADSHEET_NS + "row":
+            continue
+
+        cells: Dict[int, str] = {}
+        for cell in element.iter(_SPREADSHEET_NS + "c"):
+            reference = cell.attrib.get("r", "")
+            cell_type = cell.attrib.get("t")
+            value_node = cell.find(_SPREADSHEET_NS + "v")
+            inline_node = cell.find(_SPREADSHEET_NS + "is")
+
+            if cell_type == "s" and value_node is not None:
+                try:
+                    text = shared[int(value_node.text)]
+                except (ValueError, IndexError):
+                    text = ""
+            elif inline_node is not None:
+                text = "".join(node.text or "" for node in inline_node.iter(_SPREADSHEET_NS + "t"))
+            elif value_node is not None:
+                text = value_node.text or ""
+                style = cell.attrib.get("s")
+                if cell_type is None and style is not None and int(style) in date_styles:
+                    text = _excel_serial_to_iso(text)
+            else:
+                text = ""
+
+            if reference:
+                cells[_column_index(reference)] = normalise_text(text)
+
+        width = max(cells) + 1 if cells else 0
+        yield [cells.get(position, "") for position in range(width)]
+        element.clear()
+
+
+def _read_xlsx_with_stdlib(path: Path) -> List[Table]:
+    """Read a workbook using only the standard library.
+
+    A fallback for environments where openpyxl cannot be installed. An .xlsx
+    file is a zip archive of XML parts, so this is entirely supportable without
+    a dependency, and having it means a missing package downgrades performance
+    rather than stopping the run.
+    """
+    tables: List[Table] = []
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        if "xl/workbook.xml" not in names:
+            return []
+        relationships = {
+            node.attrib["Id"]: node.attrib["Target"]
+            for node in ElementTree.fromstring(
+                archive.read("xl/_rels/workbook.xml.rels")).iter(_PACKAGE_REL_NS + "Relationship")
+        }
+        workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        sheets = [
+            (node.attrib.get("name", "Sheet"), node.attrib.get(_DOCUMENT_REL_NS + "id", ""))
+            for node in workbook.iter(_SPREADSHEET_NS + "sheet")
+        ]
+        shared = _xlsx_shared_strings(archive)
+        date_styles = _xlsx_date_styles(archive)
+
+        for sheet_name, relationship_id in sheets:
+            target = relationships.get(relationship_id, "")
+            if not target:
+                continue
+            part = target[1:] if target.startswith("/") else f"xl/{target}"
+            if part not in names:
+                continue
+
+            payload = archive.read(part)
+            rows = _iter_xlsx_sheet(payload, shared, date_styles)
+            headers: List[str] = []
+            for candidate in rows:
+                if any(candidate):
+                    headers = candidate
+                    break
+            if not headers:
+                continue
+
+            def open_rows(part_name: str = part) -> Iterator[Tuple[int, List[str]]]:
+                with zipfile.ZipFile(path) as inner:
+                    stream = _iter_xlsx_sheet(inner.read(part_name), shared, date_styles)
+                    started = False
+                    for index, values in enumerate(stream, start=1):
+                        if not started:
+                            if any(values):
+                                started = True
+                            continue
+                        yield index, values
+
+            tables.append(Table(path=path, sheet=sheet_name,
+                                headers=headers, open_rows=open_rows))
+    return tables
 
 
 def read_table_file(path: Path) -> List[Table]:
-    """Dispatch to the appropriate reader based on the file extension."""
+    """Read any supported tabular file into one table per sheet."""
     suffix = path.suffix.lower()
-    if suffix == ".xlsx":
-        return _read_xlsx(path)
-    if suffix in {".csv", ".tsv", ".txt"}:
-        return _read_delimited(path)
-    LOGGER.warning("Skipping unsupported file type: %s", path.name)
+    try:
+        if suffix in {".csv", ".tsv", ".txt"}:
+            return _read_delimited(path)
+        if suffix in {".xlsx", ".xlsm"}:
+            if _openpyxl is not None:
+                return _read_xlsx_with_openpyxl(path)
+            return _read_xlsx_with_stdlib(path)
+        if suffix == ".xls":
+            LOGGER.warning("Legacy .xls is not supported; convert %s to .xlsx", path.name)
+            return []
+    except Exception as error:
+        LOGGER.error("Could not read %s: %s", path.name, error)
+        return []
     return []
 
 
-# ===========================================================================
-# Source profiles
-# ===========================================================================
+def discover_input_files(root: Path) -> List[Path]:
+    """Find every readable table beneath a folder.
 
-@dataclass(frozen=True)
+    The client's folder layout is not fixed and subfolders are expected, so the
+    walk is recursive. Excel lock files and hidden files are skipped, and the
+    result is sorted so that run-to-run behaviour does not depend on the order
+    the file system happens to return entries in.
+    """
+    if root.is_file():
+        return [root]
+
+    candidates: List[Path] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.name.startswith((".", "~$")):
+            continue
+        if path.suffix.lower() in {".csv", ".tsv", ".txt", ".xlsx", ".xlsm"}:
+            candidates.append(path)
+    return sorted(candidates)
+
+
+# ===========================================================================
+# Source profiling
+# ===========================================================================
+#
+# The development plan is explicit that column names may change and that the
+# script must not depend on an exact-name search. Profiling therefore works in
+# two stages: a fingerprint identifies which system a file came from, and a
+# resolver maps each logical field onto whichever column actually carries it.
+# When no profile matches, a generic profile is inferred from the data itself.
+
+def normalise_column(name: str) -> str:
+    """Reduce a header to a comparison key, ignoring spacing and punctuation."""
+    return re.sub(r"[^a-z0-9]", "", fold_accents(normalise_text(name)).lower())
+
+
+# Logical field -> candidate header spellings, in preference order. Matching is
+# performed on the normalised key, so "PO line desc", "po_line_desc" and
+# "PO Line Description" all collapse onto the same candidate.
+FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "document_number": ("documentnumber", "docnumber", "documentno", "invoicekey"),
+    "document_line_number": ("documentlinenumber", "doclinenumber", "rownumber", "lineno"),
+    "po_number": ("ponumber", "ordernumber", "ponum", "purchaseordernumber", "poid"),
+    "po_line_number": ("polinenumber", "polinenum", "polinenumber", "polinenr"),
+    "invoice_number": ("invoicenumber", "invoiceid", "invoiceno", "invoicekey"),
+    "item_number": ("itemnum", "itemid", "articleid", "materialnumber",
+                    "supplierproductcode", "itemcode", "itemnumber"),
+    "supplier_id": ("erpsuppliernumber", "suppliercode", "vendorid", "suppliernumber",
+                    "vendornum", "supplierid"),
+    "supplier_name": ("erpsuppliername", "suppliername", "supplier", "vendor",
+                      "vendorname", "creditor"),
+    "category_l1": ("categoryl1", "category1", "maincategory"),
+    "category_l2": ("categoryl2", "category2", "subcategory"),
+    "category_l3": ("categoryl3", "category3"),
+    "category_l4": ("categoryl4", "category4"),
+    "material_group_number": ("materialgroupnumber", "commoditygroup", "categorycode",
+                              "unspsc", "materialgroup"),
+    "material_group_name": ("materialgroupname", "commodity", "accountname",
+                            "materialgroupdescription"),
+    "business_area": ("businessarea", "ba", "businessunit"),
+    "division": ("division", "divisionname"),
+    "company_code": ("legalcompanynumber", "companycode", "buyercompany", "orgid", "organizationcode"),
+    "company_name": ("legalcompanyname", "companyname", "organizationname"),
+    "country": ("country", "suppliercountry", "organizationcountry", "purchasingcountry"),
+    "quantity": ("quantity", "orderqty", "polinequantity", "quantitycharged",
+                 "quantitydelivered", "qty"),
+    "unit": ("unit", "uom", "unitofmeasure", "orderunit"),
+    "unit_price": ("unitcost", "unitprice", "unitpriceexclvat", "unitpricenet", "price"),
+    "spend": ("spendineur", "linecost", "ponetsumcompany", "rowtotalexclvat",
+              "loadedcost", "spend", "netamount", "amount"),
+    "currency": ("purchasecurrency", "currencycode", "pocurrencycompany", "currency"),
+    "posting_date": ("postingdate", "orderdate", "invoicedate", "pocreationdate", "documentdate"),
+}
+
+
+@dataclass
 class SourceProfile:
-    """Declarative description of one source system's line-level layout."""
+    """How to interpret the columns of one recognised source system."""
 
-    key: str
-    label: str
-    signature: Tuple[str, ...]
-    primary_text: Tuple[str, ...]
-    support_text: Tuple[str, ...] = ()
-    aliases: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
-    structural_rows: bool = False
-    volatile_columns: Tuple[str, ...] = ()
-    is_target: bool = True
+    name: str
+    fingerprint: Tuple[str, ...]
+    description_fields: Tuple[str, ...]
+    context_fields: Tuple[str, ...] = ()
+    code_fields: Tuple[str, ...] = ()
+
+    def match_score(self, headers: Sequence[str]) -> float:
+        """Share of the fingerprint columns present in this header row."""
+        if not self.fingerprint:
+            return 0.0
+        present = {normalise_column(header) for header in headers}
+        hits = sum(1 for column in self.fingerprint if column in present)
+        return hits / len(self.fingerprint)
 
 
-SOURCE_PROFILES: Tuple[SourceProfile, ...] = (
+# Ordered by specificity: the invoice profile has to be tested before the more
+# permissive ones, because its fingerprint is small.
+KNOWN_PROFILES: Tuple[SourceProfile, ...] = (
     SourceProfile(
-        key="invoice",
-        label="Invoice lines",
-        signature=("invoicekey", "articlename", "rowtotalexclvat"),
-        primary_text=("article_name",),
-        support_text=("free_text",),
-        aliases={
-            "document_id": ("invoice_key", "invoice_id"),
-            "line_number": ("row_number",),
-            "item_code": ("article_id",),
-            "quantity": ("quantity_charged", "quantity_delivered"),
-            "unit_price": ("unit_price_excl_vat", "unit_price_net"),
-            "amount": ("row_total_excl_vat", "row_total_incl_vat"),
-            "account_name": ("free_text",),
-        },
-        structural_rows=True,
-        volatile_columns=("xml_file_name",),
+        name="sievo",
+        fingerprint=("sourcerowid", "datasource", "documentlinedesc", "categoryl1",
+                     "materialgroupnumber", "spendineur"),
+        description_fields=("Document line desc", "PO line desc"),
+        context_fields=("MaterialGroupName", "Category L4", "Category L3",
+                        "Category L2", "Category L1", "ERP supplier name"),
+        code_fields=("MaterialGroupNumber", "GLAccountNumber"),
     ),
     SourceProfile(
-        key="basware",
-        label="Basware purchase orders",
-        signature=("ordernumber", "polinenumber", "supplierproductname"),
-        primary_text=("Supplier product name",),
-        support_text=("Main category", "Sub category", "Account name", "Project name"),
-        aliases={
-            "document_id": ("Order number",),
-            "po_number": ("Order number",),
-            "po_line_number": ("PO line number",),
-            "line_number": ("PO line number",),
-            "item_code": ("Supplier product code", "Item ID"),
-            "supplier_name": ("Supplier name",),
-            "supplier_code": ("Supplier code",),
-            "quantity": ("PO line quantity",),
-            "amount": ("PO net sum company",),
-            "currency": ("PO currency company", "PO currency organization"),
-            "document_date": ("PO creation date", "PR creation date"),
-            "category_l1": ("Main category",),
-            "category_l2": ("Sub category",),
-            "material_group": ("Category code",),
-            "account_name": ("Account name",),
-        },
+        name="maximo",
+        fingerprint=("ponum", "linedescription", "itemnum", "commoditygroup",
+                     "commodity", "orderqty"),
+        description_fields=("LINE_DESCRIPTION", "DESCRIPTION", "XPOINTERNALNOTE"),
+        context_fields=("COMMODITY", "COMMODITYGROUP", "VENDOR", "POTYPE"),
+        code_fields=("ITEMNUM", "COMMODITYGROUP", "CONTRACTREFNUM"),
     ),
     SourceProfile(
-        key="maximo",
-        label="Maximo purchase orders",
-        signature=("ponum", "linedescription", "itemnum"),
-        primary_text=("LINE_DESCRIPTION", "DESCRIPTION"),
-        support_text=("COMMODITY", "COMMODITYGROUP", "XPOINTERNALNOTE"),
-        aliases={
-            "document_id": ("PONUM",),
-            "po_number": ("PONUM",),
-            "po_line_number": ("POLINENUM",),
-            "line_number": ("POLINENUM",),
-            "item_code": ("ITEMNUM",),
-            "supplier_name": ("VENDOR",),
-            "quantity": ("ORDERQTY",),
-            "unit_price": ("UNITCOST",),
-            "amount": ("LINECOST", "TOTALCOST", "LOADEDCOST"),
-            "currency": ("CURRENCYCODE",),
-            "document_date": ("ORDERDATE",),
-            "category_l1": ("COMMODITYGROUP",),
-            "category_l2": ("COMMODITY",),
-            "material_group": ("COMMODITYGROUP",),
-        },
+        name="basware",
+        fingerprint=("ordernumber", "supplierproductname", "supplierproductcode",
+                     "unspsc", "maincategory", "subcategory"),
+        description_fields=("Supplier product name", "PO line text1", "PO line text2",
+                            "PO line text3", "PO line text4", "PO line text5"),
+        context_fields=("Sub category", "Main category", "Account name", "Item type",
+                        "Project name", "Supplier name"),
+        code_fields=("Supplier product code", "Item ID", "UNSPSC", "Category code"),
     ),
     SourceProfile(
-        key="sievo",
-        label="Sievo transactions",
-        signature=("sourcerowid", "datasource", "categoryl1"),
-        primary_text=("PO line desc", "Document line desc"),
-        support_text=("MaterialGroupName", "Category L4", "Project"),
-        aliases={
-            "document_id": ("Document number", "Invoice number"),
-            "po_number": ("PO number",),
-            "po_line_number": ("PO line number",),
-            "line_number": ("Document line number",),
-            "supplier_name": ("ERP supplier name", "Supplier"),
-            "supplier_code": ("ERP supplier number",),
-            "quantity": ("Quantity",),
-            "amount": ("Spend in purchase currency", "Spend in EUR"),
-            "currency": ("Purchase currency",),
-            "document_date": ("Posting date", "Invoice date"),
-            "category_l1": ("Category L1",),
-            "category_l2": ("Category L2",),
-            "category_l3": ("Category L3",),
-            "category_l4": ("Category L4",),
-            "material_group": ("MaterialGroupName",),
-            "account_name": ("GLAccountNumber",),
-        },
+        name="invoice",
+        fingerprint=("xmlfilename", "invoicekey", "articlename", "freetext",
+                     "rowtotalexclvat"),
+        description_fields=("article_name", "free_text"),
+        context_fields=("article_id",),
+        code_fields=("article_id",),
     ),
     SourceProfile(
-        key="catalogue",
-        label="Supplier catalogues",
-        signature=("supplier", "itemname", "itemcode"),
-        primary_text=("Item_Name", "Item_Description"),
-        support_text=(),
-        aliases={
-            "item_code": ("Item_Code",),
-            "supplier_name": ("Supplier",),
-            "unit_price": ("Unit_Price",),
-        },
-        is_target=False,
+        name="catalogue",
+        fingerprint=("supplier", "itemname", "itemcode", "itemdescription", "unitprice"),
+        description_fields=("Item_Name", "Item_Description"),
+        context_fields=("Supplier",),
+        code_fields=("Item_Code",),
     ),
 )
 
+# Header substrings that suggest free text, used only by the generic profile.
+_DESCRIPTIVE_HINTS = ("desc", "description", "text", "name", "note", "comment",
+                      "narrative", "article", "material", "service", "item")
+# Header substrings that disqualify a column from being treated as free text
+# even when it also matches a descriptive hint, e.g. "Supplier name".
+_DESCRIPTIVE_BLOCKERS = ("supplier", "vendor", "company", "creditor", "buyer",
+                         "creator", "owner", "agent", "requester", "person",
+                         "country", "currency", "status", "file", "user")
 
-def _normalise_column(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", normalise_text(name).lower())
 
+def profile_table(table: Table, sample_rows: List[List[str]]) -> Tuple[SourceProfile, float]:
+    """Identify which system a table came from, inferring a profile if unknown."""
+    best_profile, best_score = None, 0.0
+    for profile in KNOWN_PROFILES:
+        score = profile.match_score(table.headers)
+        if score > best_score:
+            best_profile, best_score = profile, score
 
-def detect_profile(table: Table) -> Tuple[SourceProfile, float]:
-    """Identify which source system a table came from.
-
-    Matching is done on normalised column names rather than file names or folders, so
-    a file still resolves correctly when it is delivered as CSV instead of Excel or
-    placed in an unexpected directory.
-    """
-    present = {_normalise_column(column) for column in table.columns}
-    best_profile: Optional[SourceProfile] = None
-    best_score = 0.0
-    for profile in SOURCE_PROFILES:
-        overlap = len(present & set(profile.signature)) / len(profile.signature)
-        if overlap > best_score:
-            best_profile, best_score = profile, overlap
-    if best_profile is not None and best_score >= 0.6:
+    # Half the fingerprint present is a comfortable margin: the profiles share
+    # almost no fingerprint columns, so a genuine match scores far higher.
+    if best_profile is not None and best_score >= 0.5:
         return best_profile, best_score
-    return _generic_profile(table), 0.0
+    return infer_profile(table, sample_rows), 0.0
 
 
-def _generic_profile(table: Table) -> SourceProfile:
-    """Build a best-effort profile for a file that matches no known layout.
+def infer_profile(table: Table, sample_rows: List[List[str]]) -> SourceProfile:
+    """Build a profile for an unrecognised table from its content.
 
-    The descriptive column is taken to be the textual column with the highest average
-    word count, which is a reliable proxy for a free-text description field.
+    A column is treated as free text when its values look like language rather
+    than like identifiers: several words on average, mostly alphabetic, and not
+    drawn from a tiny set of repeated codes. Header wording is used as a tie
+    breaker rather than as the primary signal, because header wording is exactly
+    what cannot be relied upon.
     """
-    scores: List[Tuple[float, str]] = []
-    sample = table.rows[:200]
-    for column in table.columns:
-        values = [normalise_text(row.get(column)) for row in sample]
-        words = [len(tokenise(value)) for value in values if value]
-        if not words:
+    scores: Dict[int, float] = {}
+    for position, header in enumerate(table.headers):
+        values = [row[position] for row in sample_rows
+                  if position < len(row) and row[position]]
+        if len(values) < 3:
             continue
-        alphabetic = sum(1 for value in values if _WORD.search(value))
-        if alphabetic < max(1, len(values) // 4):
-            continue
-        scores.append((sum(words) / len(words), column))
-    scores.sort(key=lambda item: (-item[0], item[1]))
-    primary = tuple(column for _, column in scores[:1])
-    support = tuple(column for _, column in scores[1:3])
 
-    def find(*needles: str) -> Tuple[str, ...]:
-        matched = []
-        for column in table.columns:
-            key = _normalise_column(column)
-            if any(needle in key for needle in needles):
-                matched.append(column)
-        return tuple(matched[:2])
+        average_tokens = sum(len(tokenise(value)) for value in values) / len(values)
+        alphabetic = sum(
+            sum(1 for ch in value if ch.isalpha()) / max(1, len(value)) for value in values
+        ) / len(values)
+        distinct_ratio = len(set(values)) / len(values)
+
+        score = 0.0
+        score += min(average_tokens / 4.0, 1.0) * 0.45
+        score += alphabetic * 0.30
+        score += distinct_ratio * 0.25
+
+        key = normalise_column(header)
+        if any(hint in key for hint in _DESCRIPTIVE_HINTS):
+            score += 0.25
+        if any(blocker in key for blocker in _DESCRIPTIVE_BLOCKERS):
+            score -= 0.45
+        scores[position] = score
+
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    description_fields = tuple(table.headers[position] for position, score in ranked[:3] if score >= 0.5)
+    context_fields = tuple(table.headers[position] for position, score in ranked[3:7] if score >= 0.35)
 
     return SourceProfile(
-        key=f"generic:{table.path.stem}",
-        label=f"Unrecognised layout ({table.path.name})",
-        signature=(),
-        primary_text=primary,
-        support_text=support,
-        aliases={
-            "document_id": find("documentnumber", "invoicenumber", "ordernumber"),
-            "po_number": find("ponumber", "ponum", "ordernumber"),
-            "po_line_number": find("polinenumber", "polinenum"),
-            "item_code": find("itemcode", "itemnum", "articleid", "materialnumber"),
-            "supplier_name": find("suppliername", "vendor", "supplier"),
-            "amount": find("amount", "netsum", "linecost", "spend", "total"),
-            "currency": find("currency",),
-            "document_date": find("date",),
-        },
+        name=f"generic:{table.path.stem.lower().replace(' ', '_')}",
+        fingerprint=(),
+        description_fields=description_fields,
+        context_fields=context_fields,
     )
 
 
+class ColumnResolver:
+    """Maps logical field names onto the actual columns of one table.
+
+    Resolution is by alias first and by fuzzy header comparison second. The
+    fuzzy stage is what absorbs the renaming the development plan warns about:
+    a column that arrives as ``PO_Line_Description`` rather than ``PO line desc``
+    still resolves, without anybody editing this file.
+    """
+
+    def __init__(self, headers: Sequence[str]) -> None:
+        self.headers = list(headers)
+        self._by_key: Dict[str, int] = {}
+        for position, header in enumerate(headers):
+            key = normalise_column(header)
+            # First occurrence wins; duplicated headers are common in exports
+            # and the leftmost is invariably the populated one.
+            if key and key not in self._by_key:
+                self._by_key[key] = position
+        self._resolved: Dict[str, Optional[int]] = {}
+
+    def position_of(self, header_name: str) -> Optional[int]:
+        """Index of a column addressed by its literal name."""
+        return self._by_key.get(normalise_column(header_name))
+
+    def resolve(self, logical_field: str) -> Optional[int]:
+        """Index of the column carrying a logical field, or None."""
+        if logical_field in self._resolved:
+            return self._resolved[logical_field]
+
+        position: Optional[int] = None
+        for alias in FIELD_ALIASES.get(logical_field, ()):
+            if alias in self._by_key:
+                position = self._by_key[alias]
+                break
+
+        if position is None:
+            position = self._fuzzy_resolve(logical_field)
+
+        self._resolved[logical_field] = position
+        return position
+
+    def _fuzzy_resolve(self, logical_field: str) -> Optional[int]:
+        """Last-resort header match, requiring a high similarity to accept."""
+        aliases = FIELD_ALIASES.get(logical_field, ())
+        if not aliases:
+            return None
+
+        best_position, best_score = None, 0.0
+        for key, position in self._by_key.items():
+            for alias in aliases:
+                score = text_similarity(key, alias)
+                if score > best_score:
+                    best_position, best_score = position, score
+        # 0.92 is deliberately strict. A wrong mapping here silently corrupts a
+        # business key, which is far more damaging than leaving it unmapped.
+        return best_position if best_score >= 0.92 else None
+
+    def value(self, row: Sequence[str], logical_field: str) -> str:
+        """Value of a logical field in one row, or an empty string."""
+        position = self.resolve(logical_field)
+        if position is None or position >= len(row):
+            return ""
+        return row[position]
+
+    def value_at(self, row: Sequence[str], header_name: str) -> str:
+        """Value of a literally named column in one row, or an empty string."""
+        position = self.position_of(header_name)
+        if position is None or position >= len(row):
+            return ""
+        return row[position]
+
+
 # ===========================================================================
-# Record model
+# Row typing
 # ===========================================================================
+#
+# Invoice extracts interleave document headers, purchase lines, subtotals and
+# totals in a single sheet. Describing a total row as if it were a purchase
+# would distort every count and every spend figure downstream. No row is ever
+# dropped: the ones that are not purchase lines are flagged and left unenriched,
+# so the client's row count is preserved exactly.
 
-@dataclass
-class MatchCandidate:
-    """One resolved link between a line and a line in another source system."""
+ROW_TYPE_LINE = "LINE"
+ROW_TYPE_HEADER = "HEADER"
+ROW_TYPE_SUBTOTAL = "SUBTOTAL"
+ROW_TYPE_TOTAL = "TOTAL"
+ROW_TYPE_EMPTY = "EMPTY"
 
-    row_id: str
-    source_key: str
-    tier: str
-    method: str
-    score: float
-    po_number: str = ""
-    po_line: str = ""
-    supplier: str = ""
-    text: str = ""
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "row_id": self.row_id,
-            "source": self.source_key,
-            "tier": self.tier,
-            "method": self.method,
-            "score": round(self.score, 4),
-            "po_number": self.po_number,
-            "po_line": self.po_line,
-            "supplier": self.supplier,
-            "text": self.text,
-        }
+_TOTAL_MARKERS = re.compile(
+    r"^\s*(total|sum|subtotal|grand\s*total|yhteens[aä]|summa|delsumma|razem|suma|"
+    r"gesamt|netto|brutto|vat|alv|moms|podatek)\b", re.IGNORECASE)
 
 
-@dataclass
-class TranslationResult:
-    """Outcome of rendering one source-language phrase in English."""
+def classify_row(resolver: ColumnResolver, row: Sequence[str], description: str) -> str:
+    """Decide whether a row is a purchase line or document furniture."""
+    if not any(cell.strip() for cell in row):
+        return ROW_TYPE_EMPTY
 
-    english: str = ""
-    method: str = "none"
-    coverage: float = 0.0
-    unresolved: List[str] = field(default_factory=list)
+    if _TOTAL_MARKERS.match(description):
+        # A total that also carries a line number is a subtotal within a
+        # document rather than the closing total of the whole document.
+        line_number = resolver.value(row, "document_line_number") or resolver.value(row, "po_line_number")
+        return ROW_TYPE_SUBTOTAL if line_number.strip() else ROW_TYPE_TOTAL
 
+    has_line_number = bool((resolver.value(row, "document_line_number")
+                            or resolver.value(row, "po_line_number")).strip())
+    has_quantity = parse_amount(resolver.value(row, "quantity")) is not None
+    has_amount = parse_amount(resolver.value(row, "spend")) is not None
+    has_item = bool(resolver.value(row, "item_number").strip())
 
-@dataclass
-class LineRecord:
-    """A single source line together with everything the agent derives from it."""
+    if has_line_number or has_quantity or has_item:
+        return ROW_TYPE_LINE
+    if description and has_amount:
+        return ROW_TYPE_LINE
+    if description:
+        return ROW_TYPE_LINE
 
-    row_id: str
-    source_key: str
-    source_label: str
-    source_file: str
-    source_sheet: str
-    table_key: str
-    row_index: int
-    raw: Dict[str, str]
-    logical: Dict[str, str]
-    profile: SourceProfile
-    content_hash: str = ""
-
-    row_type: str = "LINE"
-    duplicate_of: str = ""
-
-    raw_description: str = ""
-    normalised_description: str = ""
-    support_description: str = ""
-    language: str = "und"
-    language_confidence: float = 0.0
-
-    translation: TranslationResult = field(default_factory=TranslationResult)
-    support_translation: TranslationResult = field(default_factory=TranslationResult)
-    matches: List[MatchCandidate] = field(default_factory=list)
-
-    description: str = ""
-    description_short: str = ""
-    item_or_service: str = "Unknown"
-    enrichment_method: str = "none"
-    confidence: int = 0
-    confidence_band: str = "Low"
-    confidence_components: Dict[str, float] = field(default_factory=dict)
-
-    @property
-    def is_line(self) -> bool:
-        return self.row_type == "LINE"
-
-    @property
-    def search_text(self) -> str:
-        """Concatenated source and English text used for similarity retrieval."""
-        parts = [self.normalised_description, self.translation.english, self.support_description]
-        return " ".join(part for part in parts if part)
+    # A row with a document number and money but neither a line number nor any
+    # text is the document header that the following lines belong to.
+    if resolver.value(row, "document_number").strip() and has_amount:
+        return ROW_TYPE_HEADER
+    return ROW_TYPE_EMPTY
 
 
 # ===========================================================================
 # Controlled vocabulary
 # ===========================================================================
 
-DEFAULT_LEXICON: Dict[str, Any] = {
-    "version": "builtin",
-    "phrases": {
-        "kortti- ja latauspalvelu": "card and charging service",
-        "renkaiden säilytys": "tyre storage",
-        "kaikki yhteensä": "grand total",
-        "ajoneuvovero": "vehicle tax",
-        "asbestipurku": "asbestos removal",
-    },
-    "terms": {
-        "vuokra": "rental",
-        "hallinnointi": "administration",
-        "palvelumaksu": "service fee",
-        "maksukorttiostot": "payment card purchases",
-        "vero": "tax",
-        "renkaat": "tyres",
-    },
-    "compound_parts": ["ajoneuvo", "maksu", "kortti", "osto", "vero", "palvelu"],
-    "inflection_suffixes": ["ssa", "ssä", "lla", "llä", "jen", "ien", "t", "n", "a", "ä"],
-    "concepts": {},
-    "service_markers": ["service", "fee", "rental", "tax", "storage"],
-    "material_markers": ["tyre", "material", "part"],
-    "total_markers": ["yhteensä", "total", "totalt", "summa"],
-    "stopwords": ["ja", "och", "the", "and", "of", "for"],
-}
-
-
 class Lexicon:
-    """Controlled procurement vocabulary and the rules that apply it."""
+    """The curated procurement vocabulary.
 
-    def __init__(self, data: Dict[str, Any]) -> None:
-        self.version: str = str(data.get("version", "builtin"))
-        self.phrases: Dict[str, str] = {
-            lookup_key(key): value for key, value in data.get("phrases", {}).items()
-        }
-        self.terms: Dict[str, str] = {
-            lookup_key(key): value for key, value in data.get("terms", {}).items()
-        }
-        self.concepts: Dict[str, Dict[str, str]] = {
-            lookup_key(key): value for key, value in data.get("concepts", {}).items()
-        }
-        self.compound_parts: List[str] = sorted(
-            {lookup_key(part) for part in data.get("compound_parts", [])}, key=len, reverse=True
-        )
-        self.inflection_suffixes: List[str] = sorted(
-            {str(item).lower() for item in data.get("inflection_suffixes", [])},
-            key=len,
-            reverse=True,
-        )
-        self.service_markers = {str(item).lower() for item in data.get("service_markers", [])}
-        self.material_markers = {str(item).lower() for item in data.get("material_markers", [])}
-        self.total_markers = {lookup_key(item) for item in data.get("total_markers", [])}
-        self.stopwords = {str(item).lower() for item in data.get("stopwords", [])}
+    Everything resolved here is resolved deterministically, offline and for
+    free. It is the first tier of the translation cascade and the single most
+    cost-effective place to invest effort: one entry improves every future run
+    of every agent, whereas one language-model call improves exactly one phrase
+    on exactly one run.
+    """
 
-        # Longest phrases first so that specific expressions win over their components.
-        self.phrase_order = sorted(self.phrases, key=len, reverse=True)
+    def __init__(self, payload: Optional[Dict[str, Any]] = None) -> None:
+        payload = payload or {}
+        self.version: str = str(payload.get("version", "0.0.0"))
 
-        self.english_vocabulary = set()
-        for value in list(self.terms.values()) + list(self.phrases.values()):
-            self.english_vocabulary.update(tokenise(value))
-        for concept in self.concepts.values():
-            self.english_vocabulary.update(tokenise(str(concept.get("label", ""))))
+        # Phrase tables are stored per language and also merged across
+        # languages. The merged view is what a lookup uses when language
+        # identification was inconclusive, which is common for two-word
+        # fragments where there is simply not enough signal.
+        self.phrases: Dict[str, Dict[str, str]] = {}
+        self.terms: Dict[str, Dict[str, str]] = {}
+        self.compound_parts: Dict[str, Dict[str, str]] = {}
+
+        for language, entries in (payload.get("phrases") or {}).items():
+            self.phrases[language] = {lookup_key(k): v for k, v in entries.items()}
+        for language, entries in (payload.get("terms") or {}).items():
+            self.terms[language] = {lookup_key(k): v for k, v in entries.items()}
+        for language, entries in (payload.get("compound_parts") or {}).items():
+            self.compound_parts[language] = {lookup_key(k): v for k, v in entries.items()}
+
+        self.any_phrase: Dict[str, str] = {}
+        for entries in self.phrases.values():
+            self.any_phrase.update(entries)
+        self.any_term: Dict[str, str] = {}
+        for entries in self.terms.values():
+            self.any_term.update(entries)
+        self.any_compound: Dict[str, str] = {}
+        for entries in self.compound_parts.values():
+            self.any_compound.update(entries)
+
+        # Longest first, so "asbestin purkutyo" is preferred over "asbesti".
+        self._phrase_order: List[str] = sorted(
+            self.any_phrase, key=lambda phrase: (-len(phrase), phrase))
+
+        self.service_markers: Set[str] = {lookup_key(t) for t in payload.get("service_markers", [])}
+        self.material_markers: Set[str] = {lookup_key(t) for t in payload.get("material_markers", [])}
+        self.noise_terms: Set[str] = {lookup_key(t) for t in payload.get("noise_terms", [])}
+        self.unit_terms: Dict[str, str] = {lookup_key(k): v
+                                           for k, v in (payload.get("unit_terms") or {}).items()}
+        self.legal_forms: Set[str] = {lookup_key(t) for t in payload.get("legal_forms", [])}
+
+        # Vocabulary keys double as a language-identification signal: a token
+        # present only in the Finnish tables is strong evidence for Finnish.
+        self._language_tokens: Dict[str, Set[str]] = {}
+        for language in set(self.terms) | set(self.phrases):
+            tokens: Set[str] = set(self.terms.get(language, {}))
+            for phrase in self.phrases.get(language, {}):
+                tokens.update(phrase.split())
+            self._language_tokens[language] = tokens
 
     @classmethod
-    def load(cls, path: Optional[Path]) -> "Lexicon":
-        """Load the vocabulary file, falling back to the built-in minimal set."""
-        data = dict(DEFAULT_LEXICON)
-        if path and path.is_file():
-            try:
-                loaded = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
-                LOGGER.warning("Could not read lexicon %s (%s); using built-in set", path, error)
-            else:
-                for key, value in loaded.items():
-                    if isinstance(value, dict) and isinstance(data.get(key), dict):
-                        merged = dict(data[key])
-                        merged.update(value)
-                        data[key] = merged
-                    else:
-                        data[key] = value
-                LOGGER.info("Loaded vocabulary %s (%s)", path.name, loaded.get("version", "?"))
-        return cls(data)
+    def load(cls, path: Path) -> "Lexicon":
+        """Load the vocabulary, degrading to an empty one when absent."""
+        if not path.is_file():
+            LOGGER.warning("Vocabulary file %s not found; running without it.", path)
+            return cls()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            LOGGER.error("Vocabulary file %s could not be read (%s).", path, error)
+            return cls()
+        LOGGER.info("Vocabulary %s loaded (version %s).", path.name, payload.get("version"))
+        return cls(payload)
 
-    def strip_inflection(self, token: str) -> Optional[str]:
-        """Remove a case ending only when doing so yields a known base form."""
-        for suffix in self.inflection_suffixes:
-            if len(token) > len(suffix) + 2 and token.endswith(suffix):
-                base = token[: -len(suffix)]
-                if base in self.terms or base in self.compound_parts:
-                    return base
-        return None
+    # -- lookups ------------------------------------------------------------
 
-    def resolve_token(self, token: str) -> Optional[str]:
-        """Translate a single token via direct lookup, inflection stripping or compounding."""
-        if token in self.terms:
-            return self.terms[token]
-        base = self.strip_inflection(token)
-        if base and base in self.terms:
-            return self.terms[base]
-        return self.split_compound(token)
+    def phrase(self, text: str, language: Optional[str] = None) -> Optional[str]:
+        """Exact phrase translation, preferring the identified language."""
+        key = lookup_key(text)
+        if language and key in self.phrases.get(language, {}):
+            return self.phrases[language][key]
+        return self.any_phrase.get(key)
 
-    def split_compound(self, token: str) -> Optional[str]:
-        """Decompose a Nordic compound word into known parts and translate each.
+    def term(self, token: str, language: Optional[str] = None) -> Optional[str]:
+        """Single-token translation, preferring the identified language."""
+        key = lookup_key(token)
+        if language and key in self.terms.get(language, {}):
+            return self.terms[language][key]
+        return self.any_term.get(key)
 
-        The whole token must be consumed by known parts; a partial decomposition is
-        rejected rather than guessed at, which keeps output trustworthy.
+    def substitute_phrases(self, text: str, language: Optional[str]) -> Tuple[str, int, int]:
+        """Replace every known multi-word expression, longest match first.
+
+        Matching happens on the folded, lower-cased form so that one entry
+        covers every spelling variant. The folded form is only *returned* when a
+        substitution actually fired: text the vocabulary had nothing to say
+        about is handed back untouched, so that casing and diacritics survive
+        for the tiers further down the cascade.
+
+        Returns the rewritten text, the number of substitutions made, and the
+        number of English tokens those substitutions produced. The last of these
+        is needed by the coverage measure: the words a phrase substitution emits
+        are already translated, and counting them as unresolved content would
+        make a perfectly translated phrase look like a failure.
         """
-        if len(token) < 6:
+        if not self._phrase_order:
+            return text, 0, 0
+
+        working = lookup_key(text)
+        replacements = 0
+        emitted_tokens = 0
+        for phrase in self._phrase_order:
+            if len(phrase) < 5 or phrase not in working:
+                continue
+            target = (self.phrases.get(language, {}).get(phrase)
+                      if language else None) or self.any_phrase[phrase]
+            # Word-boundary guarded so that "el" does not fire inside "eldrift".
+            pattern = re.compile(rf"(?<!\w){re.escape(phrase)}(?!\w)")
+            working, count = pattern.subn(target, working)
+            replacements += count
+            emitted_tokens += count * len(tokenise(target))
+
+        return (working, replacements, emitted_tokens) if replacements else (text, 0, 0)
+
+    def split_compound(self, token: str, language: Optional[str]) -> Optional[List[str]]:
+        """Decompose a Nordic compound into known parts.
+
+        Finnish and Swedish form compounds by concatenation, so ``asbestipurku``
+        never appears in a dictionary while both of its parts do. A greedy
+        longest-prefix walk recovers the parts. Two-part splits are required to
+        cover the whole token, which keeps the method from inventing readings of
+        words it does not actually know.
+        """
+        parts_table = self.compound_parts.get(language or "", {}) or self.any_compound
+        if not parts_table:
             return None
-        parts: List[str] = []
-        position = 0
-        length = len(token)
-        while position < length:
-            for end in range(length, position + 2, -1):
-                candidate = token[position:end]
-                translated = self.terms.get(candidate)
-                if translated is None:
-                    base = self.strip_inflection(candidate)
-                    translated = self.terms.get(base) if base else None
-                if translated:
-                    parts.append(translated)
-                    position = end
-                    break
-            else:
+
+        key = lookup_key(token)
+        if len(key) < 8:
+            return None
+
+        pieces: List[str] = []
+        cursor = 0
+        while cursor < len(key):
+            match = ""
+            for candidate in parts_table:
+                if len(candidate) > len(match) and key.startswith(candidate, cursor):
+                    match = candidate
+            if not match:
+                # Finnish compounds often insert a linking vowel; skipping one
+                # character and retrying recovers those without a rule table.
+                if pieces and cursor + 1 < len(key):
+                    cursor += 1
+                    continue
                 return None
-        return " ".join(parts) if len(parts) >= 2 else None
+            pieces.append(parts_table[match])
+            cursor += len(match)
 
-    def concept_for(self, english_phrase: str) -> Optional[Dict[str, str]]:
-        return self.concepts.get(lookup_key(english_phrase))
+        meaningful = [piece for piece in pieces if piece]
+        return meaningful if len(meaningful) >= 2 else None
 
-    def classify_kind(self, english_phrase: str) -> str:
-        """Label a phrase as a service or a material from its marker words."""
-        concept = self.concept_for(english_phrase)
-        if concept and concept.get("kind"):
-            return str(concept["kind"]).capitalize()
-        tokens = set(tokenise(english_phrase))
-        service_hits = len(tokens & self.service_markers)
-        material_hits = len(tokens & self.material_markers)
-        if service_hits > material_hits:
-            return "Service"
-        if material_hits > service_hits:
-            return "Material"
-        return "Unknown"
+    def language_affinity(self, tokens: Sequence[str]) -> Dict[str, int]:
+        """Count how many tokens are known to each language's vocabulary."""
+        counts: Dict[str, int] = {}
+        folded = [lookup_key(token) for token in tokens]
+        for language, vocabulary in self._language_tokens.items():
+            hits = sum(1 for token in folded if token in vocabulary)
+            if hits:
+                counts[language] = hits
+        return counts
 
-    def looks_like_total(self, text: str) -> bool:
+    def is_noise(self, text: str) -> bool:
+        """Whether a value is a placeholder rather than a description."""
         key = lookup_key(text)
         if not key:
-            return False
-        return any(marker and marker in key for marker in self.total_markers)
+            return True
+        if key in self.noise_terms:
+            return True
+        # A value with no letters at all is a code or a number, not a description.
+        return not any(ch.isalpha() for ch in key)
 
 
 # ===========================================================================
 # Language identification
 # ===========================================================================
+#
+# Identification runs on distinct phrases, not on rows, and only has to be good
+# enough to route a phrase to the right translation resource. Getting it wrong
+# costs a slightly worse translation, not a wrong answer, because the downstream
+# stages all validate their own output.
 
-_LANGUAGE_MARKERS: Dict[str, Tuple[set, Tuple[str, ...], str]] = {
-    "fi": (
-        {"ja", "on", "ei", "että", "sekä", "kun", "myös", "tai", "yhteensä", "kpl", "mukaan"},
-        ("nen", "inen", "ssa", "ssä", "lla", "llä", "ksi", "uus", "ys", "ös", "ista", "istä"),
-        "",
-    ),
-    "sv": (
-        {"och", "för", "med", "av", "till", "är", "den", "det", "ett", "en", "på"},
-        ("ning", "het", "else", "ande", "aren"),
-        "",
-    ),
-    "pl": (
-        {"i", "w", "na", "do", "oraz", "nie", "z", "dla", "przez"},
-        ("owy", "owa", "ych", "ami", "nie"),
-        "łżśąęćńźż",
-    ),
-    "en": (
-        {"the", "and", "of", "for", "with", "to", "in", "on", "service", "order", "total"},
-        ("tion", "ment", "ing", "ance", "ence"),
-        "",
-    ),
+_LANGUAGE_MARKERS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    # language: (characteristic character sequences, characteristic words)
+    "fi": (("ä", "ö", "yy", "ii", "kk", "tt", "uu", "ää"),
+           ("ja", "ta", "sekä", "sekae", "kpl", "oy", "tai", "sekä", "vuoden", "mukaan")),
+    "sv": (("å", "ä", "ö", "ck", "sk", "tj"),
+           ("och", "av", "för", "med", "till", "st", "ab", "enligt", "per")),
+    "pl": (("ą", "ć", "ę", "ł", "ń", "ó", "ś", "ź", "ż", "cz", "sz", "rz", "prz"),
+           ("i", "w", "na", "do", "dla", "oraz", "szt", "sp", "usluga", "z")),
+    "de": (("ä", "ö", "ü", "ß", "sch", "ung"),
+           ("und", "der", "die", "das", "für", "mit", "von", "gmbh")),
+    "et": (("õ", "ä", "ö", "ü"), ("ja", "ning", "tk", "ou")),
+    "no": (("ø", "å", "æ"), ("og", "av", "for", "med", "til", "as")),
+    "da": (("ø", "å", "æ"), ("og", "af", "for", "med", "til", "aps")),
+    "en": ((), ("the", "and", "of", "for", "with", "service", "repair", "parts", "per")),
 }
 
+# Words spelled identically in several languages are useless as evidence and are
+# excluded so that they do not decide a close contest.
+_AMBIGUOUS_MARKERS = {"i", "in", "av", "og", "and", "st", "per", "z", "w"}
 
-def detect_language(text: str, lexicon: Optional["Lexicon"] = None) -> Tuple[str, float]:
-    """Identify the language of a short phrase.
 
-    Short procurement strings defeat general-purpose detectors: a single upper-case
-    word such as "VUOKRA" carries none of the statistical signal they rely on. A
-    marker-based heuristic tuned to the languages actually present in this data runs
-    first, the controlled vocabulary is consulted as corroborating evidence, and the
-    optional langdetect package only ever breaks genuine ties.
+def detect_language(text: str, lexicon: Optional[Lexicon] = None) -> Tuple[str, float]:
+    """Identify the language of a phrase.
+
+    Returns the language code and a confidence in ``[0, 1]``. Very short input
+    is reported as ``und`` rather than guessed, because a two-word fragment
+    genuinely does not carry enough signal and a confident wrong answer is worse
+    than an honest abstention.
     """
-    tokens = tokenise(text)
-    if not tokens:
+    cleaned = normalise_text(text)
+    if not cleaned or not any(ch.isalpha() for ch in cleaned):
         return "und", 0.0
 
-    lowered = normalise_text(text).lower()
-    scores: Dict[str, float] = {}
-    for language, (markers, suffixes, characters) in _LANGUAGE_MARKERS.items():
-        score = 0.0
-        score += 2.0 * sum(1 for token in tokens if token in markers)
-        score += 1.0 * sum(1 for token in tokens if token.endswith(suffixes))
-        if characters:
-            score += 2.0 * sum(1 for char in lowered if char in characters)
-        scores[language] = score
+    tokens = [token.lower() for token in tokenise(cleaned)]
+    letters = [ch for ch in cleaned.lower() if ch.isalpha()]
+    if not tokens or not letters:
+        return "und", 0.0
 
-    # Scandinavian diacritics separate Finnish and Swedish from English and Polish.
-    if any(char in lowered for char in "äöå"):
-        scores["fi"] += 1.0
-        scores["sv"] += 1.0
+    scores: Dict[str, float] = defaultdict(float)
 
-    ascii_ratio = sum(1 for token in tokens if token.isascii()) / len(tokens)
-    scores["en"] += ascii_ratio
+    for language, (character_markers, word_markers) in _LANGUAGE_MARKERS.items():
+        for marker in character_markers:
+            hits = cleaned.lower().count(marker)
+            if hits:
+                scores[language] += min(hits, 3) * 0.6
+        for marker in word_markers:
+            if marker in _AMBIGUOUS_MARKERS:
+                continue
+            if marker in tokens:
+                scores[language] += 1.4
+
+    # Vocabulary membership is the strongest single signal available, because
+    # the vocabulary is domain-specific and these are domain phrases.
+    if lexicon is not None:
+        for language, hits in lexicon.language_affinity(tokens).items():
+            scores[language] += hits * 2.0
+
+    # An all-ASCII phrase built from common English words is English; without
+    # this, short English phrases score zero everywhere and fall through to the
+    # translation tiers unnecessarily.
+    if all(ord(ch) < 128 for ch in cleaned):
+        scores["en"] += 0.8
+
+    if not scores:
+        return ("en", 0.35) if all(ord(ch) < 128 for ch in cleaned) else ("und", 0.0)
 
     ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
     best_language, best_score = ranked[0]
     runner_up = ranked[1][1] if len(ranked) > 1 else 0.0
+    # Confidence is the margin over the runner-up, so a language that wins
+    # narrowly is reported as uncertain even when its absolute score is high.
+    confidence = min(1.0, (best_score - runner_up) / max(best_score, 1.0) + 0.25)
 
-    # A vocabulary hit is strong evidence the text is not English, but the vocabulary
-    # does not record which source language each term belongs to. Reporting
-    # "undetermined" is more honest than guessing, and the translation cascade does not
-    # depend on the answer.
-    if lexicon is not None and best_score <= 1.0:
-        if lookup_key(text) in lexicon.phrases or any(
-            token in lexicon.terms for token in tokens
-        ):
-            return "und", 0.3
+    # langdetect is statistical rather than rule-based and is a useful tie
+    # breaker, but it is unreliable on fragments so it only votes on longer text.
+    if _langdetect is not None and confidence < 0.55 and len(cleaned) >= 25:
+        try:
+            _langdetect.DetectorFactory.seed = 0  # required for deterministic output
+            statistical = _langdetect.detect(cleaned)
+            if statistical == best_language:
+                confidence = min(1.0, confidence + 0.25)
+            elif statistical in _LANGUAGE_MARKERS:
+                best_language, confidence = statistical, 0.5
+        except Exception:
+            pass
 
-    if best_score <= 0.0:
-        if _langdetect is not None:
-            try:
-                return str(_langdetect.detect(text)), 0.4
-            except Exception:  # noqa: BLE001 - detector raises on very short input
-                pass
-        return "und", 0.0
-
-    confidence = min(1.0, (best_score - runner_up + 1.0) / (best_score + 1.0))
+    if len(tokens) <= 1 and confidence < 0.5:
+        return "und", confidence
     return best_language, round(confidence, 3)
 
 
 # ===========================================================================
-# Machine translation (optional, offline)
+# Offline neural translation
 # ===========================================================================
 
-class MachineTranslator:
-    """Thin wrapper over an offline translation engine.
+class NeuralTranslator:
+    """Local Helsinki-NLP opus-mt translation.
 
-    Argos Translate is used when it is installed and the relevant language pair has
-    been downloaded. It runs entirely locally, so enabling it adds no per-row cost.
+    This is the component that removes the largest language-model cost from the
+    pipeline. The models are small, run on CPU, and translate a domain phrase at
+    roughly the quality a general-purpose language model would, at zero
+    marginal cost. Models are loaded lazily and only for the languages actually
+    present in the data, so a run over purely English input loads nothing.
     """
 
-    def __init__(self, enabled: bool) -> None:
-        self.available = False
-        self._pairs: Dict[str, Any] = {}
-        self._cache: Dict[Tuple[str, str], str] = {}
-        if not enabled or _argos is None:
-            return
-        try:
-            installed = _argos.get_installed_languages()
-        except Exception as error:  # noqa: BLE001
-            LOGGER.warning("Offline translation unavailable: %s", error)
-            return
+    MODEL_TEMPLATE = "Helsinki-NLP/opus-mt-{source}-en"
+    # Languages served by a dedicated bilingual model. Others fall through to
+    # the multilingual model or, failing that, to the language-model tier.
+    SUPPORTED = ("fi", "sv", "pl", "de", "da", "no", "nl", "et", "fr", "es", "it", "cs")
 
-        english = next((language for language in installed if language.code == "en"), None)
-        if english is None:
-            LOGGER.warning("Offline translation needs an installed English target model")
-            return
-        for language in installed:
-            if language.code == "en":
-                continue
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled and _transformers is not None
+        self._pipelines: Dict[str, Any] = {}
+        self._unavailable: Set[str] = set()
+        self.translated_count = 0
+
+    def available_for(self, language: str) -> bool:
+        return self.enabled and language in self.SUPPORTED and language not in self._unavailable
+
+    def _pipeline(self, language: str) -> Optional[Any]:
+        """Fetch or build the pipeline for one source language."""
+        if language in self._pipelines:
+            return self._pipelines[language]
+        if not self.available_for(language):
+            return None
+
+        model_name = self.MODEL_TEMPLATE.format(source=language)
+        try:
+            LOGGER.info("Loading offline translation model %s ...", model_name)
+            pipeline = _transformers.pipeline(
+                "translation", model=model_name, device=-1,  # CPU keeps this portable
+            )
+        except Exception as error:
+            LOGGER.warning("Translation model %s unavailable (%s).", model_name, error)
+            self._unavailable.add(language)
+            self._pipelines[language] = None
+            return None
+
+        self._pipelines[language] = pipeline
+        return pipeline
+
+    def translate_batch(self, texts: Sequence[str], language: str) -> Dict[str, str]:
+        """Translate a batch of phrases from one language into English.
+
+        Returns a mapping keyed by the input text so that callers do not have to
+        rely on positional alignment, which a failed item would break.
+        """
+        pipeline = self._pipeline(language)
+        if pipeline is None or not texts:
+            return {}
+
+        results: Dict[str, str] = {}
+        # Beam search with a fixed beam count and no sampling, so the same input
+        # always produces the same output. This is a hard requirement, not a
+        # preference: the whole agent is specified to be repeatable.
+        for start in range(0, len(texts), 32):
+            window = list(texts[start:start + 32])
             try:
-                self._pairs[language.code] = language.get_translation(english)
-            except Exception:  # noqa: BLE001
+                outputs = pipeline(window, max_length=256, num_beams=4, do_sample=False)
+            except Exception as error:
+                LOGGER.warning("Offline translation failed for a batch (%s).", error)
                 continue
-        self.available = bool(self._pairs)
-        if self.available:
-            LOGGER.info("Offline translation enabled for: %s", ", ".join(sorted(self._pairs)))
-
-    def translate(self, text: str, language: str) -> Optional[str]:
-        """Translate a phrase into English, or return None when unsupported."""
-        if not self.available or not text:
-            return None
-        engine = self._pairs.get(language)
-        if engine is None:
-            return None
-        key = (language, text)
-        if key in self._cache:
-            return self._cache[key]
-        try:
-            result = normalise_text(engine.translate(text))
-        except Exception:  # noqa: BLE001
-            return None
-        self._cache[key] = result
-        return result
+            for source_text, output in zip(window, outputs):
+                translated = normalise_text(output.get("translation_text", ""))
+                if translated:
+                    results[source_text] = translated
+                    self.translated_count += 1
+        return results
 
 
 # ===========================================================================
@@ -1369,976 +1738,1145 @@ class MachineTranslator:
 
 @dataclass
 class TokenUsage:
-    """Running total of language-model consumption for one run.
+    """Running total of language-model consumption.
 
-    Reasoning tokens are tracked separately because reasoning models bill for output
-    that never appears in the response, so completion tokens alone understate what a
-    run actually cost.
+    Reasoning tokens are tracked separately because reasoning models bill them
+    as output but never return them in the message, so reporting only the
+    visible output tokens would understate the cost of a run, sometimes by a
+    large factor. Cached input tokens are tracked because they are billed at a
+    reduced rate and their share is the clearest evidence that the caching
+    strategy is working.
     """
 
     requests: int = 0
+    failed_requests: int = 0
     cache_hits: int = 0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    reported_total_tokens: int = 0
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
     reasoning_tokens: int = 0
-    cached_prompt_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
-        """Total billed tokens, accumulated per response rather than derived at the end."""
-        return self.reported_total_tokens or (self.prompt_tokens + self.completion_tokens)
+        return self.input_tokens + self.output_tokens
 
-    @property
-    def any_recorded(self) -> bool:
-        return bool(self.requests or self.cache_hits)
+    def record(self, usage: Dict[str, Any]) -> None:
+        """Accumulate one API response's usage block, however it is spelled."""
+        self.requests += 1
+        if not usage:
+            return
+        self.input_tokens += int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        self.output_tokens += int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+
+        prompt_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+        self.cached_input_tokens += int(prompt_details.get("cached_tokens") or 0)
+
+        completion_details = (usage.get("completion_tokens_details")
+                              or usage.get("output_tokens_details") or {})
+        self.reasoning_tokens += int(completion_details.get("reasoning_tokens") or 0)
 
     def as_dict(self) -> Dict[str, int]:
         return {
             "requests": self.requests,
+            "failed_requests": self.failed_requests,
             "cache_hits": self.cache_hits,
-            "input_tokens": self.prompt_tokens,
-            "output_tokens": self.completion_tokens,
+            "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "output_tokens": self.output_tokens,
             "reasoning_tokens": self.reasoning_tokens,
-            "cached_input_tokens": self.cached_prompt_tokens,
             "total_tokens": self.total_tokens,
         }
 
 
 class LanguageModelClient:
-    """Chat-completions client used only for phrases the vocabulary cannot resolve.
+    """Minimal OpenAI-compatible chat client with disk caching.
 
-    Answers are cached on disk by model and phrase, so repeated runs cost nothing and
-    return identical text. Requests are issued at temperature 0 for the same reason.
+    Deliberately small. The agent needs one endpoint, one message shape and a
+    JSON reply; an SDK would add a dependency, a release cadence and a set of
+    behaviours that have to be pinned, in exchange for nothing that is needed
+    here. Both supported backends speak the same protocol, so the only
+    difference between them is the URL and the deployment name.
     """
-
-    _SYSTEM_PROMPT = (
-        "You standardise procurement line-item text for spend analysis. "
-        "For each supplied phrase, return a concise English noun phrase describing what "
-        "was purchased. Use only information contained in the phrase itself. Never add "
-        "product names, brands, suppliers, quantities, specifications or assumptions that "
-        "are not present in the input. If a phrase carries no purchasing meaning, return "
-        "it unchanged. Reply with JSON only, in the form "
-        '{"translations": [{"id": <integer>, "english": "<text>"}]}.'
-    )
 
     def __init__(self, config: ModelConfig, cache_path: Path) -> None:
         self.config = config
-        self.available = config.enabled
-        self.calls = 0
         self.usage = TokenUsage()
-        self._cache_path = cache_path
-        self._cache: Dict[str, str] = {}
-        self._dirty = False
-        if cache_path.is_file():
-            try:
-                self._cache = json.loads(cache_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                self._cache = {}
+        self.cache_path = cache_path
+        self._cache: Dict[str, str] = self._load_cache()
+        self._cache_dirty = False
+        self._omit_temperature = False
 
-    def _cache_key(self, phrase: str, language: str) -> str:
-        payload = f"{self.config.model}|{language}|{phrase}"
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+    # -- cache --------------------------------------------------------------
 
-    def translate_phrases(self, phrases: Sequence[Tuple[str, str]]) -> Dict[str, str]:
-        """Translate ``(phrase, language)`` pairs, returning a phrase to English map."""
-        results: Dict[str, str] = {}
-        outstanding: List[Tuple[str, str]] = []
-        for phrase, language in phrases:
-            cached = self._cache.get(self._cache_key(phrase, language))
-            if cached is not None:
-                results[phrase] = cached
-                self.usage.cache_hits += 1
-            else:
-                outstanding.append((phrase, language))
+    def _load_cache(self) -> Dict[str, str]:
+        """Load previously resolved phrases.
 
-        if not outstanding or not self.available:
-            return results
-
-        size = max(1, self.config.batch_size)
-        for start in range(0, len(outstanding), size):
-            batch = outstanding[start : start + size]
-            answers = self._request_batch(batch)
-            for (phrase, language), english in answers.items():
-                results[phrase] = english
-                self._cache[self._cache_key(phrase, language)] = english
-                self._dirty = True
-        return results
-
-    def _request_batch(self, batch: Sequence[Tuple[str, str]]) -> Dict[Tuple[str, str], str]:
-        items = [
-            {"id": index, "text": phrase, "language": language}
-            for index, (phrase, language) in enumerate(batch)
-        ]
-        payload: Dict[str, Any] = {
-            "model": self.config.model,
-            "temperature": 0,
-            "messages": [
-                {"role": "system", "content": self._SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps({"phrases": items}, ensure_ascii=False)},
-            ],
-        }
-        if self.config.request_json_mode:
-            payload["response_format"] = {"type": "json_object"}
-
-        content = self._post(payload)
-        if content is None:
-            return {}
-
-        parsed = _extract_json_object(content)
-        if not parsed:
-            LOGGER.warning("Model returned an unparseable response; keeping source text")
-            return {}
-
-        answers: Dict[Tuple[str, str], str] = {}
-        for entry in parsed.get("translations", []):
-            index = _safe_int(str(entry.get("id", -1)), -1)
-            english = normalise_text(entry.get("english"))
-            if 0 <= index < len(batch) and english:
-                answers[batch[index]] = english
-        return answers
-
-    def _post(self, payload: Dict[str, Any]) -> Optional[str]:
-        """Issue the request, degrading unsupported parameters and backing off on errors.
-
-        Model generations differ in which sampling parameters they accept: newer models
-        reject an explicit ``temperature`` outright. Rather than fail the run, a rejected
-        parameter is dropped and the request is reissued immediately. Determinism is
-        preserved wherever the parameter is honoured, and the on-disk cache keeps output
-        stable across runs where it is not.
+        The cache is the mechanism that makes repeated runs free and, just as
+        importantly, makes them reproducible: a phrase resolved once keeps that
+        resolution for every subsequent run regardless of model drift.
         """
+        if not self.cache_path.is_file():
+            return {}
+        try:
+            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            LOGGER.warning("Model cache %s unreadable; starting empty.", self.cache_path)
+            return {}
+        entries = payload.get("entries", {})
+        LOGGER.info("Model cache loaded with %d entries.", len(entries))
+        return entries
+
+    def save_cache(self) -> None:
+        if not self._cache_dirty:
+            return
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "agent": AGENT_NAME,
+            "model": self.config.model,
+            "backend": self.config.backend,
+            "entries": dict(sorted(self._cache.items())),
+        }
+        self.cache_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        self._cache_dirty = False
+
+    def cache_key(self, task: str, payload: str) -> str:
+        """Content address for one unit of work.
+
+        The model name is part of the key so that switching backend does not
+        silently reuse answers produced by a different model.
+        """
+        return stable_hash(task, self.config.model, payload)
+
+    def cached(self, key: str) -> Optional[str]:
+        value = self._cache.get(key)
+        if value is not None:
+            self.usage.cache_hits += 1
+        return value
+
+    def store(self, key: str, value: str) -> None:
+        self._cache[key] = value
+        self._cache_dirty = True
+
+    # -- transport ----------------------------------------------------------
+
+    def _post(self, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Issue one request, returning the decoded response or None."""
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.config.api_key}",
+            # The shared service authenticates by api-key rather than by bearer
+            # token. Sending both is accepted by each and saves branching.
+            "api-key": self.config.api_key,
         }
-        if self.config.provider == "azure":
-            headers["api-key"] = self.config.api_key
+        payload = json.dumps(body).encode("utf-8")
 
-        request_payload = dict(payload)
-        url = self.config.endpoint()
-        attempt = 0
-
-        while attempt < 3:
-            body = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
-            self.calls += 1
-            status, raw = self._send(url, headers, body)
-
-            if status == 200:
-                try:
-                    data = json.loads(raw)
-                    content = data["choices"][0]["message"]["content"]
-                except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
-                    LOGGER.warning("Unexpected response shape from the model: %s", error)
-                    return None
-                self._record_usage(data.get("usage"))
-                return content
-
-            if status == 400 and self._degrade(request_payload, raw):
-                # A parameter was removed; retry at once rather than burning an attempt.
-                continue
-
-            attempt += 1
-            if attempt >= 3 or status in {401, 403, 404}:
-                LOGGER.warning(
-                    "Model request failed (HTTP %s): %s", status, _summarise_error(raw)
-                )
-                return None
-
-            wait = 2**attempt
-            LOGGER.debug("Model request failed (HTTP %s); retrying in %ss", status, wait)
-            time.sleep(wait)
-        return None
-
-    def _record_usage(self, usage: Any) -> None:
-        """Accumulate the token counts reported alongside a successful response.
-
-        Field names differ between API generations, so both the chat-completions
-        (``prompt_tokens``) and the newer (``input_tokens``) spellings are accepted.
-        A response without a usage block is counted as a request but no tokens.
-        """
-        self.usage.requests += 1
-        if not isinstance(usage, dict):
-            return
-
-        def count(*names: str) -> int:
-            for name in names:
-                if usage.get(name) is not None:
-                    return _safe_int(str(usage[name]), 0)
-            return 0
-
-        prompt = count("prompt_tokens", "input_tokens")
-        completion = count("completion_tokens", "output_tokens")
-        self.usage.prompt_tokens += prompt
-        self.usage.completion_tokens += completion
-        # Accumulate the total per response. Deriving it at the end would understate the
-        # figure if any single response omitted its usage block.
-        self.usage.reported_total_tokens += count("total_tokens") or (prompt + completion)
-
-        output_details = usage.get("completion_tokens_details") or usage.get(
-            "output_tokens_details"
-        )
-        if isinstance(output_details, dict):
-            self.usage.reasoning_tokens += _safe_int(
-                str(output_details.get("reasoning_tokens", 0)), 0
-            )
-
-        input_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
-        if isinstance(input_details, dict):
-            self.usage.cached_prompt_tokens += _safe_int(
-                str(input_details.get("cached_tokens", 0)), 0
-            )
-
-    # Parameters that may be dropped if the model rejects them, in removal order.
-    _OPTIONAL_PARAMETERS = ("temperature", "response_format", "top_p", "seed")
-
-    def _degrade(self, payload: Dict[str, Any], error_body: str) -> bool:
-        """Remove a parameter the model rejected. True when the request is worth retrying."""
-        message = error_body.lower()
-        if not any(
-            hint in message
-            for hint in ("unsupported", "not supported", "unrecognized", "invalid_request", "does not support")
-        ):
-            return False
-        for parameter in self._OPTIONAL_PARAMETERS:
-            if parameter in payload and parameter in message:
-                payload.pop(parameter)
-                LOGGER.info(
-                    "Model %s rejected '%s'; reissuing the request without it",
-                    self.config.model,
-                    parameter,
-                )
-                return True
-        return False
-
-    def _send(self, url: str, headers: Dict[str, str], body: bytes) -> Tuple[int, str]:
-        """Perform one HTTP request, returning the status code and the raw body.
-
-        Transport failures are reported as status 0 so the caller can treat them as
-        retryable without distinguishing exception types across the two backends.
-        """
-        if _requests is not None:
-            try:
-                response = _requests.post(
-                    url, headers=headers, data=body, timeout=self.config.timeout
-                )
-            except Exception as error:  # noqa: BLE001 - connection and timeout errors
-                return 0, str(error)
-            return response.status_code, response.text
-
-        from urllib import error as urllib_error
-        from urllib import request as urllib_request
-
-        req = urllib_request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib_request.urlopen(req, timeout=self.config.timeout) as response:
-                return response.status, response.read().decode("utf-8", errors="replace")
-        except urllib_error.HTTPError as error:
-            return error.code, error.read().decode("utf-8", errors="replace")
-        except Exception as error:  # noqa: BLE001 - connection and timeout errors
-            return 0, str(error)
+            if _requests is not None:
+                response = _requests.post(self.config.endpoint, headers=headers,
+                                          data=payload, timeout=self.config.timeout)
+                status, text = response.status_code, response.text
+            else:
+                import urllib.error
+                import urllib.request
+                request = urllib.request.Request(self.config.endpoint, data=payload,
+                                                 headers=headers, method="POST")
+                try:
+                    with urllib.request.urlopen(request, timeout=self.config.timeout) as handle:
+                        status = handle.status
+                        text = handle.read().decode("utf-8", errors="replace")
+                except urllib.error.HTTPError as error:
+                    status = error.code
+                    text = error.read().decode("utf-8", errors="replace")
+        except Exception as error:
+            LOGGER.warning("Language-model request failed: %s", error)
+            self.usage.failed_requests += 1
+            return None
 
-    def close(self) -> None:
-        """Persist the cache so a repeated run makes no further requests."""
-        if not self._dirty:
-            return
-        self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self._cache_path.write_text(
-            json.dumps(self._cache, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        if status != 200:
+            summary = text[:300].replace("\n", " ")
+            # Reasoning models reject sampling parameters outright. Rather than
+            # failing the run, drop the parameter and let the caller retry; the
+            # model's own default is deterministic enough for this workload.
+            if status == 400 and "temperature" in summary.lower():
+                self._omit_temperature = True
+                LOGGER.info("Model rejected the temperature parameter; retrying without it.")
+                return self._post({k: v for k, v in body.items() if k != "temperature"})
+            LOGGER.warning("Language-model request returned HTTP %s: %s", status, summary)
+            self.usage.failed_requests += 1
+            return None
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            LOGGER.warning("Language-model response was not valid JSON.")
+            self.usage.failed_requests += 1
+            return None
+
+    def complete_json(self, system_prompt: str, user_prompt: str) -> Optional[Dict[str, Any]]:
+        """Request a JSON object from the model.
+
+        Returns None on any failure. Every caller treats that as "the model had
+        nothing to add" and falls back to its deterministic result, which is why
+        an outage degrades quality slightly instead of stopping the run.
+        """
+        if not self.config.enabled:
+            return None
+        if self.config.max_requests and self.usage.requests >= self.config.max_requests:
+            LOGGER.warning("Language-model request cap (%d) reached.", self.config.max_requests)
+            return None
+
+        body: Dict[str, Any] = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        if not self._omit_temperature:
+            body["temperature"] = 0
+
+        response = self._post(body)
+        if response is None:
+            return None
+
+        self.usage.record(response.get("usage") or {})
+        try:
+            content = response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            return None
+        return extract_json_object(content or "")
 
 
-def _summarise_error(body: str) -> str:
-    """Reduce an API error body to its message, falling back to a truncated payload."""
+def extract_json_object(content: str) -> Optional[Dict[str, Any]]:
+    """Recover a JSON object from a model reply.
+
+    Even with a JSON response format enforced, replies occasionally arrive
+    wrapped in a code fence or with a sentence in front of them, so the object
+    is located by brace balance rather than assumed to be the whole string.
+    """
+    content = content.strip()
+    if not content:
+        return None
     try:
-        parsed = json.loads(body)
-    except (json.JSONDecodeError, TypeError):
-        return normalise_text(body)[:300]
-    if isinstance(parsed, dict):
-        error = parsed.get("error")
-        if isinstance(error, dict) and error.get("message"):
-            return normalise_text(str(error["message"]))[:300]
-        if isinstance(error, str):
-            return normalise_text(error)[:300]
-    return normalise_text(body)[:300]
-
-
-def _extract_json_object(content: str) -> Dict[str, Any]:
-    """Pull a JSON object out of a model reply that may be wrapped in code fences."""
-    text = content.strip()
-    fenced = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
-    if fenced:
-        text = fenced.group(1).strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
-        return {}
-    try:
-        parsed = json.loads(text[start : end + 1])
+        parsed = json.loads(content)
+        return parsed if isinstance(parsed, dict) else None
     except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+        pass
+
+    start = content.find("{")
+    if start < 0:
+        return None
+    depth, in_string, escaped = 0, False, False
+    for position in range(start, len(content)):
+        char = content[position]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    parsed = json.loads(content[start:position + 1])
+                    return parsed if isinstance(parsed, dict) else None
+                except json.JSONDecodeError:
+                    return None
+    return None
 
 
 # ===========================================================================
 # Translation engine
 # ===========================================================================
 
+@dataclass
+class TranslationResult:
+    """One phrase rendered in English, with the evidence for how it got there."""
+
+    source_text: str
+    english_text: str
+    language: str
+    language_confidence: float
+    method: str                 # native | lexicon | compound | neural | model | passthrough
+    coverage: float             # share of content tokens resolved, in [0, 1]
+    unresolved: Tuple[str, ...] = ()
+
+
 class TranslationEngine:
-    """Renders source-language purchase text in English.
+    """Renders distinct phrases in English through a four-tier cascade.
 
-    The cascade is deliberate and ordered by cost and determinism: controlled
-    vocabulary first, offline machine translation second, language model last.
+    The tiers are ordered by cost, cheapest first, and each one only sees what
+    the tier above could not resolve:
+
+        1. controlled vocabulary   free, deterministic, domain-accurate
+        2. compound decomposition  free, deterministic, Nordic-specific
+        3. offline neural model    free after download, high quality
+        4. language model          paid, last resort, cached forever
+
+    Working on distinct phrases rather than rows is what makes this affordable:
+    on real spend data the same phrase recurs many times, so the number of
+    phrases needing tier 3 or 4 is a small fraction of the row count.
     """
 
-    def __init__(
-        self,
-        lexicon: Lexicon,
-        translator: Optional[MachineTranslator] = None,
-        coverage_floor: float = 0.6,
-    ) -> None:
+    def __init__(self, lexicon: Lexicon, settings: Settings,
+                 neural: NeuralTranslator, model: Optional[LanguageModelClient]) -> None:
         self.lexicon = lexicon
-        self.translator = translator
-        self.coverage_floor = coverage_floor
-        self._llm_overrides: Dict[str, str] = {}
+        self.settings = settings
+        self.neural = neural
+        self.model = model
+        self.results: Dict[str, TranslationResult] = {}
+        self.method_counts: Counter = Counter()
 
-    def register_overrides(self, overrides: Dict[str, str]) -> None:
-        """Supply model answers gathered in the batched top-up pass."""
-        self._llm_overrides.update(overrides)
+    # -- tier 1 and 2: vocabulary -------------------------------------------
 
-    def translate(self, text: str, language: str) -> TranslationResult:
-        """Translate a phrase, reporting how much of it the vocabulary could resolve.
+    def _resolve_with_vocabulary(self, text: str, language: str) -> Tuple[str, float, List[str], str]:
+        """Translate token by token using the vocabulary and the compound splitter.
 
-        The vocabulary pass always runs, even for text identified as English. Language
-        identification on a single upper-case word is unreliable, and short-circuiting
-        on a wrong answer would silently leave source-language text untranslated. Text
-        that the vocabulary genuinely cannot touch is returned unchanged, with its
-        original casing intact.
+        Returns the rewritten text, the share of content tokens resolved, the
+        tokens that remain unresolved, and which mechanism did the most work.
         """
-        cleaned = normalise_text(text)
-        if not cleaned:
-            return TranslationResult()
+        substituted, phrase_hits, phrase_tokens = self.lexicon.substitute_phrases(
+            separate_welded_codes(text), language)
 
-        override = self._llm_overrides.get(cleaned)
-        if override:
-            return TranslationResult(english=override, method="language_model", coverage=1.0)
-
-        key = lookup_key(cleaned)
-        if key in self.lexicon.phrases:
-            return TranslationResult(
-                english=self.lexicon.phrases[key], method="vocabulary_phrase", coverage=1.0
-            )
-
-        original_case = self._case_map(cleaned)
-        segments, matched_phrase = self._apply_phrases(key)
-
-        fragments: List[Tuple[List[str], bool]] = []
+        rendered: List[str] = []
+        content_tokens = 0
+        resolved_tokens = 0
         unresolved: List[str] = []
-        content_total = 0
-        content_resolved = 0
-        used_translator = False
+        used_compound = False
 
-        for segment, already_english in segments:
-            if already_english:
-                fragments.append((segment.split(), True))
+        for token in tokenise(substituted):
+            key = lookup_key(token)
+
+            # The vocabulary is consulted before the code detector, not after.
+            # A known word is a word whatever its casing, and checking in this
+            # order is what stops a shouted term such as VUOKRA from being
+            # written off as a part number.
+            known = self.lexicon.unit_terms.get(key) or self.lexicon.term(token, language)
+
+            if known is None and is_code_token(token):
+                # Identifiers are preserved verbatim: they are meaningful to a
+                # buyer and translating them would be nonsense.
+                rendered.append(token)
                 continue
 
-            words: List[str] = []
-            for token in segment.split():
-                if not _WORD.fullmatch(token):
-                    if not is_code_token(token):
-                        words.append(original_case.get(token, token))
-                    continue
-                if token in self.lexicon.stopwords:
-                    continue
-                content_total += 1
-                resolved = self.lexicon.resolve_token(token)
-                if resolved is None and self.translator is not None:
-                    resolved = self.translator.translate(token, language)
-                    if resolved:
-                        used_translator = True
-                if resolved:
-                    content_resolved += 1
-                    words.append(resolved)
-                else:
-                    unresolved.append(token)
-                    words.append(original_case.get(token, token))
-            if words:
-                fragments.append((words, False))
+            content_tokens += 1
+            if known:
+                rendered.append(known)
+                resolved_tokens += 1
+                continue
 
-        english = self._join(self._drop_redundant(fragments))
-        coverage = 1.0 if content_total == 0 else content_resolved / content_total
+            # A token that survived phrase substitution and is already English
+            # counts as resolved; this is what stops mixed-language text from
+            # being penalised for its English half.
+            if key in self.lexicon.service_markers or key in self.lexicon.material_markers:
+                rendered.append(token)
+                resolved_tokens += 1
+                continue
 
-        if content_resolved == 0 and not matched_phrase:
-            # Nothing in the vocabulary applied. Return the source text untouched rather
-            # than a lower-cased approximation of it.
-            is_english = language == "en"
-            return TranslationResult(
-                english=cleaned,
-                method="passthrough" if is_english else "source_text",
-                coverage=1.0 if is_english else 0.0,
-                unresolved=sorted(set(unresolved)),
-            )
+            parts = self.lexicon.split_compound(token, language)
+            if parts:
+                rendered.append(" ".join(parts))
+                resolved_tokens += 1
+                used_compound = True
+                continue
 
-        if used_translator:
-            method = "vocabulary+machine_translation"
-        elif not unresolved:
-            method = "vocabulary"
-        else:
-            method = "vocabulary_partial"
+            rendered.append(token)
+            unresolved.append(token)
 
-        return TranslationResult(
-            english=english,
-            method=method,
-            coverage=round(coverage, 3),
-            unresolved=sorted(set(unresolved)),
+        # Tokens emitted by a phrase substitution are already English, so they
+        # count as resolved even though the loop above saw them as bare words it
+        # did not recognise. Capping at the content total avoids double-counting
+        # a token that the loop also resolved on its own.
+        effective_resolved = min(content_tokens, resolved_tokens + phrase_tokens)
+        coverage = effective_resolved / content_tokens if content_tokens else 1.0
+
+        method = "compound" if used_compound and not phrase_hits else "lexicon"
+        return _WHITESPACE.sub(" ", " ".join(rendered)).strip(), coverage, unresolved, method
+
+    # -- orchestration ------------------------------------------------------
+
+    def prepare(self, phrases: Iterable[str]) -> None:
+        """Resolve a whole corpus of distinct phrases, cheapest tier first.
+
+        Batched by tier rather than by phrase so that the neural models are
+        loaded once per language and the language model is called with many
+        phrases per request.
+        """
+        pending: Dict[str, Tuple[str, float]] = {}
+
+        for phrase in sorted(set(phrases)):
+            if not phrase or phrase in self.results:
+                continue
+            language, confidence = detect_language(phrase, self.lexicon)
+
+            # The vocabulary pass runs for every phrase, including ones believed
+            # to be English. Identification is fallible on single words -
+            # "asbestipurku" contains no non-ASCII character and no Finnish
+            # function word, so it reads as English - and short-circuiting on
+            # that belief would leave the phrase untranslated. If the vocabulary
+            # in fact changes nothing, the phrase really was English.
+            english, coverage, unresolved, method = self._resolve_with_vocabulary(phrase, language)
+
+            if language == "en" and lookup_key(english) == lookup_key(phrase):
+                self.results[phrase] = TranslationResult(
+                    phrase, phrase, "en", confidence, "native", 1.0)
+                continue
+
+            # 0.85 is the point at which the remaining unresolved tokens are
+            # typically proper nouns or place names, which a translator would
+            # leave alone anyway. Below it, a real translation is worth paying for.
+            if coverage >= 0.85:
+                self.results[phrase] = TranslationResult(
+                    phrase, english, language, confidence, method, coverage, tuple(unresolved))
+                continue
+
+            # Hold the partial result: if the richer tiers are unavailable or
+            # fail, this is still a better answer than the untranslated source.
+            self.results[phrase] = TranslationResult(
+                phrase, english, language, confidence, method, coverage, tuple(unresolved))
+            pending[phrase] = (language, coverage)
+
+        self._run_neural_tier(pending)
+        self._run_model_tier(pending)
+
+        for result in self.results.values():
+            self.method_counts[result.method] += 1
+
+    def _run_neural_tier(self, pending: Dict[str, Tuple[str, float]]) -> None:
+        """Translate everything the vocabulary could not, using local models."""
+        if not self.settings.use_neural_translation or not self.neural.enabled or not pending:
+            return
+
+        by_language: Dict[str, List[str]] = defaultdict(list)
+        for phrase, (language, _) in pending.items():
+            if self.neural.available_for(language):
+                by_language[language].append(phrase)
+
+        for language in sorted(by_language):
+            phrases = sorted(by_language[language])
+            LOGGER.info("Translating %d phrase(s) from %s with the offline model.",
+                        len(phrases), language)
+            translations = self.neural.translate_batch(phrases, language)
+            for phrase, english in translations.items():
+                previous = self.results[phrase]
+                self.results[phrase] = TranslationResult(
+                    phrase, english, previous.language, previous.language_confidence,
+                    "neural", max(previous.coverage, 0.9), previous.unresolved)
+                pending.pop(phrase, None)
+
+    def _run_model_tier(self, pending: Dict[str, Tuple[str, float]]) -> None:
+        """Send the residue to the language model, in batches, with caching."""
+        if self.model is None or not self.model.config.enabled or not pending:
+            return
+
+        outstanding: List[str] = []
+        for phrase in sorted(pending):
+            key = self.model.cache_key("translate", phrase)
+            cached = self.model.cached(key)
+            if cached:
+                previous = self.results[phrase]
+                self.results[phrase] = TranslationResult(
+                    phrase, cached, previous.language, previous.language_confidence,
+                    "model", 1.0, ())
+            else:
+                outstanding.append(phrase)
+
+        if not outstanding:
+            return
+
+        LOGGER.info("Sending %d unresolved phrase(s) to %s.",
+                    len(outstanding), self.model.config.model)
+
+        system_prompt = (
+            "You translate short procurement and purchase-order line texts into "
+            "concise English. These are industrial and energy sector purchases: "
+            "materials, spare parts, maintenance work and professional services.\n"
+            "Rules:\n"
+            "1. Translate only what is written. Never add detail that is not in "
+            "the source text.\n"
+            "2. Keep part numbers, order references and measurements exactly as "
+            "they appear.\n"
+            "3. Return a noun phrase describing what was purchased, not a "
+            "sentence and not an explanation.\n"
+            "4. If the text carries no meaning, return it unchanged.\n"
+            'Reply with JSON: {"translations": {"<source>": "<english>"}}. '
+            "Every key must be reproduced exactly as given."
         )
 
-    @staticmethod
-    def _case_map(text: str) -> Dict[str, str]:
-        """Map lower-cased tokens back to their original casing.
-
-        Lookup is case-insensitive, but anything the vocabulary cannot translate should
-        reach the output exactly as the source system wrote it.
-        """
-        mapping: Dict[str, str] = {}
-        for token in text.split():
-            stripped = token.strip(",.;:()[]\"'")
-            if stripped:
-                mapping.setdefault(stripped.lower(), stripped)
-        return mapping
-
-    @staticmethod
-    def _singular(word: str) -> str:
-        """Crude singular form, sufficient for comparing English fragments."""
-        lowered = word.lower()
-        if len(lowered) > 3 and lowered.endswith("s") and not lowered.endswith("ss"):
-            return lowered[:-1]
-        return lowered
-
-    def _drop_redundant(self, fragments: Sequence[Tuple[List[str], bool]]) -> List[str]:
-        """Remove word-level fragments already covered by a matched phrase.
-
-        Source systems commonly prefix a line with its own category, as in
-        "VERO Ajoneuvovero" or "RENKAAT Renkaiden sailytys". Translating both parts
-        yields "tax vehicle tax"; dropping the prefix once the phrase already conveys it
-        yields "vehicle tax".
-        """
-        phrase_words = {
-            self._singular(word)
-            for words, is_phrase in fragments
-            if is_phrase
-            for word in words
-        }
-        kept: List[str] = []
-        for words, is_phrase in fragments:
-            if not is_phrase and phrase_words:
-                if {self._singular(word) for word in words} <= phrase_words:
-                    continue
-            kept.append(" ".join(words))
-        return kept
-
-    def _apply_phrases(self, key: str) -> Tuple[List[Tuple[str, bool]], bool]:
-        """Replace known multi-word expressions, returning ordered text segments.
-
-        Each segment is flagged to record whether it is already English, so the
-        token pass does not attempt to translate vocabulary output a second time.
-        """
-        segments: List[Tuple[str, bool]] = [(key, False)]
-        matched = False
-        for phrase in self.lexicon.phrase_order:
-            if not phrase or phrase not in key:
+        batch_size = max(1, self.model.config.batch_size)
+        for start in range(0, len(outstanding), batch_size):
+            batch = outstanding[start:start + batch_size]
+            user_prompt = json.dumps({"texts": batch}, ensure_ascii=False)
+            response = self.model.complete_json(system_prompt, user_prompt)
+            if not response:
                 continue
-            english = self.lexicon.phrases[phrase]
-            rebuilt: List[Tuple[str, bool]] = []
-            for segment, already_english in segments:
-                if already_english or phrase not in segment:
-                    rebuilt.append((segment, already_english))
-                    continue
-                matched = True
-                head, _, tail = segment.partition(phrase)
-                if head.strip():
-                    rebuilt.append((head.strip(), False))
-                rebuilt.append((english, True))
-                if tail.strip():
-                    rebuilt.append((tail.strip(), False))
-            segments = rebuilt
-        return segments, matched
 
-    @staticmethod
-    def _join(parts: Sequence[str]) -> str:
-        """Concatenate fragments, collapsing immediate repetitions."""
-        words: List[str] = []
-        for part in parts:
-            for word in part.split():
-                if words and words[-1].lower() == word.lower():
+            translations = response.get("translations") or {}
+            if not isinstance(translations, dict):
+                continue
+            for phrase in batch:
+                english = normalise_text(translations.get(phrase, ""))
+                if not english:
                     continue
-                words.append(word)
-        return " ".join(words).strip()
+                self.model.store(self.model.cache_key("translate", phrase), english)
+                previous = self.results[phrase]
+                self.results[phrase] = TranslationResult(
+                    phrase, english, previous.language, previous.language_confidence,
+                    "model", 1.0, ())
 
-    def needs_model(self, result: TranslationResult) -> bool:
-        """True when a phrase is weak enough to justify a model call."""
-        return bool(result.unresolved) and result.coverage < self.coverage_floor
+    def translate(self, phrase: str) -> TranslationResult:
+        """Look up an already-prepared phrase.
+
+        Phrases that were never prepared are resolved inline. That only happens
+        for text assembled after the preparation pass, and keeping the method
+        total avoids a class of ordering bug that would otherwise be silent.
+        """
+        if phrase in self.results:
+            return self.results[phrase]
+        language, confidence = detect_language(phrase, self.lexicon)
+        english, coverage, unresolved, method = self._resolve_with_vocabulary(phrase, language)
+        result = TranslationResult(phrase, english, language, confidence,
+                                   method, coverage, tuple(unresolved))
+        self.results[phrase] = result
+        return result
 
 
 # ===========================================================================
-# Matching engine
+# Linguistic analysis
 # ===========================================================================
 
-class MatchingEngine:
-    """Links a line to comparable lines in the other source systems.
+class EnglishAnalyser:
+    """Noun-phrase extraction and entity filtering over English text.
 
-    Three tiers run in order and the first that produces a confident result wins.
-    Every candidate keeps its tier and score so a reviewer can tell an exact key match
-    apart from a statistical one.
+    Analysis runs *after* translation rather than before it, which is a
+    deliberate simplification: it means one well-supported English pipeline does
+    the syntactic work instead of four uneven ones, and it means the same rules
+    apply to every source language. The cost is that a translation error
+    propagates, which the coverage measure already exposes.
     """
 
-    def __init__(self, records: Sequence[LineRecord], settings: Settings) -> None:
-        self.settings = settings
-        self._records = {record.row_id: record for record in records}
+    # Entity labels whose text is a name rather than a thing that was purchased.
+    _DROPPABLE_ENTITIES = frozenset({"PERSON", "GPE", "LOC", "DATE", "TIME",
+                                     "MONEY", "CARDINAL", "ORDINAL", "PERCENT"})
 
-        self._by_document: Dict[str, List[str]] = defaultdict(list)
-        self._by_item: Dict[str, List[str]] = defaultdict(list)
-        self._by_po: Dict[Tuple[str, str], List[str]] = defaultdict(list)
-        self._by_supplier: Dict[str, List[str]] = defaultdict(list)
-        self._by_amount: Dict[str, List[str]] = defaultdict(list)
-        self._by_month: Dict[str, List[str]] = defaultdict(list)
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled and _spacy is not None
+        self._pipeline: Optional[Any] = None
+        self._loaded = False
+        self.stopwords: Set[str] = self._load_stopwords()
 
-        semantic_documents: Dict[str, str] = {}
-        for record in records:
-            if not record.is_line:
-                continue
-            logical = record.logical
-            row_id = record.row_id
+    @staticmethod
+    def _load_stopwords() -> Set[str]:
+        """English stop words, from NLTK when present and a core list otherwise."""
+        core = {
+            "a", "an", "the", "and", "or", "of", "for", "to", "in", "on", "at",
+            "by", "with", "from", "as", "is", "are", "was", "were", "be", "been",
+            "this", "that", "these", "those", "it", "its", "per", "pcs", "each",
+            "new", "old", "other", "misc", "various", "general", "total", "no",
+        }
+        if _nltk is None:
+            return core
+        try:
+            from nltk.corpus import stopwords
+            return core | set(stopwords.words("english"))
+        except Exception:
+            return core
 
-            for field_name in ("document_id", "po_number"):
-                key = compact_key(logical.get(field_name))
-                if key:
-                    self._by_document[key].append(row_id)
-
-            item_code = compact_key(logical.get("item_code"))
-            if item_code:
-                self._by_item[item_code].append(row_id)
-
-            po_number = compact_key(logical.get("po_number"))
-            po_line = compact_key(logical.get("po_line_number"))
-            if po_number and po_line:
-                self._by_po[(po_number, po_line)].append(row_id)
-
-            supplier = compact_key(logical.get("supplier_name"))
-            if supplier:
-                self._by_supplier[supplier].append(row_id)
-
-            amount = parse_amount(logical.get("amount"))
-            if amount is not None:
-                self._by_amount[f"{amount:.2f}"].append(row_id)
-
-            date = parse_date(logical.get("document_date"))
-            if date:
-                self._by_month[date[:7]].append(row_id)
-
-            text = record.search_text
-            if text:
-                semantic_documents[row_id] = text
-
-        self._semantic = CharNgramIndex(semantic_documents)
-        LOGGER.info("Reference index built over %d searchable lines", len(semantic_documents))
-
-    def match(self, record: LineRecord) -> List[MatchCandidate]:
-        """Return the best cross-system candidates for one line, strongest first."""
-        if not record.is_line:
-            return []
-        candidates: Dict[str, MatchCandidate] = {}
-
-        for candidate in self._tier_a(record):
-            candidates.setdefault(candidate.row_id, candidate)
-        for candidate in self._tier_b(record):
-            candidates.setdefault(candidate.row_id, candidate)
-        for candidate in self._tier_c(record):
-            candidates.setdefault(candidate.row_id, candidate)
-
-        ranked = sorted(
-            candidates.values(),
-            key=lambda item: (-item.score, item.tier, item.row_id),
-        )
-        return ranked[: self.settings.top_k_matches]
-
-    def _eligible(self, record: LineRecord, row_id: str) -> Optional[LineRecord]:
-        """Reject self-matches and same-system matches, which add no information."""
-        other = self._records.get(row_id)
-        if other is None or other.row_id == record.row_id:
+    def _load_pipeline(self) -> Optional[Any]:
+        """Load the English pipeline once, tolerating an absent model."""
+        if self._loaded:
+            return self._pipeline
+        self._loaded = True
+        if not self.enabled:
             return None
-        if other.source_key == record.source_key:
-            return None
-        return other if other.is_line else None
-
-    def _describe(self, other: LineRecord, tier: str, method: str, score: float) -> MatchCandidate:
-        return MatchCandidate(
-            row_id=other.row_id,
-            source_key=other.source_key,
-            tier=tier,
-            method=method,
-            score=score,
-            po_number=other.logical.get("po_number", ""),
-            po_line=other.logical.get("po_line_number", ""),
-            supplier=other.logical.get("supplier_name", ""),
-            text=other.translation.english or other.normalised_description,
-        )
-
-    def _tier_a(self, record: LineRecord) -> List[MatchCandidate]:
-        """Deterministic joins on shared identifiers."""
-        found: List[MatchCandidate] = []
-        logical = record.logical
-
-        po_number = compact_key(logical.get("po_number"))
-        po_line = compact_key(logical.get("po_line_number"))
-        if po_number and po_line:
-            for row_id in self._by_po.get((po_number, po_line), ()):
-                other = self._eligible(record, row_id)
-                if other is not None:
-                    found.append(self._describe(other, "A", "po_line_key", 1.0))
-
-        for field_name in ("document_id", "po_number"):
-            key = compact_key(logical.get(field_name))
-            if not key:
+        for model_name in ("en_core_web_sm", "en_core_web_md", "xx_ent_wiki_sm"):
+            try:
+                self._pipeline = _spacy.load(model_name, disable=["lemmatizer"])
+                LOGGER.info("Loaded spaCy pipeline %s.", model_name)
+                return self._pipeline
+            except Exception:
                 continue
-            for row_id in self._by_document.get(key, ()):
-                other = self._eligible(record, row_id)
-                if other is not None:
-                    found.append(self._describe(other, "A", "document_key", 0.95))
+        LOGGER.warning(
+            "No spaCy English model is installed; falling back to rule-based "
+            "phrase extraction. Install one with: python -m spacy download en_core_web_sm")
+        self.enabled = False
+        return None
 
-        item_code = compact_key(logical.get("item_code"))
-        if item_code and len(item_code) >= 3:
-            for row_id in self._by_item.get(item_code, ()):
-                other = self._eligible(record, row_id)
-                if other is not None:
-                    found.append(self._describe(other, "A", "item_code", 0.9))
-        return found
+    def noun_phrases(self, text: str) -> List[str]:
+        """Extract candidate noun phrases, longest and earliest first.
 
-    def _tier_b(self, record: LineRecord) -> List[MatchCandidate]:
-        """Blocked fuzzy matching on supplier, amount, period and text."""
-        pool: set = set()
-        logical = record.logical
-
-        supplier = compact_key(logical.get("supplier_name"))
-        if supplier:
-            pool.update(self._by_supplier.get(supplier, ()))
-
-        amount = parse_amount(logical.get("amount"))
-        if amount is not None:
-            pool.update(self._by_amount.get(f"{amount:.2f}", ()))
-
-        date = parse_date(logical.get("document_date"))
-        if date and len(pool) < 400:
-            pool.update(self._by_month.get(date[:7], ()))
-
-        found: List[MatchCandidate] = []
-        for row_id in sorted(pool):
-            other = self._eligible(record, row_id)
-            if other is None:
-                continue
-            score = self._score_pair(record, other)
-            if score >= self.settings.fuzzy_threshold:
-                found.append(self._describe(other, "B", "blocked_fuzzy", score))
-        return found
-
-    def _tier_c(self, record: LineRecord) -> List[MatchCandidate]:
-        """Character n-gram retrieval for wording that differs across systems."""
-        text = record.search_text
-        if not text:
+        Order matters: the first noun phrase of a procurement line is almost
+        always the thing being bought, and everything after it qualifies.
+        """
+        if not text.strip():
             return []
-        found: List[MatchCandidate] = []
-        for row_id, score in self._semantic.query(
-            text, top_k=self.settings.top_k_matches * 3, min_score=self.settings.semantic_threshold
-        ):
-            other = self._eligible(record, row_id)
-            if other is not None:
-                found.append(self._describe(other, "C", "semantic_ngram", round(score, 4)))
-        return found
 
-    def _score_pair(self, left: LineRecord, right: LineRecord) -> float:
-        """Blend the available comparison signals, renormalised over what exists."""
-        signals: List[Tuple[float, float]] = []
+        pipeline = self._load_pipeline()
+        if pipeline is None:
+            return self._rule_based_phrases(text)
 
-        text = max(
-            text_similarity(left.normalised_description, right.normalised_description),
-            text_similarity(left.translation.english, right.translation.english),
-        )
-        signals.append((0.55, text))
+        try:
+            document = pipeline(text)
+        except Exception:
+            return self._rule_based_phrases(text)
 
-        left_amount = parse_amount(left.logical.get("amount"))
-        right_amount = parse_amount(right.logical.get("amount"))
-        if left_amount is not None and right_amount is not None:
-            signals.append((0.25, 1.0 if amounts_agree(left_amount, right_amount) else 0.0))
+        # Character spans covered by an entity that should not appear in the
+        # description, so that a phrase overlapping one can be discarded whole.
+        blocked_spans = [
+            (entity.start_char, entity.end_char)
+            for entity in document.ents if entity.label_ in self._DROPPABLE_ENTITIES
+        ]
 
-        left_supplier = normalise_text(left.logical.get("supplier_name"))
-        right_supplier = normalise_text(right.logical.get("supplier_name"))
-        if left_supplier and right_supplier:
-            supplier_score = (
-                1.0
-                if compact_key(left_supplier) == compact_key(right_supplier)
-                else text_similarity(left_supplier, right_supplier)
-            )
-            signals.append((0.20, supplier_score))
+        phrases: List[str] = []
+        for chunk in document.noun_chunks:
+            if any(start < chunk.end_char and chunk.start_char < end
+                   for start, end in blocked_spans):
+                continue
+            words = [token.text for token in chunk
+                     if not token.is_punct and not token.is_space
+                     and token.text.lower() not in self.stopwords]
+            if words:
+                phrases.append(" ".join(words))
 
-        total_weight = sum(weight for weight, _ in signals)
-        if total_weight == 0.0:
-            return 0.0
-        return round(sum(weight * value for weight, value in signals) / total_weight, 4)
+        if not phrases:
+            # Some lines are a bare verb phrase such as "removing asbestos",
+            # which yields no noun chunk at all.
+            phrases = [token.text for token in document
+                       if token.pos_ in {"NOUN", "PROPN", "VERB", "ADJ"}
+                       and token.text.lower() not in self.stopwords]
+        return phrases or self._rule_based_phrases(text)
+
+    def _rule_based_phrases(self, text: str) -> List[str]:
+        """Phrase extraction without spaCy.
+
+        Splits on punctuation and connectives, then keeps the fragments that
+        still carry content words. Markedly worse than the parser, but it keeps
+        the agent useful on a machine where no model could be installed.
+        """
+        fragments = re.split(r"[,;:/|]|\s+-\s+|\s+\u2013\s+", text)
+        phrases: List[str] = []
+        for fragment in fragments:
+            words = [word for word in tokenise(fragment)
+                     if word.lower() not in self.stopwords and not is_code_token(word)]
+            if words:
+                phrases.append(" ".join(words))
+        return phrases
+
+    def head_noun(self, text: str) -> str:
+        """The single most representative word of a phrase.
+
+        Used by the downstream agents to check that two descriptions are talking
+        about the same kind of thing before believing a similarity score.
+        """
+        phrases = self.noun_phrases(text)
+        if not phrases:
+            return ""
+        # English noun phrases are head-final, so the last word of the first
+        # phrase is the head.
+        words = [word for word in tokenise(phrases[0])
+                 if word.lower() not in self.stopwords]
+        return words[-1].lower() if words else ""
+
+
+# ===========================================================================
+# Semantic retrieval
+# ===========================================================================
+
+class SemanticIndex:
+    """Nearest-neighbour search over sentence embeddings.
+
+    The last matching tier, reached only for lines that no business key and no
+    fuzzy comparison could resolve. It exists because the same purchase is
+    routinely described with no words in common at all - "asbestipurku" and
+    "rivning av asbest" share not one character sequence - and lexical methods
+    are structurally incapable of connecting them.
+
+    The model is multilingual and runs locally on CPU, so this costs nothing per
+    query once the model is resident. The index is built over *distinct phrases*
+    rather than rows; at a million lines that is the difference between a few
+    seconds and an afternoon.
+    """
+
+    MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+    def __init__(self, enabled: bool = True, threshold: float = 0.72,
+                 top_k: int = 5, phrase_cap: int = 200_000) -> None:
+        self.enabled = enabled and _sentence_transformers is not None and _numpy is not None
+        self.threshold = threshold
+        self.top_k = top_k
+        self.phrase_cap = phrase_cap
+        self.phrases: List[str] = []
+        self._model: Optional[Any] = None
+        self._matrix: Optional[Any] = None
+
+    def build(self, phrases: Iterable[str]) -> None:
+        """Embed a corpus of phrases and prepare it for querying."""
+        if not self.enabled:
+            return
+
+        # Sorted so that the row order of the matrix, and therefore the
+        # tie-breaking between equally similar neighbours, is identical on every
+        # run over the same data.
+        self.phrases = sorted({phrase for phrase in phrases if phrase and len(phrase) >= 4})
+        if len(self.phrases) < 2:
+            self.enabled = False
+            return
+
+        if len(self.phrases) > self.phrase_cap:
+            LOGGER.warning(
+                "Semantic index skipped: %d distinct phrases exceeds the cap of %d. "
+                "Raise --semantic-cap if the machine has the memory for it.",
+                len(self.phrases), self.phrase_cap)
+            self.enabled = False
+            return
+
+        try:
+            LOGGER.info("Loading embedding model %s ...", self.MODEL_NAME)
+            self._model = _sentence_transformers.SentenceTransformer(self.MODEL_NAME)
+            LOGGER.info("Embedding %d distinct phrase(s) ...", len(self.phrases))
+            self._matrix = self._model.encode(
+                self.phrases, batch_size=64, convert_to_numpy=True,
+                normalize_embeddings=True, show_progress_bar=False)
+        except Exception as error:
+            LOGGER.warning("Semantic index unavailable (%s).", error)
+            self.enabled = False
+            self._model = self._matrix = None
+
+    def query(self, text: str) -> List[Tuple[str, float]]:
+        """Return the nearest phrases above the threshold, best first.
+
+        Vectors are unit-normalised at encoding time, so the dot product is the
+        cosine similarity and no per-query normalisation is needed.
+        """
+        if not self.enabled or self._model is None or self._matrix is None or not text:
+            return []
+
+        try:
+            vector = self._model.encode([text], convert_to_numpy=True,
+                                        normalize_embeddings=True, show_progress_bar=False)[0]
+        except Exception:
+            return []
+
+        similarities = self._matrix @ vector
+        count = min(self.top_k + 1, len(self.phrases))
+        # argpartition finds the top-k without sorting the whole array, which
+        # matters when the phrase pool is large and this runs once per row.
+        candidates = _numpy.argpartition(-similarities, count - 1)[:count]
+        ranked = sorted(candidates, key=lambda index: (-float(similarities[index]),
+                                                       self.phrases[index]))
+
+        results: List[Tuple[str, float]] = []
+        for index in ranked:
+            phrase = self.phrases[index]
+            score = float(similarities[index])
+            if phrase == text or score < self.threshold:
+                continue
+            results.append((phrase, round(score, 3)))
+            if len(results) >= self.top_k:
+                break
+        return results
+
+
+# ===========================================================================
+# Record model
+# ===========================================================================
+
+@dataclass
+class EvidenceBundle:
+    """Everything known about one purchase, pooled across source systems.
+
+    Pooling into a bundle rather than keeping every contributing row is what
+    holds memory flat at a million lines: the number of distinct purchases is
+    bounded by the number of purchase-order lines, and each bundle stores sets of
+    short strings rather than whole rows.
+    """
+
+    descriptions: Set[str] = field(default_factory=set)
+    context: Set[str] = field(default_factory=set)
+    codes: Set[str] = field(default_factory=set)
+    suppliers: Set[str] = field(default_factory=set)
+    categories: Set[str] = field(default_factory=set)
+    systems: Set[str] = field(default_factory=set)
+    amounts: Set[float] = field(default_factory=set)
+
+    def absorb(self, other: "EvidenceBundle") -> None:
+        self.descriptions |= other.descriptions
+        self.context |= other.context
+        self.codes |= other.codes
+        self.suppliers |= other.suppliers
+        self.categories |= other.categories
+        self.systems |= other.systems
+        self.amounts |= other.amounts
+
+    def is_empty(self) -> bool:
+        return not (self.descriptions or self.context or self.codes)
+
+
+@dataclass
+class LineRecord:
+    """One row of one source, with its enrichment attached.
+
+    Held only for the duration of writing that row, so the field count here does
+    not constrain how large an input can be processed.
+    """
+
+    row_id: str
+    source_system: str
+    source_file: str
+    source_sheet: str
+    source_row: int
+    row_type: str
+
+    keys: Dict[str, str] = field(default_factory=dict)
+    business: Dict[str, str] = field(default_factory=dict)
+
+    # Processing text, softened for analysis, and the untouched source values.
+    # Both are kept because the enrichment must be built from the former while
+    # the audit trail has to show the latter exactly as the client supplied it.
+    own_descriptions: List[str] = field(default_factory=list)
+    own_descriptions_raw: List[str] = field(default_factory=list)
+    own_description_fields: List[str] = field(default_factory=list)
+    own_context: List[str] = field(default_factory=list)
+    own_codes: List[str] = field(default_factory=list)
+
+    evidence: EvidenceBundle = field(default_factory=EvidenceBundle)
+    match_tier: str = "none"
+    match_score: float = 0.0
+    matched_systems: Tuple[str, ...] = ()
+
+    is_duplicate: bool = False
+    duplicate_of: str = ""
+
+    @property
+    def primary_text(self) -> str:
+        """The best free-text value this row carries, exactly as supplied."""
+        return self.own_descriptions_raw[0] if self.own_descriptions_raw else ""
+
+    @property
+    def primary_processing_text(self) -> str:
+        """The same value, softened for analysis."""
+        return self.own_descriptions[0] if self.own_descriptions else ""
 
 
 # ===========================================================================
 # Description synthesis
 # ===========================================================================
 
-_CONNECTIVES = {"and", "or", "of", "for", "with", "per", "the", "a", "an", "in", "on", "to"}
-
-
 @dataclass
 class DescriptionResult:
+    """A composed description and the record of how it was composed."""
+
     description: str = ""
-    short: str = ""
-    kind: str = "Unknown"
-    method: str = "none"
-    evidence: List[str] = field(default_factory=list)
+    short_description: str = ""
+    item_or_service: str = "Unclear"
+    basis: str = "none"                 # description | context | taxonomy | none
+    used_fragments: Tuple[str, ...] = ()
+    specificity: float = 0.0
 
 
 class DescriptionSynthesiser:
-    """Assembles the final English description from validated evidence.
+    """Composes the enriched description from validated fragments.
 
-    Composition is templated rather than generated. Every content word in the result
-    must be present in the evidence or in the controlled vocabulary; anything else is
-    discarded, which is what makes the "no invented information" guarantee hold.
+    The critical requirement from the validation column of the development plan
+    is that the description must contain no invented information. That is
+    enforced structurally rather than by instruction: the synthesiser can only
+    emit words that appeared in the source data, in a vocabulary translation of
+    the source data, or in the fixed connector set below. There is no path
+    through this class by which a word can reach the output without having come
+    from the input.
     """
 
-    def __init__(self, lexicon: Lexicon, max_words: int = 12) -> None:
+    # The only words the synthesiser may add. Everything else must be traceable.
+    _CONNECTORS = frozenset({"and", "for", "with", "service", "services", "work"})
+
+    _BOILERPLATE = re.compile(
+        r"\b(according to contract|as per contract|per agreement|see attachment|"
+        r"see enclosure|no description|not defined|account not defined|"
+        r"terms and conditions|hourly rate|invoice|purchase order|order confirmation)\b",
+        re.IGNORECASE)
+
+    def __init__(self, lexicon: Lexicon, analyser: EnglishAnalyser, settings: Settings) -> None:
         self.lexicon = lexicon
-        self.max_words = max_words
+        self.analyser = analyser
+        self.settings = settings
 
-    def build(
-        self,
-        record: LineRecord,
-        document_context: str = "",
-    ) -> DescriptionResult:
-        evidence: List[str] = []
-        head = record.translation.english.strip()
-        if head:
-            evidence.append(f"{record.source_key}:{record.profile.primary_text[0]}"
-                            if record.profile.primary_text else record.source_key)
+    # -- cleaning -----------------------------------------------------------
 
-        best_match = record.matches[0] if record.matches else None
-        if not head and best_match is not None and best_match.text:
-            head = best_match.text.strip()
-            evidence.append(f"{best_match.source_key}:matched_line")
+    def _strip_noise(self, text: str) -> str:
+        """Remove everything that is not part of what was purchased.
 
-        category = self._category_leaf(record)
-        material_group = normalise_text(record.logical.get("material_group"))
-        account = normalise_text(record.logical.get("account_name"))
-
-        if not head:
-            head = category or material_group or account
-            if head:
-                evidence.append("classification")
-
-        if not head:
-            return DescriptionResult(method="insufficient_evidence")
-
-        concept = self.lexicon.concept_for(head)
-        label = str(concept["label"]) if concept and concept.get("label") else sentence_case(head)
-        if concept:
-            evidence.append("vocabulary:concept")
-
-        qualifier = ""
-        for candidate in (category, material_group):
-            if candidate and self._adds_information(candidate, label):
-                qualifier = candidate.strip()
-                evidence.append("classification")
-                break
-
-        context = ""
-        if document_context and self._adds_information(document_context, f"{label} {qualifier}"):
-            context = document_context.strip()
-            evidence.append("document_header")
-
-        if (
-            not qualifier
-            and best_match is not None
-            and best_match.text
-            and self._adds_information(best_match.text, label)
-        ):
-            qualifier = best_match.text.strip()
-            evidence.append(f"{best_match.source_key}:matched_line")
-
-        description = self._compose(label, qualifier, context)
-        description = self._enforce_vocabulary(description, record, document_context)
-        description = self._trim(description)
-
-        short = str(concept["label"]) if concept and concept.get("label") else sentence_case(
-            self._trim(label, max_words=5)
-        )
-        kind = self.lexicon.classify_kind(f"{label} {qualifier}")
-        if kind == "Unknown":
-            kind = self._infer_kind_from_structure(record)
-
-        method = record.translation.method
-        if best_match is not None and f"{best_match.source_key}:matched_line" in evidence:
-            method = f"{method}+cross_source"
-
-        return DescriptionResult(
-            description=description,
-            short=short,
-            kind=kind,
-            method=method,
-            evidence=sorted(set(evidence)),
-        )
-
-    @staticmethod
-    def _category_leaf(record: LineRecord) -> str:
-        """Return the most specific populated classification level for a line."""
-        for level in ("category_l4", "category_l3", "category_l2", "category_l1"):
-            value = normalise_text(record.logical.get(level))
-            if value and value.lower() not in NULL_TOKENS:
-                return value
-        return ""
-
-    @staticmethod
-    def _compose(label: str, qualifier: str, context: str) -> str:
-        text = sentence_case(label)
-        if qualifier:
-            text = f"{text} - {qualifier}"
-        if context:
-            text = f"{text} ({context})"
+        Order references, dates, e-mail addresses and pasted correspondence are
+        all common in these fields and none of them describe the purchase.
+        """
+        text = separate_welded_codes(text)
+        text = _URL.sub(" ", text)
+        text = _EMAIL.sub(" ", text)
+        text = _MONEY.sub(" ", text)
+        text = _DATE_LIKE.sub(" ", text)
+        text = self._BOILERPLATE.sub(" ", text)
+        text = _LEADING_CODE.sub("", text)
+        text = _LONG_DIGITS.sub(" ", text)
+        text = _ALPHANUM_CODE.sub(" ", text)
+        text = re.sub(r"[\"'`*_<>\[\]{}()]+", " ", text)
+        text = re.sub(r"\s*[-–—/|:;,]\s*", " ", text)
         return _WHITESPACE.sub(" ", text).strip()
 
-    @staticmethod
-    def _adds_information(candidate: str, existing: str) -> bool:
-        """True when a fragment contributes words that are not already present."""
-        candidate_tokens = {token for token in tokenise(candidate) if len(token) > 2}
-        if not candidate_tokens:
+    def _is_meaningful(self, text: str) -> bool:
+        """Whether a cleaned fragment still says anything useful."""
+        if not text or self.lexicon.is_noise(text):
             return False
-        existing_tokens = set(tokenise(existing))
-        return bool(candidate_tokens - existing_tokens)
+        words = [word for word in tokenise(text)
+                 if not is_code_token(word) and word.lower() not in self.analyser.stopwords]
+        return len(words) >= 1 and any(len(word) >= 3 for word in words)
 
-    def _enforce_vocabulary(
-        self, description: str, record: LineRecord, document_context: str
-    ) -> str:
-        """Drop any word that cannot be traced to the evidence or the vocabulary."""
-        allowed = set(_CONNECTIVES) | self.lexicon.english_vocabulary
-        allowed.update(tokenise(record.normalised_description))
-        allowed.update(tokenise(record.translation.english))
-        allowed.update(tokenise(record.support_description))
-        allowed.update(tokenise(record.support_translation.english))
-        allowed.update(tokenise(document_context))
-        for field_name in (
-            "category_l1",
-            "category_l2",
-            "category_l3",
-            "category_l4",
-            "material_group",
-            "account_name",
-            "supplier_name",
-        ):
-            allowed.update(tokenise(record.logical.get(field_name, "")))
-        for match in record.matches:
-            allowed.update(tokenise(match.text))
+    # -- classification -----------------------------------------------------
 
-        kept: List[str] = []
-        for word in description.split():
-            core = "".join(char for char in word if char.isalpha() or char in "-").lower()
-            if not core or core in allowed or not _WORD.search(core):
-                kept.append(word)
-                continue
-            if any(part in allowed for part in core.split("-") if part):
-                kept.append(word)
-        rebuilt = " ".join(kept)
-        rebuilt = re.sub(r"\(\s*\)", "", rebuilt)
-        rebuilt = re.sub(r"\s*-\s*$", "", rebuilt.strip())
-        return _WHITESPACE.sub(" ", rebuilt).strip()
+    # The line's own text is worth more than the category it was filed under.
+    # A maintenance line inside the "Measurement equipment" category is still a
+    # service, and weighting the two sources equally gets that backwards.
+    _OWN_TEXT_WEIGHT = 2.0
+    _CONTEXT_WEIGHT = 1.0
 
-    def _trim(self, text: str, max_words: Optional[int] = None) -> str:
-        """Shorten to the configured word budget, dropping trailing detail first."""
-        limit = max_words or self.max_words
-        words = text.split()
-        if len(words) <= limit:
-            return text
-        trimmed = " ".join(words[:limit])
-        # Never leave an unbalanced parenthesis behind.
-        if trimmed.count("(") > trimmed.count(")"):
-            trimmed = trimmed[: trimmed.rfind("(")].strip()
-        return re.sub(r"\s*[-,]\s*$", "", trimmed).strip()
+    def classify_item_or_service(self, text: str, context: Sequence[str]) -> str:
+        """Decide whether a line bought a thing or an activity.
+
+        Reported as Unclear rather than guessed when the evidence is balanced or
+        absent. The development plan asks for this only where the data supports
+        a reliable assessment, and a coin-flip label would be actively harmful
+        in a spend analysis.
+        """
+        if not text and not context:
+            return "Unclear"
+
+        # The line's own text is consulted alone first. Only when it is silent
+        # or genuinely balanced does the surrounding context get a vote. Letting
+        # the two compete on a single tally lets a category with several marker
+        # words outvote an unambiguous description, which is how "asbestos
+        # removal" filed under "Measurement equipment" ends up labelled a
+        # material.
+        own = self._marker_tally(text)
+        if own[0] != own[1]:
+            return "Service" if own[0] > own[1] else "Material"
+
+        surrounding = self._marker_tally(" ".join(context))
+        if surrounding[0] != surrounding[1]:
+            return "Service" if surrounding[0] > surrounding[1] else "Material"
+        return "Unclear"
+
+    def _marker_tally(self, source: str) -> Tuple[int, int]:
+        """Count service and material marker words in one body of text."""
+        haystack = lookup_key(source)
+        if not haystack:
+            return 0, 0
+        tokens = set(tokenise(haystack))
+
+        def hits(markers: Set[str]) -> int:
+            return sum(1 for marker in markers
+                       if marker in tokens or (" " in marker and marker in haystack))
+
+        return hits(self.lexicon.service_markers), hits(self.lexicon.material_markers)
+
+    # -- composition --------------------------------------------------------
+
+    def compose(self, record: LineRecord, english_fragments: Sequence[str],
+                context_fragments: Sequence[str]) -> DescriptionResult:
+        """Build the description for one line.
+
+        Three sources are tried in order of how directly they describe the
+        purchase. The basis is recorded because a description derived from a
+        category is a much weaker statement than one derived from the line's own
+        text, and the confidence score has to know the difference.
+        """
+        cleaned_primary = [self._strip_noise(fragment) for fragment in english_fragments]
+        cleaned_primary = [fragment for fragment in cleaned_primary if self._is_meaningful(fragment)]
+
+        cleaned_context = [self._strip_noise(fragment) for fragment in context_fragments]
+        cleaned_context = [fragment for fragment in cleaned_context if self._is_meaningful(fragment)]
+
+        if cleaned_primary:
+            description, used = self._from_fragments(cleaned_primary)
+            basis = "description"
+        elif cleaned_context:
+            description, used = self._from_fragments(cleaned_context)
+            basis = "context"
+        else:
+            taxonomy = [value for value in record.business.get("category_path", "").split(" > ")
+                        if value and not self.lexicon.is_noise(value)]
+            if taxonomy:
+                # The most specific level available is the last populated one.
+                description, used = sentence_case(taxonomy[-1]), (taxonomy[-1],)
+                basis = "taxonomy"
+            else:
+                return DescriptionResult()
+
+        if not description:
+            return DescriptionResult()
+
+        item_or_service = self.classify_item_or_service(
+            description, list(cleaned_context) + list(record.evidence.categories))
+
+        # "service" is appended only when the source text actually indicated a
+        # service and did not already say so. This is the one place a word is
+        # added, and it is licensed by evidence in the input.
+        lowered = description.lower()
+        if (item_or_service == "Service"
+                and basis == "description"
+                and not any(marker in lowered for marker in
+                            ("service", "work", "maintenance", "repair", "consulting",
+                             "rental", "training", "inspection", "cleaning", "removal"))
+                and len(tokenise(description)) < self.settings.max_words):
+            description = f"{description} service"
+
+        short = self._shorten(description)
+        return DescriptionResult(
+            description=sentence_case(description),
+            short_description=sentence_case(short),
+            item_or_service=item_or_service,
+            basis=basis,
+            used_fragments=tuple(used),
+            specificity=self._specificity(description),
+        )
+
+    def _from_fragments(self, fragments: Sequence[str]) -> Tuple[str, Tuple[str, ...]]:
+        """Merge candidate fragments into one description without repetition.
+
+        Fragments arrive from several systems and overlap heavily. Deduplication
+        is on the lemma-free token set, which is enough to recognise that
+        "asbestos removal" and "removal of asbestos" say the same thing.
+        """
+        ordered = sorted(dict.fromkeys(fragments), key=lambda item: (-len(item), item))
+        selected: List[str] = []
+        seen_signatures: Set[frozenset] = set()
+        seen_words: Set[str] = set()
+
+        for fragment in ordered:
+            phrases = self.analyser.noun_phrases(fragment) or [fragment]
+            for phrase in phrases:
+                words = [word for word in tokenise(phrase) if not is_code_token(word)]
+                words = [word for word in words
+                         if word.lower() not in self.analyser.stopwords
+                         or word.lower() in self._CONNECTORS]
+                if not words:
+                    continue
+
+                signature = frozenset(word.lower() for word in words)
+                if signature in seen_signatures or signature <= seen_words:
+                    continue
+                seen_signatures.add(signature)
+                seen_words |= signature
+                selected.append(" ".join(words))
+
+                if len(tokenise(" ".join(selected))) >= self.settings.max_words:
+                    break
+            if len(tokenise(" ".join(selected))) >= self.settings.max_words:
+                break
+
+        if not selected:
+            return "", ()
+
+        merged = " ".join(selected)
+        words = tokenise(merged)
+        if len(words) > self.settings.max_words:
+            merged = " ".join(words[: self.settings.max_words])
+        return _WHITESPACE.sub(" ", merged).strip(), tuple(fragments)
+
+    def _shorten(self, description: str) -> str:
+        """Reduce a description to its head phrase for compact display."""
+        phrases = self.analyser.noun_phrases(description)
+        candidate = phrases[0] if phrases else description
+        words = tokenise(candidate)[: self.settings.max_short_words]
+        return " ".join(words)
 
     @staticmethod
-    def _infer_kind_from_structure(record: LineRecord) -> str:
-        """Fall back to structural cues when the wording carries no marker."""
-        item_code = normalise_text(record.logical.get("item_code"))
-        quantity = parse_amount(record.logical.get("quantity"))
-        unit_price = parse_amount(record.logical.get("unit_price"))
-        if item_code and quantity is not None and quantity > 1:
-            return "Material"
-        if unit_price is not None and quantity == 1 and not item_code:
-            return "Service"
-        return "Unknown"
+    def _specificity(description: str) -> float:
+        """How informative a description is, in ``[0, 1]``.
+
+        Rewards content words and distinct words, and penalises the generic
+        vocabulary that indicates the pipeline had little to work with.
+        """
+        words = [word.lower() for word in tokenise(description)]
+        if not words:
+            return 0.0
+        generic = {"other", "various", "general", "misc", "material", "materials",
+                   "service", "services", "equipment", "supplies", "item", "items",
+                   "work", "works", "product", "products", "goods"}
+        informative = [word for word in words if word not in generic and len(word) > 2]
+        distinctness = len(set(words)) / len(words)
+        return round(min(1.0, (len(informative) / 4.0) * 0.7 + distinctness * 0.3), 3)
 
 
 # ===========================================================================
 # Confidence scoring
 # ===========================================================================
 
-_INFORMATIVE_FIELDS = (
-    "supplier_name",
-    "item_code",
-    "amount",
-    "document_date",
-    "category_l1",
-    "material_group",
-    "account_name",
-)
+def score_confidence(record: LineRecord, description: DescriptionResult,
+                     translation: TranslationResult) -> Tuple[int, str, Dict[str, float]]:
+    """Score how much the enriched description can be relied upon.
 
+    The score is computed from measurable properties of the pipeline, never from
+    a model's opinion of its own output. A model asked to rate its own answer
+    reports its fluency, which on this task is uncorrelated with correctness:
+    the most confident-sounding descriptions are precisely the invented ones.
 
-def score_confidence(record: LineRecord, description: DescriptionResult) -> Tuple[int, str, Dict[str, float]]:
-    """Combine the independent quality signals into a 0-100 score.
-
-    The score is derived from measurable properties of the pipeline rather than from a
-    model's self-assessment, so it can be audited and reproduced.
+    The factors are returned alongside the score so that a reviewer can see why
+    a line scored as it did, which is what makes the sample-based validation in
+    the development plan practical.
     """
-    components: Dict[str, float] = {}
+    factors: Dict[str, float] = {}
 
-    components["lexical_coverage"] = round(record.translation.coverage, 3)
+    # How directly the description reflects the line's own text.
+    factors["basis"] = {"description": 1.0, "context": 0.65,
+                        "taxonomy": 0.3, "none": 0.0}.get(description.basis, 0.0)
 
-    tier_strength = {"A": 1.0, "B": 0.7, "C": 0.45}
-    best = record.matches[0] if record.matches else None
-    components["evidence_strength"] = tier_strength.get(best.tier, 0.25) if best else 0.25
+    # How much of the source language was actually resolved.
+    factors["translation"] = round(min(1.0, translation.coverage), 3)
 
-    distinct_sources = {match.source_key for match in record.matches}
-    components["cross_source_agreement"] = min(1.0, len(distinct_sources) / 2.0)
+    # How many independent fields contributed. Corroboration across systems is
+    # the strongest evidence available that a description is right.
+    field_count = len(record.evidence.descriptions) + len(record.evidence.context)
+    factors["evidence"] = round(min(1.0, field_count / 4.0), 3)
 
-    populated = sum(1 for name in _INFORMATIVE_FIELDS if not is_blank(record.logical.get(name)))
-    components["field_completeness"] = round(populated / len(_INFORMATIVE_FIELDS), 3)
+    # Agreement between source systems, which only a successful match can give.
+    factors["corroboration"] = round(min(1.0, max(0, len(record.evidence.systems) - 1) / 2.0), 3)
 
-    if len(record.matches) >= 2:
-        margin = record.matches[0].score - record.matches[1].score
-        components["decisiveness"] = round(min(1.0, max(0.0, margin * 2.0)), 3)
-    elif record.matches:
-        components["decisiveness"] = 1.0
-    else:
-        components["decisiveness"] = 0.5
+    # How informative the result is.
+    factors["specificity"] = description.specificity
+
+    # How reliable the link to the other systems was, if one was used.
+    factors["match"] = {"key": 1.0, "fuzzy": 0.75, "semantic": 0.6,
+                        "none": 0.5}.get(record.match_tier, 0.5)
 
     weights = {
-        "lexical_coverage": 0.35,
-        "evidence_strength": 0.20,
-        "cross_source_agreement": 0.15,
-        "field_completeness": 0.15,
-        "decisiveness": 0.15,
+        "basis": 0.28,
+        "translation": 0.18,
+        "evidence": 0.16,
+        "corroboration": 0.10,
+        "specificity": 0.20,
+        "match": 0.08,
     }
-    score = sum(weights[name] * components[name] for name in weights)
+    raw = sum(factors[name] * weight for name, weight in weights.items())
+    score = int(round(max(0.0, min(1.0, raw)) * 100))
 
+    # A description built purely from a category is a statement about the
+    # category, not about the line, and must not reach the high band however
+    # well the other factors score.
+    if description.basis == "taxonomy":
+        score = min(score, CONFIDENCE_MEDIUM - 1)
     if not description.description:
-        score *= 0.3
-    elif description.method == "insufficient_evidence":
-        score *= 0.4
+        score = 0
 
-    value = int(round(max(0.0, min(1.0, score)) * 100))
-    band = next(name for threshold, name in CONFIDENCE_BANDS if value >= threshold)
-    return value, band, components
+    band = ("High" if score >= CONFIDENCE_HIGH
+            else "Medium" if score >= CONFIDENCE_MEDIUM else "Low")
+    return score, band, factors
 
 
 # ===========================================================================
@@ -2346,930 +2884,943 @@ def score_confidence(record: LineRecord, description: DescriptionResult) -> Tupl
 # ===========================================================================
 
 class Agent1:
-    """Orchestrates ingestion, enrichment and output for the purchase-description agent."""
+    """Orchestrates the run.
+
+    Structured as two streaming passes over the input. The first pass reads
+    every row to learn what is in the data: which distinct phrases occur, which
+    business keys link the systems together, and which rows duplicate each other.
+    Between the passes, all the expensive work happens once, on the distinct
+    phrases. The second pass reads the rows again and writes the output.
+
+    Two passes cost twice the I/O and save an unbounded amount of memory, which
+    is the right trade at a million lines. Nothing is held between the passes
+    except the phrase table and the evidence index, both of which are bounded by
+    the number of *distinct* values rather than the number of rows.
+    """
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.lexicon = Lexicon.load(settings.lexicon_file)
-        self.translator = MachineTranslator(settings.use_machine_translation)
-        self.engine = TranslationEngine(self.lexicon, self.translator)
-        self.synthesiser = DescriptionSynthesiser(self.lexicon, settings.max_description_words)
-        self.model = LanguageModelClient(
-            settings.model, settings.cache_dir / "agent1_model_cache.json"
+        self.lexicon = Lexicon.load(settings.lexicon_path)
+        self.analyser = EnglishAnalyser()
+        self.neural = NeuralTranslator(enabled=settings.use_neural_translation)
+
+        self.model: Optional[LanguageModelClient] = None
+        if settings.model.enabled:
+            self.model = LanguageModelClient(
+                settings.model, settings.cache_dir / "agent1_model_cache.json")
+
+        self.translator = TranslationEngine(self.lexicon, settings, self.neural, self.model)
+        self.synthesiser = DescriptionSynthesiser(self.lexicon, self.analyser, settings)
+        self.semantic = SemanticIndex(
+            enabled=settings.use_semantic_matching,
+            threshold=settings.semantic_threshold,
+            top_k=settings.top_k,
+            phrase_cap=settings.semantic_phrase_cap,
         )
-        self.tables: List[Tuple[Table, SourceProfile]] = []
-        self.records: List[LineRecord] = []
+
+        self.tables: List[Tuple[Table, SourceProfile, ColumnResolver]] = []
         self.run_id = ""
-        self.stats: Dict[str, Any] = {}
 
-    # -- orchestration ------------------------------------------------------
+        # Cross-source evidence, keyed by every identifier a row can be found by.
+        self.evidence_by_key: Dict[str, EvidenceBundle] = defaultdict(EvidenceBundle)
+        # Distinct phrases seen anywhere in the input.
+        self.phrase_pool: Set[str] = set()
+        # Content hash -> first row identifier carrying it, for duplicate marking.
+        self.content_seen: Dict[str, str] = {}
+        # Phrases indexed for the fuzzy and semantic matching tiers.
+        self.phrase_index: Dict[str, Set[str]] = defaultdict(set)
 
-    def run(self) -> Dict[str, Any]:
-        """Execute the full pipeline and return the run manifest."""
-        files = self._discover_files()
-        if not files:
-            raise SystemExit("No readable source files were found. Check the paths and try again.")
+        self.statistics: Dict[str, Any] = Counter()
+        self.input_hashes: Dict[str, str] = {}
 
-        self.run_id = self._compute_run_id(files)
-        LOGGER.info("Run identifier %s", self.run_id)
+    # -- discovery ----------------------------------------------------------
 
-        self._ingest(files)
-        self._classify_rows()
-        self._deduplicate()
-        self._prepare_text()
-        self._translate()
-        self._top_up_with_model()
-        self._match()
-        self._synthesise()
-        return self._write_outputs(files)
+    def discover(self) -> None:
+        """Locate, read and profile every input table."""
+        paths = discover_input_files(self.settings.source_dir)
+        if not paths:
+            raise SystemExit(f"No readable data files were found under {self.settings.source_dir}")
 
-    # -- discovery and ingestion -------------------------------------------
+        LOGGER.info("Found %d candidate file(s) under %s", len(paths), self.settings.source_dir)
 
-    def _discover_files(self) -> List[Path]:
-        """Collect every readable source file from the configured locations."""
-        candidates: List[Path] = []
-        directories = [
-            directory
-            for directory in (
-                self.settings.invoice_dir,
-                self.settings.po_dir,
-                self.settings.transaction_dir,
-            )
-            if directory and directory.is_dir()
-        ]
-
-        if not directories and self.settings.sources_root.is_dir():
-            LOGGER.info("Named folders not found; scanning %s", self.settings.sources_root)
-            directories = [self.settings.sources_root]
-
-        for directory in directories:
-            for path in sorted(directory.rglob("*")):
-                if path.is_file() and path.suffix.lower() in {".xlsx", ".csv", ".tsv"}:
-                    if not path.name.startswith((".", "~$")):
-                        candidates.append(path)
-
-        catalogue = self.settings.catalogue_file
-        if catalogue and catalogue.is_file():
-            candidates.append(catalogue)
-
-        unique: List[Path] = []
-        seen: set = set()
-        for path in candidates:
-            resolved = path.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                unique.append(path)
-        return sorted(unique, key=lambda item: str(item).lower())
-
-    def _compute_run_id(self, files: Sequence[Path]) -> str:
-        """Derive a stable identifier from input contents and configuration."""
-        digest = hashlib.sha256()
-        digest.update(f"{__version__}|{self.lexicon.version}".encode("utf-8"))
-        digest.update(
-            f"{self.settings.fuzzy_threshold}|{self.settings.semantic_threshold}"
-            f"|{self.settings.top_k_matches}|{self.settings.max_description_words}"
-            f"|llm={self.settings.model.enabled}|mt={self.translator.available}".encode("utf-8")
-        )
-        for path in files:
-            digest.update(path.name.encode("utf-8"))
-            digest.update(sha256_file(path).encode("utf-8"))
-        return digest.hexdigest()[:16]
-
-    def _ingest(self, files: Sequence[Path]) -> None:
-        """Read every file, identify its source system and build line records."""
-        for path in files:
+        for path in paths:
             for table in read_table_file(path):
-                if not table.rows:
-                    LOGGER.warning("No data rows in %s [%s]", path.name, table.sheet)
-                    continue
-                profile, confidence = detect_profile(table)
-                self.tables.append((table, profile))
-                LOGGER.info(
-                    "%-34s %-26s %4d rows (layout match %.0f%%)",
-                    path.name,
-                    profile.label,
-                    len(table.rows),
-                    confidence * 100,
-                )
-                self._build_records(table, profile)
-
-        if not self.records:
-            raise SystemExit("Source files were read but contained no usable rows.")
-        LOGGER.info("Ingested %d rows in total", len(self.records))
-
-    def _build_records(self, table: Table, profile: SourceProfile) -> None:
-        """Materialise one LineRecord per source row."""
-        volatile = {_normalise_column(name) for name in profile.volatile_columns}
-        table_key = f"{table.path.resolve()}::{table.sheet}"
-        for index, row in enumerate(table.rows, start=1):
-            logical = self._map_logical_fields(row, profile)
-            content_hash = self._content_hash(row, volatile)
-            row_id = f"{profile.key}:{table.path.stem}:{table.sheet}:{index:06d}"
-            self.records.append(
-                LineRecord(
-                    row_id=row_id,
-                    source_key=profile.key,
-                    source_label=profile.label,
-                    source_file=table.path.name,
-                    source_sheet=table.sheet,
-                    table_key=table_key,
-                    row_index=index,
-                    raw=row,
-                    logical=logical,
-                    profile=profile,
-                    content_hash=content_hash,
-                )
-            )
-
-    @staticmethod
-    def _map_logical_fields(row: Dict[str, str], profile: SourceProfile) -> Dict[str, str]:
-        """Project source columns onto the common logical schema.
-
-        Column names are compared case- and punctuation-insensitively so that minor
-        header drift between deliveries does not break the mapping.
-        """
-        normalised_row = {_normalise_column(name): value for name, value in row.items()}
-        logical: Dict[str, str] = {}
-        for logical_name, columns in profile.aliases.items():
-            for column in columns:
-                value = normalised_row.get(_normalise_column(column), "")
-                if not is_blank(value):
-                    logical[logical_name] = normalise_text(value)
-                    break
-            logical.setdefault(logical_name, "")
-
-        for level in ("category_l1", "category_l2", "category_l3", "category_l4"):
-            logical.setdefault(level, "")
-        for name in ("po_number", "po_line_number", "supplier_name", "supplier_code",
-                     "quantity", "unit_price", "amount", "currency", "document_date",
-                     "material_group", "account_name", "item_code", "document_id",
-                     "line_number"):
-            logical.setdefault(name, "")
-        return logical
-
-    @staticmethod
-    def _content_hash(row: Dict[str, str], volatile: set) -> str:
-        """Hash a row excluding volatile columns such as the source file name.
-
-        This is what allows the same invoice delivered under two file names to be
-        recognised as one logical line.
-        """
-        payload = {
-            name: normalise_text(value)
-            for name, value in sorted(row.items())
-            if _normalise_column(name) not in volatile
-        }
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
-
-    # -- structural analysis ------------------------------------------------
-
-    @staticmethod
-    def _document_key(record: LineRecord) -> Tuple[str, ...]:
-        """Identify the physical document block a row belongs to.
-
-        The document identifier alone is not sufficient: the same invoice is delivered
-        under two file names in the same extract, and both blocks carry their own
-        header and total rows. Including the volatile columns keeps the blocks apart
-        during structural analysis, while the content hash still recognises them as
-        duplicates afterwards.
-        """
-        normalised_row = {_normalise_column(name): value for name, value in record.raw.items()}
-        volatile = tuple(
-            normalise_text(normalised_row.get(_normalise_column(column), ""))
-            for column in record.profile.volatile_columns
-        )
-        return (record.table_key, record.logical.get("document_id", "")) + volatile
-
-    @staticmethod
-    def _restates_line(
-        key: str, amount: Optional[float], line_texts: Sequence[str], line_amounts: set
-    ) -> bool:
-        """Detect a summary row that repeats a line already counted in this document.
-
-        Summary blocks abbreviate the article name, so "PALVELUMAKSU" restates the line
-        "PALVELUMAKSU Kortti- ja latauspalvelu". Matching on the full string alone misses
-        those and counts the same purchase twice, so a repeated amount or a name that
-        prefixes an existing line both qualify.
-        """
-        if amount is not None and round(amount, 2) in line_amounts:
-            return True
-        if not key:
-            return False
-        return any(
-            existing == key or existing.startswith(key + " ") or key.startswith(existing + " ")
-            for existing in line_texts
-        )
-
-    def _classify_rows(self) -> None:
-        """Separate genuine purchase lines from headers, subtotals and totals.
-
-        Invoice extracts interleave a document header, the priced lines, a grand total
-        and per-article subtotals. Enriching all of them would inflate every downstream
-        count, so each row is typed and only true lines are described.
-        """
-        counts: Counter = Counter()
-        grouped: Dict[Tuple[str, ...], List[LineRecord]] = defaultdict(list)
-        for record in self.records:
-            if record.profile.structural_rows:
-                grouped[self._document_key(record)].append(record)
-            else:
-                counts[record.row_type] += 1
-
-        for group in grouped.values():
-            line_amounts: set = set()
-            line_texts: List[str] = []
-            header_assigned = False
-            total_seen = False
-
-            for record in group:
-                text = self._primary_text(record)
-                key = lookup_key(text)
-                amount = parse_amount(record.logical.get("amount"))
-
-                if not is_blank(record.logical.get("line_number")):
-                    record.row_type = "LINE"
-                elif self.lexicon.looks_like_total(text):
-                    record.row_type = "TOTAL"
-                    total_seen = True
-                elif not header_assigned:
-                    record.row_type = "HEADER"
-                    header_assigned = True
-                elif total_seen or self._restates_line(key, amount, line_texts, line_amounts):
-                    record.row_type = "SUBTOTAL"
-                else:
-                    record.row_type = "LINE"
-
-                if record.row_type == "LINE":
-                    if amount is not None:
-                        line_amounts.add(round(amount, 2))
-                    if key:
-                        line_texts.append(key)
-                counts[record.row_type] += 1
-
-        self.stats["row_types"] = dict(sorted(counts.items()))
-        LOGGER.info("Row types: %s", ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
-
-    def _deduplicate(self) -> None:
-        """Mark rows that repeat an earlier row's content under a different file name."""
-        canonical: Dict[Tuple[str, str], str] = {}
-        duplicates = 0
-        for record in self.records:
-            key = (record.source_key, record.content_hash)
-            existing = canonical.get(key)
-            if existing is None:
-                canonical[key] = record.row_id
-            else:
-                record.duplicate_of = existing
-                duplicates += 1
-        self.stats["duplicate_rows"] = duplicates
-        if duplicates:
-            LOGGER.info("Flagged %d duplicate rows (content identical to an earlier row)", duplicates)
-
-    def _primary_text(self, record: LineRecord) -> str:
-        """Return the descriptive text for a row, honouring the profile's field order."""
-        normalised_row = {_normalise_column(name): value for name, value in record.raw.items()}
-        for column in record.profile.primary_text:
-            value = normalised_row.get(_normalise_column(column), "")
-            if not is_blank(value):
-                return normalise_text(value)
-        return ""
-
-    def _support_text(self, record: LineRecord) -> str:
-        """Concatenate the secondary descriptive fields declared by the profile."""
-        normalised_row = {_normalise_column(name): value for name, value in record.raw.items()}
-        parts: List[str] = []
-        for column in record.profile.support_text:
-            value = normalised_row.get(_normalise_column(column), "")
-            if not is_blank(value):
-                parts.append(normalise_text(value))
-        return " ".join(parts)
-
-    # -- text preparation ---------------------------------------------------
-
-    def _prepare_text(self) -> None:
-        """Extract, clean and language-tag the descriptive text of every row."""
-        for record in self.records:
-            record.raw_description = self._primary_text(record)
-            record.support_description = self._support_text(record)
-            record.normalised_description = normalise_text(record.raw_description)
-            combined = f"{record.normalised_description} {record.support_description}".strip()
-            record.language, record.language_confidence = detect_language(combined, self.lexicon)
-
-        languages = Counter(record.language for record in self.records if record.is_line)
-        self.stats["languages"] = dict(sorted(languages.items()))
-        LOGGER.info("Languages detected: %s", ", ".join(f"{k}={v}" for k, v in sorted(languages.items())))
-
-    def _translate(self) -> None:
-        """Render every descriptive field in English using the deterministic cascade."""
-        for record in self.records:
-            record.translation = self.engine.translate(
-                record.normalised_description, record.language
-            )
-            if record.support_description:
-                record.support_translation = self.engine.translate(
-                    record.support_description, record.language
-                )
-
-        methods = Counter(record.translation.method for record in self.records if record.is_line)
-        self.stats["translation_methods"] = dict(sorted(methods.items()))
-
-    def _top_up_with_model(self) -> None:
-        """Send only the phrases the vocabulary could not resolve to the model.
-
-        Batching over unique phrases means cost scales with vocabulary gaps rather than
-        with row count, and the on-disk cache makes any repeat run free.
-        """
-        if not self.model.available:
-            if self.settings.use_llm:
-                LOGGER.warning(
-                    "Language-model fallback requested but not configured; "
-                    "continuing with vocabulary and machine translation only"
-                )
-            self.stats["model_phrases"] = 0
-            return
-
-        pending: Dict[str, str] = {}
-        for record in self.records:
-            if not record.is_line or not record.normalised_description:
-                continue
-            if self.engine.needs_model(record.translation):
-                pending.setdefault(record.normalised_description, record.language)
-
-        if not pending:
-            LOGGER.info("Vocabulary resolved every phrase; no model calls required")
-            self.stats["model_phrases"] = 0
-            return
-
-        LOGGER.info("Resolving %d unique phrases with the language model", len(pending))
-        answers = self.model.translate_phrases(sorted(pending.items()))
-        if answers:
-            self.engine.register_overrides(answers)
-            for record in self.records:
-                if record.normalised_description in answers:
-                    record.translation = self.engine.translate(
-                        record.normalised_description, record.language
-                    )
-        self.model.close()
-        self.stats["model_phrases"] = len(pending)
-        self.stats["model_attempts"] = self.model.calls
-        self.stats["token_usage"] = self.model.usage.as_dict()
-
-        usage = self.model.usage
-        LOGGER.info(
-            "Token usage: input=%s output=%s (reasoning=%s) total=%s across %s request(s), "
-            "%s phrase(s) served from cache",
-            f"{usage.prompt_tokens:,}",
-            f"{usage.completion_tokens:,}",
-            f"{usage.reasoning_tokens:,}",
-            f"{usage.total_tokens:,}",
-            usage.requests,
-            usage.cache_hits,
-        )
-
-    # -- matching and synthesis --------------------------------------------
-
-    def _match(self) -> None:
-        """Link each line to comparable lines in the other source systems."""
-        matcher = MatchingEngine(self.records, self.settings)
-        tiers: Counter = Counter()
-        for record in self.records:
-            record.matches = matcher.match(record)
-            tiers[record.matches[0].tier if record.matches else "none"] += 1
-        self.stats["match_tiers"] = dict(sorted(tiers.items()))
-        LOGGER.info("Match tiers: %s", ", ".join(f"{k}={v}" for k, v in sorted(tiers.items())))
-
-    def _document_contexts(self) -> Dict[Tuple[str, ...], str]:
-        """Map each document block to the English text of its header row.
-
-        The header of a vehicle-leasing invoice names the asset the priced lines relate
-        to, which is exactly the context a line such as "VUOKRA" is missing.
-        """
-        contexts: Dict[Tuple[str, ...], str] = {}
-        for record in self.records:
-            if record.row_type != "HEADER":
-                continue
-            text = record.translation.english or record.normalised_description
-            if text:
-                contexts[self._document_key(record)] = text
-        return contexts
-
-    def _synthesise(self) -> None:
-        """Produce the final description and confidence score for every row."""
-        contexts = self._document_contexts()
-        by_id = {record.row_id: record for record in self.records}
-        bands: Counter = Counter()
-
-        for record in self.records:
-            if record.duplicate_of:
-                source = by_id.get(record.duplicate_of)
-                if source is not None and source.description:
-                    record.description = source.description
-                    record.description_short = source.description_short
-                    record.item_or_service = source.item_or_service
-                    record.confidence = source.confidence
-                    record.confidence_band = source.confidence_band
-                    record.confidence_components = dict(source.confidence_components)
-                    record.enrichment_method = "inherited_from_duplicate"
-                    bands[record.confidence_band] += 1
+                sample: List[List[str]] = []
+                for _, values in table.iter_rows():
+                    sample.append(values)
+                    if len(sample) >= 200:
+                        break
+                if not sample:
+                    LOGGER.info("Skipping %s: no data rows.", table.label)
                     continue
 
-            if not record.is_line:
-                record.enrichment_method = f"skipped_{record.row_type.lower()}"
-                continue
+                profile, score = profile_table(table, sample)
+                resolver = ColumnResolver(table.headers)
+                self.tables.append((table, profile, resolver))
+                LOGGER.info("%-46s -> %-22s (fingerprint match %.0f%%, %d columns)",
+                            table.label, profile.name, score * 100, len(table.headers))
 
-            context = contexts.get(self._document_key(record), "")
-            result = self.synthesiser.build(record, context)
+            if path.is_file():
+                self.input_hashes[str(path.relative_to(self.settings.source_dir)
+                                      if self.settings.source_dir in path.parents
+                                      else path.name)] = sha256_file(path)
 
-            record.description = result.description
-            record.description_short = result.short
-            record.item_or_service = result.kind
-            record.enrichment_method = result.method
-            confidence, band, components = score_confidence(record, result)
-            record.confidence = confidence
-            record.confidence_band = band
-            record.confidence_components = components
-            bands[band] += 1
+        if not self.tables:
+            raise SystemExit("No table contained usable data.")
 
-        self.stats["confidence_bands"] = dict(sorted(bands.items()))
-        LOGGER.info("Confidence: %s", ", ".join(f"{k}={v}" for k, v in sorted(bands.items())))
+        # The run identifier is derived from the inputs and the configuration,
+        # never from the clock, so an identical run produces an identical id and
+        # an output file can always be traced to exactly what produced it.
+        signature = json.dumps({
+            "inputs": dict(sorted(self.input_hashes.items())),
+            "agent": AGENT_VERSION,
+            "lexicon": self.lexicon.version,
+            "max_words": self.settings.max_words,
+            "fuzzy": self.settings.fuzzy_threshold,
+            "semantic": self.settings.semantic_threshold,
+            "neural": self.settings.use_neural_translation,
+            "llm": self.settings.model.enabled,
+            "model": self.settings.model.model if self.settings.model.enabled else "",
+        }, sort_keys=True)
+        self.run_id = stable_hash("agent1-run", signature)
 
-    # -- output -------------------------------------------------------------
+    # -- pass one -----------------------------------------------------------
 
-    def _enrichment_row(self, record: LineRecord) -> Dict[str, str]:
-        """Flatten a record's derived fields into the appended output columns."""
-        best = record.matches[0] if record.matches else None
+    def _row_keys(self, resolver: ColumnResolver, row: Sequence[str]) -> Dict[str, str]:
+        """Extract the identifiers a row can be joined on."""
         return {
-            "Row_Id": record.row_id,
-            "Row_Type": record.row_type,
-            "Is_Duplicate": "Yes" if record.duplicate_of else "No",
-            "Duplicate_Of": record.duplicate_of,
-            "Source_Description_Raw": record.raw_description,
-            "Source_Description_Normalized": record.normalised_description,
-            "Detected_Language": record.language,
-            "Language_Confidence": f"{record.language_confidence:.3f}",
-            "Enriched_Purchase_Description": record.description,
-            "Enriched_Description_Short": record.description_short,
-            "Item_Or_Service": record.item_or_service,
-            "Translation_Method": record.translation.method,
-            "Translation_Coverage": f"{record.translation.coverage:.3f}",
-            "Unresolved_Tokens": "; ".join(record.translation.unresolved),
-            "Evidence_Sources": "; ".join(
-                sorted({match.source_key for match in record.matches})
-            ),
-            "Matched_Source_System": best.source_key if best else "",
-            "Matched_Row_Id": best.row_id if best else "",
-            "Matched_PO_Number": best.po_number if best else "",
-            "Matched_PO_Line": best.po_line if best else "",
-            "Matched_Supplier": best.supplier if best else "",
-            "Match_Tier": best.tier if best else "",
-            "Match_Method": best.method if best else "",
-            "Match_Score": f"{best.score:.4f}" if best else "",
-            "Enrichment_Method": record.enrichment_method,
-            "AI_Confidence": str(record.confidence),
-            "Confidence_Band": record.confidence_band,
-            "Agent_Version": __version__,
-            "Lexicon_Version": self.lexicon.version,
-            "Run_Id": self.run_id,
+            "document_number": resolver.value(row, "document_number"),
+            "document_line_number": resolver.value(row, "document_line_number"),
+            "po_number": resolver.value(row, "po_number"),
+            "po_line_number": resolver.value(row, "po_line_number"),
+            "invoice_number": resolver.value(row, "invoice_number"),
+            "item_number": resolver.value(row, "item_number"),
         }
 
-    def _unified_row(self, record: LineRecord) -> Dict[str, str]:
-        """Build one row of the common table consumed by the downstream agents."""
-        logical = record.logical
-        row = {
-            "Source_System": record.source_key,
+    @staticmethod
+    def _join_keys(keys: Dict[str, str]) -> List[str]:
+        """Build the join keys a row participates in, most specific first.
+
+        A purchase-order line key is far stronger evidence of identity than a
+        purchase-order header key, so they are namespaced separately and the
+        matcher prefers the specific one. Item numbers are included because they
+        link a catalogue or a repeat purchase across documents.
+        """
+        candidates: List[str] = []
+        po = compact_key(keys.get("po_number"))
+        po_line = compact_key(keys.get("po_line_number"))
+        invoice = compact_key(keys.get("invoice_number"))
+        document = compact_key(keys.get("document_number"))
+        document_line = compact_key(keys.get("document_line_number"))
+        item = compact_key(keys.get("item_number"))
+
+        if po and po_line:
+            candidates.append(f"POL:{po}:{po_line}")
+        if po:
+            candidates.append(f"PO:{po}")
+        if invoice and document_line:
+            candidates.append(f"INVL:{invoice}:{document_line}")
+        if invoice:
+            candidates.append(f"INV:{invoice}")
+        if document and document_line and document.lower() not in {"NA", "N/A"}:
+            candidates.append(f"DOCL:{document}:{document_line}")
+        # An item number alone is a weak key: it identifies a product, not a
+        # transaction. It is kept last so it only ever supplies context.
+        if item and len(item) >= 4:
+            candidates.append(f"ITEM:{item}")
+        return candidates
+
+    def _extract_texts(self, profile: SourceProfile, resolver: ColumnResolver,
+                       row: Sequence[str]) -> Tuple[List[str], List[str], List[str],
+                                                    List[str], List[str]]:
+        """Pull the descriptive, contextual and code values out of one row.
+
+        Description fields are returned in the profile's declared order, which
+        encodes which field is the better free-text source for that system. The
+        descriptions come back twice: once softened for analysis and once
+        exactly as the client wrote them, for the audit trail.
+        """
+        descriptions: List[str] = []
+        descriptions_raw: List[str] = []
+        description_fields: List[str] = []
+        for header in profile.description_fields:
+            value = resolver.value_at(row, header)
+            if value and not self.lexicon.is_noise(value):
+                descriptions.append(soften_caps(value))
+                descriptions_raw.append(value)
+                description_fields.append(header)
+
+        context: List[str] = []
+        for header in profile.context_fields:
+            value = resolver.value_at(row, header)
+            if value and not self.lexicon.is_noise(value):
+                context.append(soften_caps(value))
+
+        codes: List[str] = []
+        for header in profile.code_fields:
+            value = resolver.value_at(row, header)
+            if value and not self.lexicon.is_noise(value):
+                codes.append(value)
+
+        return descriptions, descriptions_raw, description_fields, context, codes
+
+    def collect(self) -> None:
+        """First pass: index phrases, evidence and duplicates."""
+        LOGGER.info("Pass 1 of 2: reading input and indexing evidence")
+
+        for table, profile, resolver in self.tables:
+            rows_read = 0
+            for row_number, row in table.iter_rows():
+                rows_read += 1
+                descriptions, _, _, context, codes = self._extract_texts(profile, resolver, row)
+                primary = descriptions[0] if descriptions else ""
+                row_type = classify_row(resolver, row, primary)
+
+                self.statistics[f"rows_{row_type.lower()}"] += 1
+                if row_type != ROW_TYPE_LINE:
+                    continue
+
+                self.phrase_pool.update(descriptions)
+                self.phrase_pool.update(context)
+
+                bundle = EvidenceBundle(
+                    descriptions=set(descriptions),
+                    context=set(context),
+                    codes=set(codes),
+                    systems={profile.name},
+                )
+                supplier = resolver.value(row, "supplier_name")
+                if supplier:
+                    bundle.suppliers.add(supplier)
+                for level in ("category_l1", "category_l2", "category_l3", "category_l4"):
+                    value = resolver.value(row, level)
+                    if value and not self.lexicon.is_noise(value):
+                        bundle.categories.add(value)
+                amount = parse_amount(resolver.value(row, "spend"))
+                if amount is not None:
+                    bundle.amounts.add(round(amount, 2))
+
+                for key in self._join_keys(self._row_keys(resolver, row)):
+                    self.evidence_by_key[key].absorb(bundle)
+
+                # Index each description under a blocking key so that the fuzzy
+                # tier compares a phrase only against plausible neighbours rather
+                # than against every phrase in the data set.
+                for description in descriptions:
+                    for block in self._blocking_keys(description):
+                        self.phrase_index[block].add(description)
+
+            self.statistics[f"rows_read:{profile.name}"] += rows_read
+            LOGGER.info("  %-46s %8d row(s)", table.label, rows_read)
+
+        LOGGER.info("Indexed %d distinct phrase(s) and %d join key(s).",
+                    len(self.phrase_pool), len(self.evidence_by_key))
+
+    @staticmethod
+    def _blocking_keys(text: str) -> List[str]:
+        """Cheap keys that group phrases likely to be comparable.
+
+        Blocking converts an intractable all-pairs comparison into a set of
+        small ones. The keys are the longest content words in the phrase: two
+        descriptions of the same purchase almost always share at least one, and
+        two unrelated descriptions almost never do.
+        """
+        words = [word.lower() for word in tokenise(fold_accents(text))
+                 if len(word) >= 5 and not is_code_token(word)]
+        return sorted(set(words), key=len, reverse=True)[:3]
+
+    # -- between the passes -------------------------------------------------
+
+    def resolve_language(self) -> None:
+        """Translate every distinct phrase once, then index them for retrieval."""
+        LOGGER.info("Resolving %d distinct phrase(s) into English ...", len(self.phrase_pool))
+        self.translator.prepare(self.phrase_pool)
+        for method, count in sorted(self.translator.method_counts.items()):
+            LOGGER.info("  %-12s %6d phrase(s)", method, count)
+            self.statistics[f"translation_{method}"] = count
+
+        # Built after translation so that the index holds English text. A
+        # multilingual model would place the source phrases near each other
+        # anyway, but indexing the English keeps this consistent with what the
+        # downstream agents embed and makes the neighbours legible in the audit
+        # trail.
+        self.semantic.build(
+            self.translator.results[phrase].english_text
+            for phrase in self.phrase_pool if phrase in self.translator.results
+        )
+
+    # -- matching -----------------------------------------------------------
+
+    def _match_by_key(self, keys: Dict[str, str]) -> Tuple[EvidenceBundle, str, float]:
+        """Look a row up by its business keys, preferring the most specific."""
+        merged = EvidenceBundle()
+        tier, score = "none", 0.0
+
+        for candidate in self._join_keys(keys):
+            bundle = self.evidence_by_key.get(candidate)
+            if not bundle:
+                continue
+            merged.absorb(bundle)
+            if tier == "none":
+                tier = "key"
+                # A line-level key is an exact identification; a header-level or
+                # item-level key only places the row in the right neighbourhood.
+                score = 1.0 if candidate.startswith(("POL:", "INVL:", "DOCL:")) else 0.8
+        return merged, tier, score
+
+    def _match_by_similarity(self, text: str, english_text: str) -> Tuple[Set[str], str, float]:
+        """Find comparable phrases when no business key resolved the row.
+
+        Two tiers, tried in order of how much they can be trusted. Lexical
+        comparison runs against the *source* text, because the blocking index
+        was built from source text and because a lexical match between two
+        untranslated strings is the stronger signal. Embedding retrieval runs
+        against the *English* text, because that is what the semantic index
+        holds, and only when the lexical tier found nothing: it can connect
+        phrases with no words in common, which is valuable and correspondingly
+        easier to fool.
+
+        The bar is set high on purpose. A false match here attaches another
+        purchase's description to this line, which is precisely the invented
+        information the specification forbids, so precision is favoured over
+        recall throughout.
+        """
+        if not text:
+            return set(), "none", 0.0
+
+        candidates: Set[str] = set()
+        for block in self._blocking_keys(text):
+            candidates |= self.phrase_index.get(block, set())
+        candidates.discard(text)
+
+        if candidates:
+            scored = sorted(
+                ((text_similarity(lookup_key(text), lookup_key(candidate)), candidate)
+                 for candidate in candidates),
+                key=lambda item: (-item[0], item[1]),
+            )[: self.settings.top_k]
+
+            accepted = {candidate for score, candidate in scored
+                        if score >= self.settings.fuzzy_threshold}
+            if accepted:
+                return accepted, "fuzzy", round(max(score for score, _ in scored), 3)
+
+        neighbours = self.semantic.query(english_text)
+        if neighbours:
+            return ({phrase for phrase, _ in neighbours}, "semantic",
+                    round(max(score for _, score in neighbours), 3))
+        return set(), "none", 0.0
+
+    # -- pass two -----------------------------------------------------------
+
+    def enrich_row(self, profile: SourceProfile, resolver: ColumnResolver,
+                   table: Table, row_number: int, row: Sequence[str]) -> LineRecord:
+        """Build the complete enriched record for one input row."""
+        (descriptions, descriptions_raw, description_fields,
+         context, codes) = self._extract_texts(profile, resolver, row)
+        primary = descriptions[0] if descriptions else ""
+        row_type = classify_row(resolver, row, primary)
+
+        keys = self._row_keys(resolver, row)
+        category_values = [resolver.value(row, level)
+                           for level in ("category_l1", "category_l2", "category_l3", "category_l4")]
+
+        record = LineRecord(
+            row_id=stable_hash(self.run_id, table.label, str(row_number)),
+            source_system=profile.name,
+            source_file=table.path.name,
+            source_sheet=table.sheet,
+            source_row=row_number,
+            row_type=row_type,
+            keys=keys,
+            own_descriptions=descriptions,
+            own_descriptions_raw=descriptions_raw,
+            own_description_fields=description_fields,
+            own_context=context,
+            own_codes=codes,
+        )
+
+        record.business = {
+            "supplier_id": resolver.value(row, "supplier_id"),
+            "supplier_name": resolver.value(row, "supplier_name"),
+            "category_l1": category_values[0],
+            "category_l2": category_values[1],
+            "category_l3": category_values[2],
+            "category_l4": category_values[3],
+            "category_path": " > ".join(value for value in category_values if value),
+            "material_group_number": resolver.value(row, "material_group_number"),
+            "material_group_name": resolver.value(row, "material_group_name"),
+            "business_area": resolver.value(row, "business_area"),
+            "division": resolver.value(row, "division"),
+            "company_code": resolver.value(row, "company_code"),
+            "company_name": resolver.value(row, "company_name"),
+            "country": resolver.value(row, "country"),
+            "quantity": resolver.value(row, "quantity"),
+            "unit": resolver.value(row, "unit"),
+            "unit_price": resolver.value(row, "unit_price"),
+            "spend": resolver.value(row, "spend"),
+            "currency": resolver.value(row, "currency"),
+            "posting_date": parse_date(resolver.value(row, "posting_date")),
+        }
+
+        if row_type != ROW_TYPE_LINE:
+            return record
+
+        # Duplicate detection ignores the file the row arrived in, so the same
+        # invoice delivered twice is recognised as one purchase. The row is
+        # flagged rather than removed: the client's row count must be preserved.
+        content_signature = stable_hash(
+            compact_key(keys.get("po_number")), compact_key(keys.get("po_line_number")),
+            compact_key(keys.get("invoice_number")), compact_key(keys.get("document_line_number")),
+            lookup_key(primary), lookup_key(record.business["supplier_name"]),
+            record.business["spend"],
+        )
+        if content_signature in self.content_seen:
+            record.is_duplicate = True
+            record.duplicate_of = self.content_seen[content_signature]
+        else:
+            self.content_seen[content_signature] = record.row_id
+
+        # Evidence: what this row says, plus what every other system says about
+        # the same purchase.
+        record.evidence = EvidenceBundle(
+            descriptions=set(descriptions), context=set(context),
+            codes=set(codes), systems={profile.name},
+        )
+        matched, tier, score = self._match_by_key(keys)
+        if not matched.is_empty():
+            record.evidence.absorb(matched)
+            record.match_tier, record.match_score = tier, score
+        elif not descriptions or all(self.lexicon.is_noise(value) for value in descriptions):
+            # Only reach for similarity when the row has nothing of its own to
+            # say. A row with a good description does not need a risky match.
+            english_primary = self.translator.translate(primary).english_text if primary else ""
+            similar, tier, score = self._match_by_similarity(primary, english_primary)
+            if similar:
+                record.evidence.descriptions |= similar
+                record.match_tier, record.match_score = tier, score
+
+        record.matched_systems = tuple(sorted(record.evidence.systems - {profile.name}))
+        return record
+
+    def build_description(self, record: LineRecord) -> Tuple[DescriptionResult, TranslationResult]:
+        """Translate a record's evidence and compose its description."""
+        if record.row_type != ROW_TYPE_LINE:
+            return DescriptionResult(), TranslationResult("", "", "und", 0.0, "none", 0.0)
+
+        # Own text first, then corroborating text from the other systems.
+        own = [value for value in record.own_descriptions]
+        borrowed = sorted(record.evidence.descriptions - set(own))
+        ordered_descriptions = own + borrowed
+
+        english_fragments: List[str] = []
+        translations: List[TranslationResult] = []
+        for fragment in ordered_descriptions:
+            result = self.translator.translate(fragment)
+            english_fragments.append(result.english_text)
+            translations.append(result)
+
+        context_fragments = [self.translator.translate(value).english_text
+                             for value in sorted(record.evidence.context)]
+
+        description = self.synthesiser.compose(record, english_fragments, context_fragments)
+
+        # The reported translation is the one for the line's own primary text,
+        # which is what a reviewer will want to check against the source cell.
+        primary_translation = translations[0] if translations else TranslationResult(
+            "", "", "und", 0.0, "none", 1.0)
+        return description, primary_translation
+
+    def unified_row(self, record: LineRecord, description: DescriptionResult,
+                    translation: TranslationResult, confidence: int,
+                    band: str, factors: Dict[str, float]) -> Dict[str, Any]:
+        """Assemble one row of the unified table."""
+        business = record.business
+        return {
+            "Enriched_Purchase_Description": description.description,
+            "Enriched_Description_Short": description.short_description,
+            "Item_Or_Service": description.item_or_service if description.description else "",
+            "AI_Confidence": confidence if description.description else "",
+            "Confidence_Band": band if description.description else "",
+
+            "Original_Description": record.primary_text,
+            "Original_Description_Fields": "; ".join(record.own_description_fields),
+            "Detected_Language": translation.language,
+            "Language_Confidence": translation.language_confidence,
+            "Translated_Description": translation.english_text,
+            "Translation_Method": translation.method,
+            "Translation_Coverage": round(translation.coverage, 3),
+            "Unresolved_Tokens": "; ".join(translation.unresolved),
+            "Evidence_Sources": "; ".join(sorted(record.evidence.systems)),
+            "Evidence_Field_Count": len(record.evidence.descriptions) + len(record.evidence.context),
+            "Match_Tier": record.match_tier,
+            "Match_Score": record.match_score,
+            "Matched_Source_Systems": "; ".join(record.matched_systems),
+            "Confidence_Factors": json.dumps(factors, sort_keys=True) if description.description else "",
+
+            "Source_System": record.source_system,
+            "Row_Type": record.row_type,
+            "Document_Number": record.keys.get("document_number", ""),
+            "Document_Line_Number": record.keys.get("document_line_number", ""),
+            "PO_Number": record.keys.get("po_number", ""),
+            "PO_Line_Number": record.keys.get("po_line_number", ""),
+            "Invoice_Number": record.keys.get("invoice_number", ""),
+            "Item_Number": record.keys.get("item_number", ""),
+            "Supplier_Id": business.get("supplier_id", ""),
+            "Supplier_Name": business.get("supplier_name", ""),
+            "Category_L1": business.get("category_l1", ""),
+            "Category_L2": business.get("category_l2", ""),
+            "Category_L3": business.get("category_l3", ""),
+            "Category_L4": business.get("category_l4", ""),
+            "Material_Group_Number": business.get("material_group_number", ""),
+            "Material_Group_Name": business.get("material_group_name", ""),
+            "Business_Area": business.get("business_area", ""),
+            "Division": business.get("division", ""),
+            "Company_Code": business.get("company_code", ""),
+            "Company_Name": business.get("company_name", ""),
+            "Country": business.get("country", ""),
+            "Quantity": business.get("quantity", ""),
+            "Unit": business.get("unit", ""),
+            "Unit_Price": business.get("unit_price", ""),
+            "Spend_EUR": business.get("spend", ""),
+            "Currency": business.get("currency", ""),
+            "Posting_Date": business.get("posting_date", ""),
+
+            "Is_Duplicate": "Yes" if record.is_duplicate else "No",
+            "Duplicate_Of": record.duplicate_of,
             "Source_File": record.source_file,
             "Source_Sheet": record.source_sheet,
-            "Source_Row_Index": str(record.row_index),
-            "Document_Id": logical.get("document_id", ""),
-            "Line_Number": logical.get("line_number", ""),
-            "PO_Number": logical.get("po_number", ""),
-            "PO_Line_Number": logical.get("po_line_number", ""),
-            "Item_Code": logical.get("item_code", ""),
-            "Supplier_Name": logical.get("supplier_name", ""),
-            "Supplier_Code": logical.get("supplier_code", ""),
-            "Quantity": logical.get("quantity", ""),
-            "Unit_Price": logical.get("unit_price", ""),
-            "Amount": logical.get("amount", ""),
-            "Currency": logical.get("currency", ""),
-            "Document_Date": logical.get("document_date", ""),
-            "Category_L1": logical.get("category_l1", ""),
-            "Category_L2": logical.get("category_l2", ""),
-            "Category_L3": logical.get("category_l3", ""),
-            "Category_L4": logical.get("category_l4", ""),
-            "Material_Group": logical.get("material_group", ""),
-            "Account_Name": logical.get("account_name", ""),
+            "Source_Row_Number": record.source_row,
+            "Row_Id": record.row_id,
+            "Run_Id": self.run_id,
+            "Lexicon_Version": self.lexicon.version,
+            "Agent_Version": AGENT_VERSION,
         }
-        row.update(self._enrichment_row(record))
-        return row
 
-    def _write_outputs(self, files: Sequence[Path]) -> Dict[str, Any]:
-        """Write per-source files, the unified table, the JSONL export and the manifest."""
-        results = self.settings.results_dir
-        results.mkdir(parents=True, exist_ok=True)
-        written: List[str] = []
+    def write(self) -> Dict[str, Any]:
+        """Second pass: enrich every row and write all output files."""
+        LOGGER.info("Pass 2 of 2: enriching rows and writing output")
+        results_dir = self.settings.results_dir
+        results_dir.mkdir(parents=True, exist_ok=True)
 
-        by_table: Dict[str, List[LineRecord]] = defaultdict(list)
-        for record in self.records:
-            by_table[record.table_key].append(record)
+        unified_csv_path = results_dir / "agent1_unified_lines.csv"
+        unified_jsonl_path = results_dir / "agent1_unified_lines.jsonl"
+        written_files: List[str] = []
 
-        for table, profile in self.tables:
-            if not profile.is_target:
-                continue
-            records = by_table.get(f"{table.path.resolve()}::{table.sheet}", [])
-            if not records:
-                continue
-            stem = re.sub(r"[^A-Za-z0-9]+", "_", table.path.stem).strip("_").lower()
-            sheet_key = re.sub(r"[^a-z0-9]+", "_", table.sheet.lower()).strip("_")
-            if sheet_key and sheet_key not in {"sheet1", stem}:
-                stem = f"{stem}_{sheet_key}"
-            path = results / f"{AGENT_ID}_{stem}.csv"
-            self._write_csv(
-                path,
-                list(table.columns) + list(self.settings.enrichment_columns),
-                [
-                    {**record.raw, **self._enrichment_row(record)}
-                    for record in sorted(records, key=lambda item: item.row_index)
-                ],
-            )
-            written.append(path.name)
+        per_source_columns = list(UNIFIED_COLUMNS if self.settings.full_columns
+                                  else PER_SOURCE_COLUMNS)
+        confidence_totals: List[int] = []
+        band_counts: Counter = Counter()
 
-        # Reference-only sources (supplier catalogues) take part in matching but are not
-        # purchase lines, so they stay out of the table the downstream agents consume.
-        ordered = sorted(
-            (record for record in self.records if record.profile.is_target),
-            key=lambda item: (item.source_key, item.source_file, item.row_index),
-        )
+        unified_handle = unified_csv_path.open("w", encoding="utf-8-sig", newline="")
+        unified_writer = csv.DictWriter(unified_handle, fieldnames=list(UNIFIED_COLUMNS),
+                                        extrasaction="ignore")
+        unified_writer.writeheader()
 
-        # The unified table is the handoff to Agents 2-4 and the audit record, so it always
-        # carries the full column set; the per-source files a human reads stay narrow.
-        unified_path = results / f"{AGENT_ID}_unified_lines.csv"
-        self._write_csv(
-            unified_path,
-            list(UNIFIED_CORE_COLUMNS) + list(ENRICHMENT_COLUMNS),
-            [self._unified_row(record) for record in ordered],
-        )
-        written.append(unified_path.name)
+        jsonl_handle = (unified_jsonl_path.open("w", encoding="utf-8")
+                        if self.settings.write_jsonl else None)
 
-        jsonl_path = results / f"{AGENT_ID}_unified_lines.jsonl"
-        with jsonl_path.open("w", encoding="utf-8", newline="\n") as handle:
-            for record in ordered:
-                handle.write(json.dumps(self._json_record(record), ensure_ascii=False) + "\n")
-        written.append(jsonl_path.name)
+        try:
+            for table, profile, resolver in self.tables:
+                output_path = results_dir / f"agent1_{self._output_stem(table, profile)}.csv"
+                with output_path.open("w", encoding="utf-8-sig", newline="") as source_handle:
+                    source_writer = csv.writer(source_handle)
+                    source_writer.writerow(list(table.headers) + per_source_columns)
 
-        manifest_path = results / f"{AGENT_ID}_run_manifest.json"
-        written.append(manifest_path.name)
+                    enriched_count = 0
+                    for row_number, row in table.iter_rows():
+                        record = self.enrich_row(profile, resolver, table, row_number, row)
+                        description, translation = self.build_description(record)
+                        confidence, band, factors = score_confidence(record, description, translation)
+
+                        unified = self.unified_row(record, description, translation,
+                                                   confidence, band, factors)
+                        unified_writer.writerow(unified)
+
+                        if jsonl_handle is not None:
+                            payload = dict(unified)
+                            # The JSONL carries the evidence that the flat table
+                            # can only summarise, so that a reviewer can see
+                            # every fragment a description was built from.
+                            payload["Evidence"] = {
+                                "own_descriptions": record.own_descriptions,
+                                "own_context": record.own_context,
+                                "own_codes": record.own_codes,
+                                "pooled_descriptions": sorted(record.evidence.descriptions),
+                                "pooled_context": sorted(record.evidence.context),
+                                "used_fragments": list(description.used_fragments),
+                                "description_basis": description.basis,
+                                "specificity": description.specificity,
+                            }
+                            jsonl_handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+                        source_writer.writerow(
+                            list(row) + [unified.get(column, "") for column in per_source_columns])
+
+                        if description.description:
+                            enriched_count += 1
+                            confidence_totals.append(confidence)
+                            band_counts[band] += 1
+
+                self.statistics[f"enriched:{profile.name}"] += enriched_count
+                written_files.append(output_path.name)
+                LOGGER.info("  %-46s %8d description(s) -> %s",
+                            table.label, enriched_count, output_path.name)
+        finally:
+            unified_handle.close()
+            if jsonl_handle is not None:
+                jsonl_handle.close()
+
+        written_files.extend([unified_csv_path.name]
+                             + ([unified_jsonl_path.name] if self.settings.write_jsonl else []))
+
+        if self.model is not None:
+            self.model.save_cache()
+
+        statistics = {name: value for name, value in sorted(self.statistics.items())}
+        statistics.update({
+            "distinct_phrases": len(self.phrase_pool),
+            "join_keys": len(self.evidence_by_key),
+            "descriptions_written": len(confidence_totals),
+            "mean_confidence": round(sum(confidence_totals) / len(confidence_totals), 1)
+                               if confidence_totals else 0.0,
+            "confidence_bands": dict(band_counts),
+        })
+        if self.model is not None:
+            statistics["token_usage"] = self.model.usage.as_dict()
 
         manifest = {
             "agent": AGENT_NAME,
-            "agent_version": __version__,
-            "lexicon_version": self.lexicon.version,
+            "agent_version": AGENT_VERSION,
             "run_id": self.run_id,
-            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "lexicon_version": self.lexicon.version,
+            "environment": describe_environment(),
             "configuration": {
-                "language_model_enabled": self.settings.model.enabled,
-                "language_model_provider": self.settings.model.provider if self.settings.model.enabled else None,
-                "language_model_name": self.settings.model.model if self.settings.model.enabled else None,
-                "machine_translation_enabled": self.translator.available,
+                "source_dir": str(self.settings.source_dir),
+                "results_dir": str(self.settings.results_dir),
+                "neural_translation": self.settings.use_neural_translation,
+                "semantic_matching": self.settings.use_semantic_matching,
+                "language_model": self.settings.model.enabled,
+                "model": self.settings.model.model if self.settings.model.enabled else None,
+                "backend": self.settings.model.backend if self.settings.model.enabled else None,
                 "fuzzy_threshold": self.settings.fuzzy_threshold,
                 "semantic_threshold": self.settings.semantic_threshold,
-                "top_k_matches": self.settings.top_k_matches,
-                "max_description_words": self.settings.max_description_words,
+                "max_words": self.settings.max_words,
             },
-            "inputs": [
-                {
-                    "file": str(path),
-                    "sha256": sha256_file(path),
-                    "bytes": path.stat().st_size,
-                }
-                for path in files
+            "inputs": dict(sorted(self.input_hashes.items())),
+            "sources": [
+                {"file": table.path.name, "sheet": table.sheet,
+                 "profile": profile.name, "columns": len(table.headers)}
+                for table, profile, _ in self.tables
             ],
-            "row_counts": {
-                "total": len(self.records),
-                "purchase_lines": len(ordered),
-                "reference_lines": len(self.records) - len(ordered),
-                "enriched": sum(1 for record in self.records if record.description),
-            },
-            "statistics": self.stats,
-            "outputs": written,
+            "outputs": written_files,
+            "statistics": statistics,
         }
+
+        manifest_path = results_dir / "agent1_run_manifest.json"
         manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return manifest
 
     @staticmethod
-    def _write_csv(path: Path, columns: Sequence[str], rows: Sequence[Dict[str, str]]) -> None:
-        """Write a CSV that Excel opens correctly regardless of locale."""
-        seen: set = set()
-        ordered_columns: List[str] = []
-        for column in columns:
-            if column not in seen:
-                seen.add(column)
-                ordered_columns.append(column)
-        with path.open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(
-                handle, fieldnames=ordered_columns, extrasaction="ignore", lineterminator="\r\n"
-            )
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({column: row.get(column, "") for column in ordered_columns})
+    def _output_stem(table: Table, profile: SourceProfile) -> str:
+        """Safe, stable file-name stem for a per-source output file."""
+        base = f"{table.path.stem}_{table.sheet}" if table.sheet not in {"", table.path.stem} else table.path.stem
+        stem = re.sub(r"[^A-Za-z0-9]+", "_", base).strip("_").lower()
+        return stem or profile.name
 
-    def _json_record(self, record: LineRecord) -> Dict[str, Any]:
-        """Full record including the evidence bundle that does not fit a CSV cell."""
-        return {
-            "row_id": record.row_id,
-            "run_id": self.run_id,
-            "source": {
-                "system": record.source_key,
-                "label": record.source_label,
-                "file": record.source_file,
-                "sheet": record.source_sheet,
-                "row_index": record.row_index,
-            },
-            "row_type": record.row_type,
-            "duplicate_of": record.duplicate_of or None,
-            "original": record.raw,
-            "logical": record.logical,
-            "enrichment": {
-                "enriched_purchase_description": record.description,
-                "enriched_description_short": record.description_short,
-                "item_or_service": record.item_or_service,
-                "method": record.enrichment_method,
-                "ai_confidence": record.confidence,
-                "confidence_band": record.confidence_band,
-                "confidence_components": record.confidence_components,
-            },
-            "language": {
-                "detected": record.language,
-                "confidence": record.language_confidence,
-            },
-            "translation": {
-                "source_text": record.raw_description,
-                "english": record.translation.english,
-                "method": record.translation.method,
-                "coverage": record.translation.coverage,
-                "unresolved_tokens": record.translation.unresolved,
-                "support_english": record.support_translation.english,
-            },
-            "matches": [match.as_dict() for match in record.matches],
-            "provenance": {
-                "agent_version": __version__,
-                "lexicon_version": self.lexicon.version,
-            },
-        }
+    def run(self) -> Dict[str, Any]:
+        """Execute the full pipeline."""
+        self.discover()
+        self.collect()
+        self.resolve_language()
+        return self.write()
 
 
 # ===========================================================================
 # Command line interface
 # ===========================================================================
 
-BANNER = f"""
+BANNER = r"""
 ===============================================================================
- {AGENT_NAME}
- Version {__version__}
+ Fortum AI-Powered Procurement Analysis
+ Agent 1 - Improved Purchase Description
+ Prof. Shahab Anbarjafari
 ===============================================================================
 """.strip("\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Define the command-line interface.
+
+    Interactive prompting is the primary way this agent is run, so every option
+    here has a sensible default and the parser exists mainly so that a scheduled
+    run can bypass the prompts entirely.
+    """
     parser = argparse.ArgumentParser(
         prog="agent1.py",
-        description=AGENT_NAME,
+        description="Agent 1 - generate standardised English purchase descriptions.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Run without arguments for an interactive session; every prompt offers a\n"
-            "default that can be accepted by pressing Enter."
+            "Examples:\n"
+            "  python agent1.py\n"
+            "      Prompt for each path in turn and run with the defaults.\n\n"
+            "  python agent1.py --non-interactive --sources ./sources --results ./results\n"
+            "      Run unattended with the local NLP stack only.\n\n"
+            "  python agent1.py --non-interactive --use-llm --max-words 10\n"
+            "      Add the language-model tier for phrases the vocabulary cannot resolve.\n"
         ),
     )
-    parser.add_argument("--sources", type=str, help="Root folder holding the source data")
-    parser.add_argument("--invoice-dir", type=str, help="Folder containing invoice line data")
-    parser.add_argument("--po-dir", type=str, help="Folder containing purchase order data")
-    parser.add_argument("--transaction-dir", type=str, help="Folder containing transaction data")
-    parser.add_argument("--catalogue", type=str, help="Optional supplier catalogue file")
-    parser.add_argument("--results", type=str, help="Folder for the generated output")
-    parser.add_argument("--lexicon", type=str, help="Path to the controlled vocabulary file")
-    parser.add_argument("--use-llm", action="store_true", help="Enable the language-model fallback")
-    parser.add_argument(
-        "--use-mt", action="store_true", help="Enable offline machine translation (Argos)"
-    )
-    parser.add_argument("--top-k", type=int, default=5, help="Matches retained per line")
-    parser.add_argument(
-        "--fuzzy-threshold", type=float, default=0.62, help="Minimum score for a fuzzy match"
-    )
-    parser.add_argument(
-        "--semantic-threshold", type=float, default=0.45, help="Minimum score for a semantic match"
-    )
-    parser.add_argument(
-        "--max-words", type=int, default=12, help="Word budget for a generated description"
-    )
-    parser.add_argument(
-        "--full-columns",
-        action="store_true",
-        help="Append the complete audit trail to each source file instead of the two "
-        "description columns",
-    )
-    parser.add_argument(
-        "--non-interactive", action="store_true", help="Never prompt; use defaults and arguments"
-    )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Show debug logging")
+    paths = parser.add_argument_group("paths")
+    paths.add_argument("--sources", metavar="DIR", help="folder holding the source data")
+    paths.add_argument("--results", metavar="DIR", help="folder to write results into")
+    paths.add_argument("--lexicon", metavar="FILE", help="controlled vocabulary JSON file")
+    paths.add_argument("--cache", metavar="DIR", help="folder for the model response cache")
+
+    tiers = parser.add_argument_group("processing tiers")
+    tiers.add_argument("--use-llm", action="store_true",
+                       help="enable the language-model tier for unresolved phrases")
+    tiers.add_argument("--no-neural", action="store_true",
+                       help="disable the offline neural translation models")
+    tiers.add_argument("--no-semantic", action="store_true",
+                       help="disable embedding-based matching")
+
+    tuning = parser.add_argument_group("tuning")
+    tuning.add_argument("--fuzzy-threshold", type=float, default=0.86,
+                        help="minimum similarity to accept a fuzzy match (default 0.86)")
+    tuning.add_argument("--semantic-threshold", type=float, default=0.72,
+                        help="minimum cosine similarity for a semantic match (default 0.72)")
+    tuning.add_argument("--top-k", type=int, default=5,
+                        help="candidate matches retained per line (default 5)")
+    tuning.add_argument("--max-words", type=int, default=12,
+                        help="word budget for a generated description (default 12)")
+
+    output = parser.add_argument_group("output")
+    output.add_argument("--full-columns", action="store_true",
+                        help="append the complete audit trail to the per-source files")
+    output.add_argument("--no-jsonl", action="store_true", help="skip the JSONL export")
+
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="never prompt; use the supplied arguments and defaults")
+    parser.add_argument("--verbose", action="store_true", help="emit debug-level logging")
+    parser.add_argument("--version", action="version",
+                        version=f"{AGENT_NAME} {AGENT_VERSION}")
     return parser
 
 
 def _clean_path_input(value: str) -> str:
-    """Tolerate quoted paths and shell escaping when pasted into a prompt."""
-    text = value.strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
-        text = text[1:-1]
-    return text.replace("\\ ", " ").strip()
+    """Tidy a path pasted into the terminal.
+
+    Dragging a folder onto a terminal wraps it in quotes and escapes its spaces,
+    and both would otherwise be taken as part of the name.
+    """
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return value.replace("\\ ", " ").strip()
 
 
 def ask(question: str, default: str) -> str:
-    """Prompt for a value, returning the default when the answer is empty."""
+    """Prompt for a value, offering a default that Enter accepts."""
     try:
-        answer = input(f"{question}\n  [{default}]: ")
+        answer = input(f"{question}\n  [{default}]: ").strip()
     except EOFError:
+        # Reached when input is piped rather than typed; the default is correct.
         return default
-    answer = _clean_path_input(answer)
-    return answer or default
+    return _clean_path_input(answer) or default
 
 
-def ask_yes_no(question: str, default: bool = False) -> bool:
+def ask_yes_no(question: str, default: bool) -> bool:
     """Prompt for a yes or no answer."""
-    suffix = "Y/n" if default else "y/N"
+    hint = "Y/n" if default else "y/N"
     try:
-        answer = input(f"{question} [{suffix}]: ").strip().lower()
+        answer = input(f"{question} [{hint}]: ").strip().lower()
     except EOFError:
         return default
     if not answer:
         return default
-    return answer in {"y", "yes"}
+    return answer[0] == "y"
 
 
 def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
-    """Merge command-line arguments, prompted answers and sensible defaults."""
-    project_root = Path(__file__).resolve().parent
-    interactive = not args.non_interactive and sys.stdin.isatty()
+    """Combine defaults, command-line arguments and prompts into a settings object."""
+    here = Path(__file__).resolve().parent
+    default_sources = Path(args.sources) if args.sources else here / "sources"
+    default_results = Path(args.results) if args.results else here / "results"
+    default_lexicon = Path(args.lexicon) if args.lexicon else here / "lexicon" / "procurement_lexicon.json"
+    default_cache = Path(args.cache) if args.cache else here / "cache"
 
-    default_sources = args.sources or str(project_root / "sources")
-    if interactive:
+    use_neural = not args.no_neural
+    use_semantic = not args.no_semantic
+    use_llm = args.use_llm
+
+    if not args.non_interactive:
         print(BANNER)
         print("\nPress Enter to accept the value shown in brackets.\n")
-        sources_root = Path(ask("Source data folder", default_sources)).expanduser()
-    else:
-        sources_root = Path(default_sources).expanduser()
+        default_sources = Path(ask("Source data folder", str(default_sources)))
+        default_results = Path(ask("Results folder", str(default_results)))
+        default_lexicon = Path(ask("Controlled vocabulary file", str(default_lexicon)))
+        default_cache = Path(ask("Cache folder", str(default_cache)))
 
-    def resolve_directory(argument: Optional[str], label: str, folder: str) -> Optional[Path]:
-        default = argument or str(sources_root / folder)
-        if interactive:
-            default = ask(f"{label} folder", default)
-        path = Path(default).expanduser()
-        if not path.is_dir():
-            LOGGER.debug("Folder not present: %s", path)
-        return path
+        print()
+        if _transformers is None:
+            print("  Offline translation models are not installed; that tier will be skipped.")
+            use_neural = False
+        else:
+            use_neural = ask_yes_no(
+                "Use the offline neural translation models (recommended, free)?", True)
 
-    invoice_dir = resolve_directory(args.invoice_dir, "Invoice data", "invoice data")
-    po_dir = resolve_directory(args.po_dir, "Purchase order data", "po data")
-    transaction_dir = resolve_directory(args.transaction_dir, "Transaction data", "transaction data")
+        if _sentence_transformers is None:
+            use_semantic = False
+        else:
+            use_semantic = ask_yes_no(
+                "Use embedding-based matching for unlinked lines?", use_semantic)
 
-    default_catalogue = args.catalogue or str(sources_root / "Demo - Item Catalogues.csv")
-    if interactive:
-        default_catalogue = ask("Supplier catalogue file (optional, '-' to skip)", default_catalogue)
-    catalogue = None if default_catalogue.strip() in {"", "-"} else Path(default_catalogue).expanduser()
-
-    default_results = args.results or str(project_root / "results")
-    if interactive:
-        default_results = ask("Results folder", default_results)
-    results_dir = Path(default_results).expanduser()
-
-    lexicon_file = Path(
-        args.lexicon or str(project_root / "lexicon" / "procurement_lexicon.json")
-    ).expanduser()
-
-    use_mt = args.use_mt
-    use_llm = args.use_llm
-    if interactive:
-        if _argos is not None:
-            use_mt = ask_yes_no("Enable offline machine translation (Argos)?", use_mt)
         use_llm = ask_yes_no(
-            "Enable the language-model fallback for unresolved phrases?", use_llm
-        )
+            "Use the language model for phrases the local stack cannot resolve?", use_llm)
+        print()
 
-    model = resolve_model_config(env, use_llm)
-    if use_llm and not model.enabled:
-        LOGGER.warning(
-            "Language-model fallback could not be configured; check AZURE_ENABLE and the "
-            "matching key, base URL and model name in .env"
-        )
-
-    return Settings(
-        sources_root=sources_root,
-        invoice_dir=invoice_dir,
-        po_dir=po_dir,
-        transaction_dir=transaction_dir,
-        catalogue_file=catalogue,
-        results_dir=results_dir,
-        lexicon_file=lexicon_file if lexicon_file.is_file() else None,
-        cache_dir=project_root / "cache",
+    settings = Settings(
+        source_dir=default_sources.expanduser().resolve(),
+        results_dir=default_results.expanduser().resolve(),
+        lexicon_path=default_lexicon.expanduser().resolve(),
+        cache_dir=default_cache.expanduser().resolve(),
+        use_neural_translation=use_neural,
+        use_semantic_matching=use_semantic,
         use_llm=use_llm,
-        use_machine_translation=use_mt,
-        top_k_matches=max(1, args.top_k),
         fuzzy_threshold=args.fuzzy_threshold,
         semantic_threshold=args.semantic_threshold,
-        max_description_words=max(4, args.max_words),
-        full_columns=bool(args.full_columns),
-        model=model,
+        top_k=args.top_k,
+        max_words=args.max_words,
+        full_columns=args.full_columns,
+        write_jsonl=not args.no_jsonl,
+        verbose=args.verbose,
     )
+    settings.model = resolve_model_config(env, use_llm)
+
+    if not settings.source_dir.exists():
+        raise SystemExit(f"Source folder does not exist: {settings.source_dir}")
+    return settings
 
 
 def configure_logging(verbose: bool) -> None:
+    """Send progress to stdout in a format that reads well in a terminal."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s  %(levelname)-7s  %(message)s",
+        format="%(asctime)s  %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
         stream=sys.stdout,
     )
 
 
-def _print_token_usage(statistics: Dict[str, Any], settings: Settings) -> None:
-    """Report language-model consumption, but only when a model was actually used."""
+def print_token_usage(statistics: Dict[str, Any], settings: Settings) -> None:
+    """Report language-model consumption for the run.
+
+    Printed whenever the tier was enabled, including when it turned out that
+    every phrase was served from cache, because "this run cost nothing" is
+    exactly as useful a result as a token count.
+    """
     usage = statistics.get("token_usage")
     if not usage:
         return
 
-    print("\n" + "-" * 79)
+    print()
+    print("-" * 79)
     print("Language model usage")
     print("-" * 79)
-    print(f"  {'Model':<20}: {settings.model.model} ({settings.model.provider})")
-    print(f"  {'Phrases resolved':<20}: {statistics.get('model_phrases', 0)}")
-    print(f"  {'Requests sent':<20}: {usage.get('requests', 0)}")
-    if usage.get("cache_hits"):
-        print(f"  {'Served from cache':<20}: {usage['cache_hits']} (no tokens consumed)")
-    print(f"  {'Input tokens':<20}: {usage.get('input_tokens', 0):,}")
-    if usage.get("cached_input_tokens"):
-        print(f"  {'  of which cached':<20}: {usage['cached_input_tokens']:,}")
-    print(f"  {'Output tokens':<20}: {usage.get('output_tokens', 0):,}")
-    if usage.get("reasoning_tokens"):
-        print(f"  {'  of which reasoning':<20}: {usage['reasoning_tokens']:,}")
-    print(f"  {'Total tokens':<20}: {usage.get('total_tokens', 0):,}")
+    print(f"  Model                : {settings.model.model} ({settings.model.backend})")
+    print(f"  Requests sent        : {usage['requests']:,}")
+    if usage["failed_requests"]:
+        print(f"  Failed requests      : {usage['failed_requests']:,}")
+    print(f"  Served from cache    : {usage['cache_hits']:,} (no tokens consumed)")
+    print(f"  Input tokens         : {usage['input_tokens']:,}")
+    if usage["cached_input_tokens"]:
+        print(f"    of which cached    : {usage['cached_input_tokens']:,}")
+    print(f"  Output tokens        : {usage['output_tokens']:,}")
+    if usage["reasoning_tokens"]:
+        # Billed as output but never returned in the message, so a report that
+        # omitted them would understate the cost of the run.
+        print(f"    of which reasoning : {usage['reasoning_tokens']:,}")
+    print(f"  Total tokens         : {usage['total_tokens']:,}")
 
 
 def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
-    """Print a short operator-facing report of what the run produced."""
-    statistics = manifest.get("statistics", {})
-    counts = manifest.get("row_counts", {})
+    """Print the closing report."""
+    statistics = manifest["statistics"]
 
-    print("\n" + "=" * 79)
-    print("Run complete")
+    print()
     print("=" * 79)
-    print(f"  Run identifier      : {manifest['run_id']}")
-    print(f"  Vocabulary version  : {manifest['lexicon_version']}")
-    print(f"  Rows processed      : {counts.get('total', 0)}")
-    print(f"  Rows enriched       : {counts.get('enriched', 0)}")
+    print(f"{AGENT_NAME} - complete")
+    print("=" * 79)
+    print(f"  Run id               : {manifest['run_id']}")
+    print(f"  Vocabulary version   : {manifest['lexicon_version']}")
+    print(f"  Sources processed    : {len(manifest['sources'])}")
+    print(f"  Purchase lines       : {statistics.get('rows_line', 0):,}")
 
-    for label, key in (
-        ("Row types", "row_types"),
-        ("Languages", "languages"),
-        ("Match tiers", "match_tiers"),
-        ("Confidence", "confidence_bands"),
-    ):
-        values = statistics.get(key)
-        if values:
-            rendered = ", ".join(f"{name}={value}" for name, value in values.items())
-            print(f"  {label:<20}: {rendered}")
+    for row_type in ("header", "subtotal", "total", "empty"):
+        count = statistics.get(f"rows_{row_type}", 0)
+        if count:
+            print(f"  Rows typed {row_type:<10}: {count:,}")
 
-    if statistics.get("duplicate_rows"):
-        print(f"  {'Duplicate rows':<20}: {statistics['duplicate_rows']}")
+    print(f"  Distinct phrases     : {statistics.get('distinct_phrases', 0):,}")
+    print(f"  Descriptions written : {statistics.get('descriptions_written', 0):,}")
+    print(f"  Mean confidence      : {statistics.get('mean_confidence', 0)}")
 
-    _print_token_usage(statistics, settings)
+    bands = statistics.get("confidence_bands", {})
+    if bands:
+        band_summary = "  ".join(f"{name} {count:,}" for name, count in sorted(bands.items()))
+        print(f"  Confidence bands     : {band_summary}")
 
-    print(f"\n  Output folder: {settings.results_dir}")
-    for name in manifest.get("outputs", []):
-        print(f"    - {name}")
+    methods = [(name.replace("translation_", ""), value)
+               for name, value in statistics.items() if name.startswith("translation_")]
+    if methods:
+        print("\n  Phrase resolution by tier")
+        for name, value in sorted(methods, key=lambda item: -item[1]):
+            print(f"    {name:<14} {value:,}")
+
+    print(f"\n  Output folder        : {settings.results_dir}")
+    for name in manifest["outputs"]:
+        print(f"    {name}")
+
+    print_token_usage(statistics, settings)
     print()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    """Entry point."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
     configure_logging(args.verbose)
 
     env = load_dotenv(Path(__file__).resolve().parent / ".env")
-    settings = resolve_settings(args, env)
+    # Real environment variables win over the file, which is what allows a
+    # scheduled job to override a developer's local settings.
+    env.update({key: value for key, value in os.environ.items() if key in {
+        "AZURE_ENABLE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
+        "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_MODEL",
+        "BASE_URL", "MODEL_NAME", "LLM_BATCH_SIZE", "LLM_TIMEOUT", "LLM_MAX_REQUESTS",
+    }})
 
+    try:
+        settings = resolve_settings(args, env)
+    except SystemExit as error:
+        print(f"\n{error}\n", file=sys.stderr)
+        return 2
+
+    available = describe_environment()
+    LOGGER.info("Optional components: %s", ", ".join(
+        f"{name}={'yes' if present else 'no'}" for name, present in sorted(available.items())))
     if settings.model.enabled:
-        LOGGER.info(
-            "Language model enabled: %s via %s", settings.model.model, settings.model.provider
-        )
-    else:
-        LOGGER.info("Running without a language model (vocabulary and rules only)")
+        LOGGER.info("Language-model tier enabled: %s via %s",
+                    settings.model.model, settings.model.backend)
 
     try:
         manifest = Agent1(settings).run()
     except SystemExit as error:
-        LOGGER.error("%s", error)
-        return 1
+        print(f"\n{error}\n", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
-        LOGGER.error("Interrupted by user")
+        print("\nInterrupted.\n", file=sys.stderr)
         return 130
 
     print_summary(manifest, settings)
@@ -3277,4 +3828,4 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

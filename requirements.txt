@@ -1,23 +1,91 @@
-# Agent 1 runs on the Python standard library alone. Everything below is optional
-# and is detected automatically at start-up; install what you need.
+# ---------------------------------------------------------------------------
+# Fortum AI-Powered Procurement Analysis - Python dependencies
 #
-#     pip install -r requirements.txt
+#   python3 -m venv myenv
+#   source myenv/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
 #
-# Python 3.9 or newer.
+# Requires Python 3.9 or newer.
+#
+# The agents are built so that the classical NLP stack does the bulk of the
+# work and a large language model is consulted only for the residue that the
+# deterministic layers cannot resolve. Every neural component listed here runs
+# locally on CPU, which is what keeps the per-row cost at zero.
+# ---------------------------------------------------------------------------
 
-# --- Recommended -----------------------------------------------------------
-# Faster and more accurate fuzzy string comparison than the stdlib fallback.
+# --- Data access -----------------------------------------------------------
+# Tabular handling and the Excel reader. openpyxl is used in read-only,
+# streaming mode so that million-row workbooks do not have to fit in memory.
+pandas>=2.0
+numpy>=1.24
+openpyxl>=3.1
+
+# --- Classical NLP ---------------------------------------------------------
+# NLTK supplies the Snowball stemmers (which cover Finnish, Swedish, Norwegian,
+# Danish, German and Dutch), the stop-word lists and the collocation finder
+# used to detect recurring multi-word procurement terms.
+nltk>=3.8
+
+# spaCy supplies tokenisation, lemmatisation, part-of-speech tagging and named
+# entity recognition. The per-language pipelines are installed separately; see
+# the model block at the bottom of this file.
+spacy>=3.7
+
+# Vectorisation, nearest-neighbour search and agglomerative clustering.
+scikit-learn>=1.3
+scipy>=1.10
+
+# C++ implementation of the edit-distance family. Roughly two orders of
+# magnitude faster than difflib, which matters when blocking a million lines.
 rapidfuzz>=3.6
 
-# HTTP client for the language-model fallback (urllib is used when absent).
+# --- Neural components (local, CPU, no per-call cost) ----------------------
+# Multilingual sentence embeddings. This is the component that makes semantic
+# grouping, catalogue matching and supplier-portfolio comparison possible
+# without sending anything to a language model.
+sentence-transformers>=2.6
+
+# Hosts the Helsinki-NLP opus-mt translation models. Offline machine
+# translation removes the single largest language-model cost driver.
+transformers>=4.40
+torch>=2.1
+sentencepiece>=0.2
+sacremoses>=0.1
+
+# --- Utilities -------------------------------------------------------------
+# HTTP client for the language-model backends. The agents fall back to
+# urllib from the standard library when this is absent.
 requests>=2.31
 
-# --- Optional --------------------------------------------------------------
-# Statistical language identification, used only to break ties left by the
-# built-in marker heuristic.
+# Statistical language identification, used only to break ties that the
+# built-in marker heuristic leaves unresolved.
 langdetect>=1.0.9
 
-# Offline neural translation. Requires the language pairs to be downloaded
-# separately, for example:
-#     python -c "import argostranslate.package as p; p.update_package_index()"
-# argostranslate>=1.9
+# Progress reporting for the long passes over large inputs.
+tqdm>=4.66
+
+# ---------------------------------------------------------------------------
+# Language resources - install after the packages above
+# ---------------------------------------------------------------------------
+#
+#   python -m spacy download en_core_web_sm
+#   python -m spacy download fi_core_news_sm
+#   python -m spacy download sv_core_news_sm
+#   python -m spacy download pl_core_news_sm
+#   python -m spacy download de_core_news_sm
+#   python -m spacy download nb_core_news_sm
+#   python -m spacy download xx_ent_wiki_sm
+#
+#   python -m nltk.downloader punkt punkt_tab stopwords wordnet omw-1.4
+#
+# The translation and embedding models are fetched from the Hugging Face hub on
+# first use and cached under ~/.cache/huggingface. To pre-load them, or to
+# stage them for an air-gapped machine, run:
+#
+#   python -c "from sentence_transformers import SentenceTransformer; \
+#              SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')"
+#   python -c "from transformers import pipeline; \
+#              [pipeline('translation', model=f'Helsinki-NLP/opus-mt-{p}') \
+#               for p in ('fi-en', 'sv-en', 'pl-en', 'de-en')]"
+# ---------------------------------------------------------------------------

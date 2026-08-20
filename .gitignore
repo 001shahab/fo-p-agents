@@ -1,9 +1,23 @@
+# Virtual environments
 myenv/
-__pycache__/
-sources/
-.env
-.DS_Store
-results/
-cache/
-*.pyc
+venv/
 .venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Client data and generated output never belong in version control
+sources/
+results/
+
+# Credentials
+.env
+
+# Derived state: caches are reproducible, registries are environment specific
+cache/
+lexicon/*_registry.json
+
+# Operating system noise
+.DS_Store
+Thumbs.db
