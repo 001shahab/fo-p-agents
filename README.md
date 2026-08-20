@@ -102,29 +102,26 @@ Written to `results/`:
 
 | File | Contents |
 |---|---|
-| `agent1_<source>.csv` | One file per input, original columns untouched with the enrichment columns appended at the end |
+| `agent1_<source>.csv` | One file per input, original columns untouched with the enriched description appended at the end |
 | `agent1_unified_lines.csv` | Common schema across all sources; the input contract for Agents 2 to 4 |
 | `agent1_unified_lines.jsonl` | Same rows with the full nested evidence bundle |
 | `agent1_run_manifest.json` | Input hashes, configuration, statistics and vocabulary version |
 
-The appended columns are ordered so the result comes first, then the evidence behind it,
-then provenance. In a per-source file the first five columns after your own data are
-always `Enriched_Purchase_Description`, `Enriched_Description_Short`, `Item_Or_Service`,
-`AI_Confidence` (0-100) and `Confidence_Band`. For `invoice_line_data.xlsx`, whose data
-ends at column O, that puts the enriched description in column P and the short form in
-column Q.
+A per-source file is your own sheet with two columns added and nothing else:
+`Enriched_Purchase_Description` followed by `Enriched_Description_Short`. For
+`invoice_line_data.xlsx`, whose data ends at column O, that is column P and column Q.
 
-`Row_Type` and `Detected_Language` follow, because they explain a blank result: only rows
-typed `LINE` are enriched, so headers, subtotals and totals are deliberately left empty
-rather than described as if they were purchases.
+Both are blank on rows that are not purchase lines. Only rows typed `LINE` are enriched,
+so document headers, subtotals and totals are left empty rather than described as if they
+were purchases; the `Row_Type` column in the unified table records which is which.
 
-The remaining columns carry the audit trail — `Translation_Method`,
-`Translation_Coverage`, `Unresolved_Tokens`, `Evidence_Sources`, `Match_Tier`,
-`Match_Score`, `Matched_Source_System`, `Is_Duplicate`, `Duplicate_Of`, `Row_Id`,
-`Run_Id` and `Lexicon_Version`.
-
-Pass `--minimal` to append only the five headline columns to the per-source files. The
-unified table always carries the full set, since Agents 2 to 4 depend on it.
+Pass `--full-columns` to append the complete audit trail to the per-source files instead:
+`Item_Or_Service`, `AI_Confidence` (0-100), `Confidence_Band`, `Row_Type`,
+`Detected_Language`, `Translation_Method`, `Translation_Coverage`, `Unresolved_Tokens`,
+`Evidence_Sources`, `Match_Tier`, `Match_Score`, `Matched_Source_System`, `Is_Duplicate`,
+`Duplicate_Of`, `Row_Id`, `Run_Id` and `Lexicon_Version`. The unified table and the JSONL
+carry that full set unconditionally, since Agents 2 to 4 depend on it, so the narrow
+per-source view costs no traceability.
 
 ### Configuration
 
