@@ -136,6 +136,28 @@ the agent drops it and reissues the request rather than failing the run.
 The language model is **off by default**. The agent produces complete output without it;
 enabling it only improves coverage of phrases the vocabulary cannot resolve.
 
+When the model is used, consumption is reported at the end of the run and recorded under
+`statistics.token_usage` in the run manifest:
+
+```
+-------------------------------------------------------------------------------
+Language model usage
+-------------------------------------------------------------------------------
+  Model               : gpt-5.1 (openai)
+  Phrases resolved    : 12
+  Requests sent       : 2
+  Served from cache   : 5 (no tokens consumed)
+  Input tokens        : 1,212
+    of which cached   : 128
+  Output tokens       : 330
+    of which reasoning: 192
+  Total tokens        : 1,542
+```
+
+Reasoning tokens are shown separately because they are billed but never appear in the
+response, so output tokens alone understate what a run cost. Phrases served from the
+cache consume nothing, which is why a repeated run reports zero tokens.
+
 ### Controlled vocabulary
 
 `lexicon/procurement_lexicon.json` holds the Finnish, Swedish and Polish procurement

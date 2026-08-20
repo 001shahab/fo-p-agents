@@ -1345,6 +1345,44 @@ class MachineTranslator:
 # Language model client
 # ===========================================================================
 
+@dataclass
+class TokenUsage:
+    """Running total of language-model consumption for one run.
+
+    Reasoning tokens are tracked separately because reasoning models bill for output
+    that never appears in the response, so completion tokens alone understate what a
+    run actually cost.
+    """
+
+    requests: int = 0
+    cache_hits: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reported_total_tokens: int = 0
+    reasoning_tokens: int = 0
+    cached_prompt_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        """Total billed tokens, accumulated per response rather than derived at the end."""
+        return self.reported_total_tokens or (self.prompt_tokens + self.completion_tokens)
+
+    @property
+    def any_recorded(self) -> bool:
+        return bool(self.requests or self.cache_hits)
+
+    def as_dict(self) -> Dict[str, int]:
+        return {
+            "requests": self.requests,
+            "cache_hits": self.cache_hits,
+            "input_tokens": self.prompt_tokens,
+            "output_tokens": self.completion_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cached_input_tokens": self.cached_prompt_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+
 class LanguageModelClient:
     """Chat-completions client used only for phrases the vocabulary cannot resolve.
 
@@ -1366,6 +1404,7 @@ class LanguageModelClient:
         self.config = config
         self.available = config.enabled
         self.calls = 0
+        self.usage = TokenUsage()
         self._cache_path = cache_path
         self._cache: Dict[str, str] = {}
         self._dirty = False
@@ -1387,6 +1426,7 @@ class LanguageModelClient:
             cached = self._cache.get(self._cache_key(phrase, language))
             if cached is not None:
                 results[phrase] = cached
+                self.usage.cache_hits += 1
             else:
                 outstanding.append((phrase, language))
 
@@ -1464,10 +1504,12 @@ class LanguageModelClient:
             if status == 200:
                 try:
                     data = json.loads(raw)
-                    return data["choices"][0]["message"]["content"]
+                    content = data["choices"][0]["message"]["content"]
                 except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
                     LOGGER.warning("Unexpected response shape from the model: %s", error)
                     return None
+                self._record_usage(data.get("usage"))
+                return content
 
             if status == 400 and self._degrade(request_payload, raw):
                 # A parameter was removed; retry at once rather than burning an attempt.
@@ -1484,6 +1526,45 @@ class LanguageModelClient:
             LOGGER.debug("Model request failed (HTTP %s); retrying in %ss", status, wait)
             time.sleep(wait)
         return None
+
+    def _record_usage(self, usage: Any) -> None:
+        """Accumulate the token counts reported alongside a successful response.
+
+        Field names differ between API generations, so both the chat-completions
+        (``prompt_tokens``) and the newer (``input_tokens``) spellings are accepted.
+        A response without a usage block is counted as a request but no tokens.
+        """
+        self.usage.requests += 1
+        if not isinstance(usage, dict):
+            return
+
+        def count(*names: str) -> int:
+            for name in names:
+                if usage.get(name) is not None:
+                    return _safe_int(str(usage[name]), 0)
+            return 0
+
+        prompt = count("prompt_tokens", "input_tokens")
+        completion = count("completion_tokens", "output_tokens")
+        self.usage.prompt_tokens += prompt
+        self.usage.completion_tokens += completion
+        # Accumulate the total per response. Deriving it at the end would understate the
+        # figure if any single response omitted its usage block.
+        self.usage.reported_total_tokens += count("total_tokens") or (prompt + completion)
+
+        output_details = usage.get("completion_tokens_details") or usage.get(
+            "output_tokens_details"
+        )
+        if isinstance(output_details, dict):
+            self.usage.reasoning_tokens += _safe_int(
+                str(output_details.get("reasoning_tokens", 0)), 0
+            )
+
+        input_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+        if isinstance(input_details, dict):
+            self.usage.cached_prompt_tokens += _safe_int(
+                str(input_details.get("cached_tokens", 0)), 0
+            )
 
     # Parameters that may be dropped if the model rejects them, in removal order.
     _OPTIONAL_PARAMETERS = ("temperature", "response_format", "top_p", "seed")
@@ -2581,7 +2662,20 @@ class Agent1:
                     )
         self.model.close()
         self.stats["model_phrases"] = len(pending)
-        self.stats["model_calls"] = self.model.calls
+        self.stats["model_attempts"] = self.model.calls
+        self.stats["token_usage"] = self.model.usage.as_dict()
+
+        usage = self.model.usage
+        LOGGER.info(
+            "Token usage: input=%s output=%s (reasoning=%s) total=%s across %s request(s), "
+            "%s phrase(s) served from cache",
+            f"{usage.prompt_tokens:,}",
+            f"{usage.completion_tokens:,}",
+            f"{usage.reasoning_tokens:,}",
+            f"{usage.total_tokens:,}",
+            usage.requests,
+            usage.cache_hits,
+        )
 
     # -- matching and synthesis --------------------------------------------
 
@@ -3038,6 +3132,29 @@ def configure_logging(verbose: bool) -> None:
     )
 
 
+def _print_token_usage(statistics: Dict[str, Any], settings: Settings) -> None:
+    """Report language-model consumption, but only when a model was actually used."""
+    usage = statistics.get("token_usage")
+    if not usage:
+        return
+
+    print("\n" + "-" * 79)
+    print("Language model usage")
+    print("-" * 79)
+    print(f"  {'Model':<20}: {settings.model.model} ({settings.model.provider})")
+    print(f"  {'Phrases resolved':<20}: {statistics.get('model_phrases', 0)}")
+    print(f"  {'Requests sent':<20}: {usage.get('requests', 0)}")
+    if usage.get("cache_hits"):
+        print(f"  {'Served from cache':<20}: {usage['cache_hits']} (no tokens consumed)")
+    print(f"  {'Input tokens':<20}: {usage.get('input_tokens', 0):,}")
+    if usage.get("cached_input_tokens"):
+        print(f"  {'  of which cached':<20}: {usage['cached_input_tokens']:,}")
+    print(f"  {'Output tokens':<20}: {usage.get('output_tokens', 0):,}")
+    if usage.get("reasoning_tokens"):
+        print(f"  {'  of which reasoning':<20}: {usage['reasoning_tokens']:,}")
+    print(f"  {'Total tokens':<20}: {usage.get('total_tokens', 0):,}")
+
+
 def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
     """Print a short operator-facing report of what the run produced."""
     statistics = manifest.get("statistics", {})
@@ -3064,8 +3181,8 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
 
     if statistics.get("duplicate_rows"):
         print(f"  {'Duplicate rows':<20}: {statistics['duplicate_rows']}")
-    if statistics.get("model_phrases"):
-        print(f"  {'Model phrases':<20}: {statistics['model_phrases']}")
+
+    _print_token_usage(statistics, settings)
 
     print(f"\n  Output folder: {settings.results_dir}")
     for name in manifest.get("outputs", []):
