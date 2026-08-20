@@ -1,0 +1,23 @@
+# Agent 1 runs on the Python standard library alone. Everything below is optional
+# and is detected automatically at start-up; install what you need.
+#
+#     pip install -r requirements.txt
+#
+# Python 3.9 or newer.
+
+# --- Recommended -----------------------------------------------------------
+# Faster and more accurate fuzzy string comparison than the stdlib fallback.
+rapidfuzz>=3.6
+
+# HTTP client for the language-model fallback (urllib is used when absent).
+requests>=2.31
+
+# --- Optional --------------------------------------------------------------
+# Statistical language identification, used only to break ties left by the
+# built-in marker heuristic.
+langdetect>=1.0.9
+
+# Offline neural translation. Requires the language pairs to be downloaded
+# separately, for example:
+#     python -c "import argostranslate.package as p; p.update_package_index()"
+# argostranslate>=1.9
