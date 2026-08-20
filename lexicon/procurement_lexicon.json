@@ -6,7 +6,8 @@
     "`phrases` are matched before `terms`, longest first, on the normalised (lower-cased, accent-preserving) text.",
     "`terms` are matched against both the raw token and its stem, so inflected Finnish and Swedish forms resolve without an entry per case.",
     "`compound_parts` drive the Nordic compound splitter: 'asbestipurkutyo' decomposes to asbesti + purku + tyo.",
-    "Targets are written in lower case; the description synthesiser applies casing."
+    "Targets are written in lower case; the description synthesiser applies casing.",
+    "`legal_forms` holds incorporation suffixes only. A word that distinguishes one company from another does not belong here: strip 'Nordic' from a vendor name and 'Nordic Cleaning Oy' becomes indistinguishable from 'Cleaning International AB'. Geographic and market qualifiers go in `geographic_qualifiers`, which supplier matching treats as weak rather than absent."
   ],
 
   "phrases": {
@@ -428,6 +429,13 @@
     "llc", "inc", "incorporated", "corp", "corporation", "gmbh", "ag", "kg", "bv",
     "nv", "sa", "sas", "srl", "spa", "sp z o o", "sp z oo", "spzoo", "sp j", "spj",
     "sp k", "spk", "s a", "zoo", "kft", "doo", "ou", "ky", "ry", "hf", "ehf", "co",
-    "company", "group", "holding", "holdings", "international", "nordic", "scandinavia"
+    "company", "group", "holding", "holdings"
+  ],
+
+  "geographic_qualifiers": [
+    "international", "nordic", "nordics", "scandinavia", "scandinavian", "europe",
+    "european", "global", "baltic", "suomi", "finland", "sverige", "sweden",
+    "norge", "norway", "danmark", "denmark", "polska", "poland", "deutschland",
+    "germany"
   ]
 }
