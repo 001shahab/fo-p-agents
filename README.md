@@ -17,12 +17,31 @@ They form a chain. Each one appends columns to the table the previous one
 produced, so no analysis has to be recomputed and every result can be traced
 back to the source row it came from.
 
-**Author:** Prof. Shahab Anbarjafari
+**Author and developer:** Prof. Shahab Anbarjafari
+
+---
+
+## Quick start
+
+```bash
+python3 -m venv myenv && source myenv/bin/activate
+pip install --upgrade pip && pip install -r requirements.txt
+
+python agent1.py        # then answer the prompts, or press Enter for defaults
+python agent2.py
+python agent3.py
+python agent4.py
+```
+
+Results land in `results/`. Nothing else is required: the language model is
+optional, and every agent runs to completion without one.
 
 ---
 
 ## Contents
 
+- [How the agents chain together](#how-the-agents-chain-together)
+- [Scope: what is built and what is not](#scope-what-is-built-and-what-is-not)
 - [Design principles](#design-principles)
 - [Installation](#installation)
 - [Configuration](#configuration)
@@ -31,12 +50,82 @@ back to the source row it came from.
 - [Agent 2 — AI purchase group, Category L5](#agent-2--ai-purchase-group-category-l5)
 - [Agent 3 — Material and service standardisation](#agent-3--material-and-service-standardisation)
 - [Agent 4 — Supplier consolidation](#agent-4--supplier-consolidation)
+- [A worked example](#a-worked-example)
+- [Reviewing the output](#reviewing-the-output)
+- [What leaves your machine](#what-leaves-your-machine)
 - [Repeatability](#repeatability)
 - [Running at full volume](#running-at-full-volume)
 - [Cost](#cost)
 - [Extending the vocabulary](#extending-the-vocabulary)
 - [Troubleshooting](#troubleshooting)
 - [Repository layout](#repository-layout)
+- [Project status and authorship](#project-status-and-authorship)
+
+---
+
+## How the agents chain together
+
+```mermaid
+flowchart TD
+    S["sources/<br/>Sievo · Maximo · Basware · invoices · catalogues<br/>FI · SV · PL · EN"]
+
+    A1["<b>Agent 1</b><br/>Improved purchase description"]
+    A2["<b>Agent 2</b><br/>AI purchase group, Category L5"]
+    A3["<b>Agent 3</b><br/>Material / service standardisation"]
+    A4["<b>Agent 4</b><br/>Supplier consolidation"]
+
+    O1["agent1_unified_lines.csv<br/><i>Enriched_Purchase_Description</i>"]
+    O2["agent2_purchase_groups.csv<br/><i>AI_Purchase_Group_L5</i>"]
+    O3["agent3_standardisation.csv<br/>agent3_catalogue_candidates.csv"]
+    O4["agent4_supplier_consolidation.csv<br/>agent4_supplier_master.csv"]
+
+    S --> A1 --> O1 --> A2 --> O2
+    O2 --> A3 --> O3
+    O2 --> A4 --> O4
+    S -. "catalogues and price lists" .-> A3
+
+    L["lexicon/procurement_lexicon.json<br/>controlled vocabulary"]
+    L -.-> A1
+    L -.-> A2
+    L -.-> A3
+    L -.-> A4
+```
+
+Agents 3 and 4 both read Agent 2's output and are independent of each other, so
+they can be run in either order or in parallel. Agent 3 is the only one that
+needs reference data beyond the purchase lines.
+
+The column names are the interface between the agents.
+`Enriched_Purchase_Description` and `AI_Purchase_Group_L5` in particular are
+read by name downstream and should not be renamed without updating the readers.
+
+---
+
+## Scope: what is built and what is not
+
+The planning workbook lists ten items of core AI functionality. Five are
+delivered here; the rest were either de-scoped by the client or marked optional.
+Stating that plainly avoids the expectation that this repository covers them.
+
+| Workbook item | Priority | Status |
+| --- | --- | --- |
+| Language standardisation, cross-cutting | Must have 0 | **Delivered** — all four agents emit English and retain the source text |
+| Agent 1. Improved purchase description | Must have 1 | **Delivered** — `agent1.py` |
+| Agent 2. AI Purchase Group (Category L5) | Must have 2 | **Delivered** — `agent2.py` |
+| Agent 3. AI material/service standardisation | Must have 3 | **Delivered** — `agent3.py` |
+| Agent 4. AI Supplier Consolidation | Must have 4 | **Delivered** — `agent4.py` |
+| Sievo attribute selection | Marked "19.8. Not needed" | Not built; superseded by PO-line-level joins |
+| AI Sievo Category Selection | Marked "OLD: combined above" | Not a separate agent; folded into Agent 2's classification |
+| AI Business Area / Division Selection | Marked "OLD: combined above" | Not a separate agent; BA and Division are carried through and used as comparison scopes in Agent 4 |
+| Category enrichment, levels 1–4 | Optional 1 | Not built |
+| Additional purchase classification information | Optional 2 | Not built |
+| PO quality / other AI indicators | Optional 3 / TBD | Not built |
+
+Two open items from the workbook are answered in code rather than left hanging.
+The similarity threshold that Agent 3 was to have "defined and tested" is
+supplied as a documented default plus a calibration file to set it from. The
+supplier master that Agent 4 was asked whether the client possesses does not
+exist, so one is derived and written out for correction.
 
 ---
 
@@ -597,6 +686,130 @@ file opens on what should be read.
 
 ---
 
+## A worked example
+
+Illustrative rather than measured, but it is the shape every row takes. A single
+Finnish purchase line as it travels the chain:
+
+**In the source extract.** The description field is a code welded to an
+abbreviation, the supplier name is in one system and the price in another:
+
+```
+Material text : 157238asbestipurku
+Supplier      : Rakennus Palvelu Oy
+Category L2   : Maintenance services
+Spend         : 4 820,00
+```
+
+**After Agent 1.** The code is separated from the words, the Finnish resolves
+through the controlled vocabulary at no token cost, and the evidence is kept:
+
+```
+Enriched_Purchase_Description : Asbestos removal work
+Item_Or_Service               : Service
+Detected_Language             : fi
+Translation_Method            : vocabulary
+Translation_Coverage          : 1.00
+Original_Description          : 157238asbestipurku
+AI_Confidence                 : 86  (High)
+```
+
+**After Agent 2.** It joins the other wordings of the same purchase — *Asbestos
+demolition*, *Asbestin purkutyö*, *Rivning av asbest* — under one name derived
+from what the members actually wrote:
+
+```
+AI_Purchase_Group_L5 : Asbestos removal
+AI_Purchase_Group_Id : G-3F2A91C4
+```
+
+**After Agent 3.** No catalogue item covers it, but the purchase recurs and its
+unit price is stable, so it surfaces on the other list:
+
+```
+Catalogue_Candidate : Yes
+Occurrences         : 34      Distinct_Suppliers : 5
+Total_Spend_EUR     : 168,400 Price_Stability    : 0.91
+```
+
+**After Agent 4.** Five suppliers are selling the same service, and the
+directional measure says which way any consolidation should run:
+
+```
+Supplier             : Rakennus Palvelu Oy
+Most_Similar_Supplier: Nordic Sanering AB
+Similarity_Percent   : 78     Reverse_Similarity_Percent : 34
+Addressable_Spend_EUR: 131,300
+Consolidation_Potential : High   AI_Confidence : 81
+Reason: 78% of Rakennus Palvelu Oy spend in Maintenance services is on items
+        Nordic Sanering AB also supplies, chiefly Asbestos removal (1 purchase
+        group shared exactly). Nordic Sanering AB has the broader portfolio and
+        could absorb this volume.
+```
+
+The original Finnish text is still on the row at every step.
+
+---
+
+## Reviewing the output
+
+The workbook is explicit that a procurement expert confirms whether the
+purchases and suppliers a model flags are genuinely comparable. The output is
+built for that step rather than to replace it.
+
+**Start with the bands, not the scores.** Both Agent 3 and Agent 4 sort their
+headline file so that the rows worth reading are at the top — primary scope
+first, strongest opportunity first.
+
+**Read the reason column before the numbers.** Every finding carries a sentence
+naming the evidence behind it. If the sentence does not survive contact with
+what you know about the supplier, the number will not either.
+
+**Check confidence separately from similarity.** A 100% similarity at 40%
+confidence is a claim about a supplier with almost no history. The two columns
+exist so that this case looks different from a 70% similarity at 95% confidence,
+which is a far stronger finding.
+
+**Check `Possible_Duplicate_Vendor` first in Agent 4.** A "consolidation
+opportunity" between two records of the same company is a data-quality finding,
+not a sourcing one. `agent4_supplier_master.csv` lists these, and any merge you
+confirm belongs in the registry's `overrides` block so it holds on future runs.
+
+**Feed corrections back into the vocabulary.** Where a description was
+misunderstood, the fix is normally a phrase in
+`lexicon/procurement_lexicon.json`. That is deterministic, free, and improves
+every future run and every agent at once.
+
+---
+
+## What leaves your machine
+
+Procurement data is commercially sensitive, so it is worth being precise about
+this.
+
+**With the language-model tier off — the default — nothing leaves the machine.**
+Every component runs locally: the vocabulary, spaCy, NLTK, the Helsinki-NLP
+translation models and the sentence-embedding model all execute on the CPU
+against local files. The only network access is the one-off model download at
+installation, which can be done ahead of time and staged for an air-gapped
+machine.
+
+**With it on, only short text fragments are sent**, and only those the local
+layers could not resolve: an untranslatable phrase, a pair of item descriptions
+sitting on a match threshold, a list of purchase-group names. Whole rows,
+supplier identities, spend figures and source files are never transmitted.
+
+The destination is whichever backend `AZURE_ENABLE` selects. `OPENAI_BASE_URL`
+deliberately has no fallback to the shared-service URL, so a direct OpenAI key
+cannot be sent to the PwC endpoint by accident, and the reverse cannot happen
+either.
+
+Everything sent is cached locally under `cache/`, so a repeated run transmits
+nothing at all. That cache contains fragments of client data and, like
+`sources/` and `results/`, is excluded from version control.
+
+---
+
 ## Repeatability
 
 The plan requires that a future production run find the same items and the same
@@ -651,9 +864,22 @@ comparable supplier pair per scope, which can run to hundreds of thousands of
 rows. It is an analysis artefact; the headline file is the one to read. Restrict
 `--scopes` if it is not needed.
 
-As a reference point, 300,000 lines across 900 suppliers and 600 purchase groups
-completes Agent 4 in about 22 seconds on a laptop with none of the optional
-packages installed.
+### Measured reference point
+
+Agent 4 over synthetic data on a laptop, with **none** of the optional packages
+installed, so the pure-Python fallbacks were in use throughout:
+
+| Lines | Suppliers | Purchase groups | Scopes | Wall clock |
+| --- | --- | --- | --- | --- |
+| 300,000 | 900 | 600 | 14 | 22 s |
+
+The cost of Agents 1 and 3 is set by the number of *distinct descriptions*
+rather than the number of lines, so it depends far more on how repetitive the
+data is than on how large it is. Agent 2's clustering is the most expensive step
+in the chain and is the one to time first on real data.
+
+Installing `rapidfuzz`, `scikit-learn` and `numpy` improves all of these
+substantially and costs nothing at run time.
 
 ---
 
@@ -770,3 +996,18 @@ lexicon/agent4_supplier_registry.json  stable supplier keys and merge overrides
 ```
 
 Client data and generated output are never committed.
+
+---
+
+## Project status and authorship
+
+Proof of concept. The four "must have" agents from the technical planning
+workbook are complete, run end to end, and have been exercised against the
+sample extracts and against synthetic data at volume. The thresholds and bands
+are documented defaults intended to be revised once they have been read against
+real output, and the vocabulary is expected to grow as the data is worked.
+
+All four agents were designed, written and tested by
+**Prof. Shahab Anbarjafari**, who is the sole author and contributor to this
+repository.
+
