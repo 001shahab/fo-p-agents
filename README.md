@@ -249,7 +249,11 @@ AZURE_OPENAI_MODEL="azure.gpt-5.1"
 
 LLM_BATCH_SIZE=25
 LLM_TIMEOUT=90
-LLM_MAX_REQUESTS=0        # 0 = no cap
+LLM_MAX_REQUESTS=0            # 0 = no cap
+
+LLM_SPEND_LIMIT=25.00         # ask before spending past this; 0 = no alert
+LLM_INPUT_COST_PER_MTOK=1.25  # dollars per million input tokens
+LLM_OUTPUT_COST_PER_MTOK=10.00
 ```
 
 Both blocks are read independently, so both can be populated at once and
@@ -297,11 +301,12 @@ Common options, available on all four:
 | `--lexicon FILE` | the controlled vocabulary |
 | `--cache DIR` | model response cache (default `./cache`) |
 | `--use-llm` | enable the language-model tier |
+| `--llm-spend-limit USD` | ask before spending past this figure (default 25) |
 | `--no-jsonl` | skip the JSONL export |
 | `--verbose` | debug-level logging |
 | `--version` | agent name and version |
 
-When the language-model tier is used, the run ends with a token report:
+When the language-model tier is used, the run ends with a token and cost report:
 
 ```
 -------------------------------------------------------------------------------
@@ -315,6 +320,10 @@ Language model usage
   Output tokens        : 3,902
     of which reasoning : 1,344
   Total tokens         : 28,419
+  Input cost           : $0.03 at $1.25/M
+  Output cost          : $0.04 at $10.00/M
+  Estimated cost       : $0.07
+  Spend alert          : $25.00
 ```
 
 ---
@@ -826,6 +835,12 @@ suppliers again. This is a design constraint rather than a side effect:
 - Registries persist group labels and supplier keys, and carry an `overrides`
   block for corrections that must survive future runs.
 
+The one operator decision that can break this is the spend alert: a run that
+switched the model off half way through will not match a run that kept it on,
+because part of the work took the deterministic path instead. The manifest flags
+this with `spend_limit_stopped`, and the cache means the answers already paid for
+are reused rather than re-purchased on the next attempt.
+
 Verifying it takes one command:
 
 ```bash
@@ -904,6 +919,62 @@ tokens.
 The cheapest way to improve quality is to extend the vocabulary, not to enable
 the model.
 
+### The spend alert
+
+Answering yes to the language-model question brings up a second question:
+
+```
+  Charged at $1.25 per million input tokens and $10.00 per million output tokens.
+  The run pauses at the figure below and asks before spending more.
+Alert when estimated language-model spend reaches (USD)
+  [25.00]:
+```
+
+From then on the agent values every response as it arrives, at $1.25 per million
+input tokens and $10.00 per million output tokens by default. When the running
+estimate reaches the figure given, the run stops and asks:
+
+```
+===============================================================================
+  Language-model spend alert
+===============================================================================
+  Estimated spend      : $25.43
+  Authorised so far    : $25.00
+  Input tokens         : 1,240,512 at $1.25/M = $1.55
+  Output tokens        : 2,388,401 at $10.00/M = $23.88
+  Requests sent        : 412
+
+  Answering yes raises the limit to $50.00.
+  Answering no finishes the run on the local stack alone.
+  Continue using the language model? [y/N]:
+```
+
+Answering `y` authorises one more increment of the same size, so $25 becomes
+$50, then $75, and so on; each step asks again. Answering `n` switches the model
+off and the run **continues to completion** on the local NLP stack, keeping
+everything the model had already produced. Nothing is lost and no output file is
+left half-written — the model tier was always optional.
+
+Three details worth knowing:
+
+- The estimate is built from the token counts the API reports, so it lags the
+  true figure by at most one response. Cached input is valued at the full input
+  rate even though the provider discounts it, which makes the estimate an upper
+  bound. It is a guard rail, not an accounting record; the invoice is the
+  authority.
+- Under `--non-interactive` there is nobody to ask, so reaching the limit
+  switches the model off and logs a warning. A scheduled job therefore has a
+  hard ceiling rather than an open-ended bill. Set `--llm-spend-limit` to the
+  most that run may spend, or to `0` to remove the ceiling.
+- The manifest records `spend_limit_usd`, `spend_limit_extensions` and
+  `spend_limit_stopped`, so a run that lost the model part way through is
+  distinguishable afterwards from one that had it throughout. That distinction
+  matters when comparing two runs' output.
+
+Rates are configurable through `LLM_INPUT_COST_PER_MTOK` and
+`LLM_OUTPUT_COST_PER_MTOK` for when published prices change or the shared
+service quotes its own.
+
 ---
 
 ## Extending the vocabulary
@@ -946,6 +1017,12 @@ empty. Check that `Supplier_Name` or `Supplier_Id` survived Agent 1.
 **`Language-model tier requested but no API key was found`** — `--use-llm` was
 passed but `.env` has no key for the selected backend. Note that
 `AZURE_ENABLE=true` reads `AZURE_OPENAI_API_KEY`, not `OPENAI_API_KEY`.
+
+**`Estimated language-model spend is $... at or above the ... limit`** — the
+spend alert fired during an unattended run and the model was switched off for
+the remainder. The run still completed on the local stack. Raise
+`--llm-spend-limit`, or accept the result: the affected work simply used the
+deterministic path.
 
 **`Reading ... needs openpyxl`** — `pip install openpyxl`, or convert the
 workbook to CSV.

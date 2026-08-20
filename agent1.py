@@ -239,6 +239,18 @@ CONFIDENCE_MEDIUM = 50
 # Configuration
 # ===========================================================================
 
+# List price for the default model, in dollars per million tokens. Both figures
+# are overridable from the environment because prices are revised from time to
+# time and the shared service does not have to quote the same rate as the public
+# API. They are used only to estimate spend during a run; the invoice is the
+# authority.
+INPUT_COST_PER_MTOK = 1.25
+OUTPUT_COST_PER_MTOK = 10.00
+
+# Default alert threshold offered at the prompt, in dollars.
+DEFAULT_SPEND_LIMIT = 25.00
+
+
 @dataclass
 class ModelConfig:
     """Resolved language-model connection details.
@@ -256,6 +268,9 @@ class ModelConfig:
     batch_size: int = 25
     timeout: int = 90
     max_requests: int = 0            # 0 means no cap
+    spend_limit: float = 0.0         # dollars; 0 means no alert
+    input_cost_per_mtok: float = INPUT_COST_PER_MTOK
+    output_cost_per_mtok: float = OUTPUT_COST_PER_MTOK
 
     @property
     def endpoint(self) -> str:
@@ -294,6 +309,9 @@ class Settings:
     full_columns: bool = False
     write_jsonl: bool = True
     verbose: bool = False
+
+    # False under --non-interactive, where nothing may block waiting for input.
+    interactive: bool = True
 
     model: ModelConfig = field(default_factory=ModelConfig)
 
@@ -348,7 +366,16 @@ def _env_int(value: Optional[str], default: int) -> int:
         return default
 
 
-def resolve_model_config(env: Dict[str, str], use_llm: bool) -> ModelConfig:
+def _env_float(value: Optional[str], default: float) -> float:
+    """Read a decimal environment variable, tolerating a currency symbol."""
+    try:
+        return float(str(value).strip().lstrip("$").replace(",", ""))
+    except (TypeError, ValueError):
+        return default
+
+
+def resolve_model_config(env: Dict[str, str], use_llm: bool,
+                         spend_limit: Optional[float] = None) -> ModelConfig:
     """Select and validate the language-model backend.
 
     ``AZURE_ENABLE`` chooses between the PwC GenAI shared service and the public
@@ -362,6 +389,14 @@ def resolve_model_config(env: Dict[str, str], use_llm: bool) -> ModelConfig:
     config.batch_size = max(1, _env_int(env.get("LLM_BATCH_SIZE"), 25))
     config.timeout = max(5, _env_int(env.get("LLM_TIMEOUT"), 90))
     config.max_requests = max(0, _env_int(env.get("LLM_MAX_REQUESTS"), 0))
+
+    if spend_limit is None:
+        spend_limit = _env_float(env.get("LLM_SPEND_LIMIT"), DEFAULT_SPEND_LIMIT)
+    config.spend_limit = max(0.0, spend_limit)
+    config.input_cost_per_mtok = max(
+        0.0, _env_float(env.get("LLM_INPUT_COST_PER_MTOK"), INPUT_COST_PER_MTOK))
+    config.output_cost_per_mtok = max(
+        0.0, _env_float(env.get("LLM_OUTPUT_COST_PER_MTOK"), OUTPUT_COST_PER_MTOK))
 
     if _env_flag(env.get("AZURE_ENABLE"), False):
         config.backend = "azure"
@@ -1756,9 +1791,34 @@ class TokenUsage:
     output_tokens: int = 0
     reasoning_tokens: int = 0
 
+    # Per-million-token prices, copied from the resolved model configuration so
+    # that the running total can be valued without reaching back into it.
+    input_cost_per_mtok: float = INPUT_COST_PER_MTOK
+    output_cost_per_mtok: float = OUTPUT_COST_PER_MTOK
+
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    @property
+    def input_cost(self) -> float:
+        """Dollar value of the input tokens consumed so far.
+
+        Cached input is charged here at the full rate even though the provider
+        discounts it heavily. The figure therefore leans high, which is the
+        right direction for a number that exists to stop a run before it
+        becomes expensive.
+        """
+        return self.input_tokens / 1_000_000.0 * self.input_cost_per_mtok
+
+    @property
+    def output_cost(self) -> float:
+        """Dollar value of the output tokens, reasoning tokens included."""
+        return self.output_tokens / 1_000_000.0 * self.output_cost_per_mtok
+
+    @property
+    def estimated_cost(self) -> float:
+        return self.input_cost + self.output_cost
 
     def record(self, usage: Dict[str, Any]) -> None:
         """Accumulate one API response's usage block, however it is spelled."""
@@ -1775,7 +1835,7 @@ class TokenUsage:
                               or usage.get("output_tokens_details") or {})
         self.reasoning_tokens += int(completion_details.get("reasoning_tokens") or 0)
 
-    def as_dict(self) -> Dict[str, int]:
+    def as_dict(self) -> Dict[str, Any]:
         return {
             "requests": self.requests,
             "failed_requests": self.failed_requests,
@@ -1785,7 +1845,119 @@ class TokenUsage:
             "output_tokens": self.output_tokens,
             "reasoning_tokens": self.reasoning_tokens,
             "total_tokens": self.total_tokens,
+            "input_cost_per_mtok": self.input_cost_per_mtok,
+            "output_cost_per_mtok": self.output_cost_per_mtok,
+            "input_cost_usd": round(self.input_cost, 4),
+            "output_cost_usd": round(self.output_cost, 4),
+            "estimated_cost_usd": round(self.estimated_cost, 4),
         }
+
+
+class SpendGuard:
+    """Holds language-model spend to what the operator authorised.
+
+    The operator names a figure when the model tier is switched on. After every
+    billed response the running estimate is compared against it, and once the
+    figure is reached the run pauses and asks whether to carry on. Agreeing
+    raises the ceiling by the same amount again, so a limit of $25 becomes $50,
+    then $75, and each further step needs its own answer. Declining switches the
+    model off for the rest of the run: nothing is lost, because every call site
+    already has a deterministic path to fall back on, and the work completed so
+    far is kept.
+
+    The estimate is derived from the token counts the API reports, so it lags
+    the true figure by at most one request and cannot account for discounts
+    applied at invoicing. It is a guard rail, not an accounting record.
+    """
+
+    def __init__(self, usage: TokenUsage, config: ModelConfig, interactive: bool) -> None:
+        self.usage = usage
+        self.config = config
+        self.interactive = interactive
+        self.step = max(0.0, config.spend_limit)
+        self.limit = self.step
+        self.extensions = 0
+        self.declined = False
+
+    @property
+    def active(self) -> bool:
+        """True when a limit is in force and has not been waived."""
+        return bool(self.step) and not self.declined
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Guard state for the run manifest.
+
+        Worth recording: a run whose model was switched off part way through is
+        not comparable with one that had it throughout, and the manifest is
+        where that difference has to be visible.
+        """
+        return {
+            "spend_limit_usd": round(self.step, 4),
+            "spend_limit_final_usd": round(self.limit, 4),
+            "spend_limit_extensions": self.extensions,
+            "spend_limit_stopped": self.declined,
+        }
+
+    def review(self) -> None:
+        """Check the running total after a billed response and act on it.
+
+        Called once per response rather than per batch so that a single
+        expensive reply cannot carry the run far past the figure that was
+        authorised.
+        """
+        if not self.active or not self.config.enabled:
+            return
+
+        # A loop rather than a single test: one costly response can overshoot
+        # by more than a whole step, and each step still needs its own answer.
+        while self.usage.estimated_cost >= self.limit:
+            if not self.interactive:
+                LOGGER.warning(
+                    "Estimated language-model spend is $%.2f, at or above the $%.2f limit. "
+                    "Continuing without the model; raise --llm-spend-limit to allow more.",
+                    self.usage.estimated_cost, self.limit)
+                self._stop()
+                return
+            if not self._ask():
+                self._stop()
+                return
+            self.limit += self.step
+            self.extensions += 1
+            print(f"  Continuing. The limit is now ${self.limit:,.2f}.\n", flush=True)
+
+    def _ask(self) -> bool:
+        """Report the position and ask whether to keep using the model."""
+        print(flush=True)
+        print("=" * 79)
+        print("  Language-model spend alert")
+        print("=" * 79)
+        print(f"  Estimated spend      : ${self.usage.estimated_cost:,.2f}")
+        print(f"  Authorised so far    : ${self.limit:,.2f}")
+        print(f"  Input tokens         : {self.usage.input_tokens:,} "
+              f"at ${self.usage.input_cost_per_mtok:,.2f}/M = ${self.usage.input_cost:,.2f}")
+        print(f"  Output tokens        : {self.usage.output_tokens:,} "
+              f"at ${self.usage.output_cost_per_mtok:,.2f}/M = ${self.usage.output_cost:,.2f}")
+        print(f"  Requests sent        : {self.usage.requests:,}")
+        print()
+        print(f"  Answering yes raises the limit to ${self.limit + self.step:,.2f}.")
+        print("  Answering no finishes the run on the local stack alone.")
+        try:
+            answer = input("  Continue using the language model? [y/N]: ").strip().lower()
+        except EOFError:
+            # Input is piped and nobody is watching; the cautious reading of
+            # silence is that no further spend was authorised.
+            print()
+            return False
+        return answer[:1] == "y"
+
+    def _stop(self) -> None:
+        """Switch the model off for the remainder of the run."""
+        self.declined = True
+        self.config.enabled = False
+        LOGGER.info(
+            "Language model disabled after an estimated $%.2f of spend. "
+            "The run continues on the local stack; cached answers are still used.",
+            self.usage.estimated_cost)
 
 
 class LanguageModelClient:
@@ -1798,9 +1970,14 @@ class LanguageModelClient:
     difference between them is the URL and the deployment name.
     """
 
-    def __init__(self, config: ModelConfig, cache_path: Path) -> None:
+    def __init__(self, config: ModelConfig, cache_path: Path,
+                 interactive: bool = False) -> None:
         self.config = config
-        self.usage = TokenUsage()
+        self.usage = TokenUsage(
+            input_cost_per_mtok=config.input_cost_per_mtok,
+            output_cost_per_mtok=config.output_cost_per_mtok,
+        )
+        self.guard = SpendGuard(self.usage, config, interactive)
         self.cache_path = cache_path
         self._cache: Dict[str, str] = self._load_cache()
         self._cache_dirty = False
@@ -1942,6 +2119,9 @@ class LanguageModelClient:
             return None
 
         self.usage.record(response.get("usage") or {})
+        # Checked after every response, so a limit reached mid-batch takes
+        # effect on the next call rather than at the end of the phase.
+        self.guard.review()
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
@@ -2907,7 +3087,8 @@ class Agent1:
         self.model: Optional[LanguageModelClient] = None
         if settings.model.enabled:
             self.model = LanguageModelClient(
-                settings.model, settings.cache_dir / "agent1_model_cache.json")
+                settings.model, settings.cache_dir / "agent1_model_cache.json",
+                interactive=settings.interactive)
 
         self.translator = TranslationEngine(self.lexicon, settings, self.neural, self.model)
         self.synthesiser = DescriptionSynthesiser(self.lexicon, self.analyser, settings)
@@ -3487,7 +3668,10 @@ class Agent1:
             "confidence_bands": dict(band_counts),
         })
         if self.model is not None:
-            statistics["token_usage"] = self.model.usage.as_dict()
+            statistics["token_usage"] = {
+                **self.model.usage.as_dict(),
+                **self.model.guard.as_dict(),
+            }
 
         manifest = {
             "agent": AGENT_NAME,
@@ -3580,6 +3764,9 @@ def build_parser() -> argparse.ArgumentParser:
     tiers = parser.add_argument_group("processing tiers")
     tiers.add_argument("--use-llm", action="store_true",
                        help="enable the language-model tier for unresolved phrases")
+    tiers.add_argument("--llm-spend-limit", metavar="USD", type=float, default=None,
+                       help="pause and ask once estimated model spend reaches this "
+                            f"figure (default {DEFAULT_SPEND_LIMIT:.2f}; 0 disables the alert)")
     tiers.add_argument("--no-neural", action="store_true",
                        help="disable the offline neural translation models")
     tiers.add_argument("--no-semantic", action="store_true",
@@ -3642,6 +3829,26 @@ def ask_yes_no(question: str, default: bool) -> bool:
     return answer[0] == "y"
 
 
+def ask_amount(question: str, default: float) -> float:
+    """Prompt for a sum of money, re-asking until the answer is usable."""
+    while True:
+        try:
+            answer = input(f"{question}\n  [{default:.2f}]: ").strip()
+        except EOFError:
+            return default
+        if not answer:
+            return default
+        try:
+            value = float(answer.lstrip("$").replace(",", "").strip())
+        except ValueError:
+            print("  Enter an amount in dollars, for example 25 or 25.00.")
+            continue
+        if value < 0:
+            print("  Enter zero or more; zero runs without a spend alert.")
+            continue
+        return value
+
+
 def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     """Combine defaults, command-line arguments and prompts into a settings object."""
     here = Path(__file__).resolve().parent
@@ -3653,6 +3860,8 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     use_neural = not args.no_neural
     use_semantic = not args.no_semantic
     use_llm = args.use_llm
+    spend_limit = (args.llm_spend_limit if args.llm_spend_limit is not None
+                   else _env_float(env.get("LLM_SPEND_LIMIT"), DEFAULT_SPEND_LIMIT))
 
     if not args.non_interactive:
         print(BANNER)
@@ -3678,6 +3887,13 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
 
         use_llm = ask_yes_no(
             "Use the language model for phrases the local stack cannot resolve?", use_llm)
+        if use_llm:
+            print()
+            print(f"  Charged at ${INPUT_COST_PER_MTOK:,.2f} per million input tokens and "
+                  f"${OUTPUT_COST_PER_MTOK:,.2f} per million output tokens.")
+            print("  The run pauses at the figure below and asks before spending more.")
+            spend_limit = ask_amount(
+                "Alert when estimated language-model spend reaches (USD)", spend_limit)
         print()
 
     settings = Settings(
@@ -3695,8 +3911,9 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         full_columns=args.full_columns,
         write_jsonl=not args.no_jsonl,
         verbose=args.verbose,
+        interactive=not args.non_interactive,
     )
-    settings.model = resolve_model_config(env, use_llm)
+    settings.model = resolve_model_config(env, use_llm, spend_limit)
 
     if not settings.source_dir.exists():
         raise SystemExit(f"Source folder does not exist: {settings.source_dir}")
@@ -3742,6 +3959,23 @@ def print_token_usage(statistics: Dict[str, Any], settings: Settings) -> None:
         # omitted them would understate the cost of the run.
         print(f"    of which reasoning : {usage['reasoning_tokens']:,}")
     print(f"  Total tokens         : {usage['total_tokens']:,}")
+
+    # Priced from the rates in force at configuration time. Cached input is
+    # counted at the full rate, so the figure is an upper bound.
+    print(f"  Input cost           : ${usage['input_cost_usd']:,.2f} "
+          f"at ${usage['input_cost_per_mtok']:,.2f}/M")
+    print(f"  Output cost          : ${usage['output_cost_usd']:,.2f} "
+          f"at ${usage['output_cost_per_mtok']:,.2f}/M")
+    print(f"  Estimated cost       : ${usage['estimated_cost_usd']:,.2f}")
+
+    if usage.get("spend_limit_usd"):
+        print(f"  Spend alert          : ${usage['spend_limit_usd']:,.2f}"
+              + (f", raised {usage['spend_limit_extensions']} time(s) "
+                 f"to ${usage['spend_limit_final_usd']:,.2f}"
+                 if usage["spend_limit_extensions"] else ""))
+    if usage.get("spend_limit_stopped"):
+        print("  Model switched off part way through the run at the spend limit;")
+        print("  the remaining lines were processed on the local stack alone.")
 
 
 def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
@@ -3813,6 +4047,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if settings.model.enabled:
         LOGGER.info("Language-model tier enabled: %s via %s",
                     settings.model.model, settings.model.backend)
+        if settings.model.spend_limit:
+            LOGGER.info("Spend alert set at $%.2f; the run will ask before going past it.",
+                        settings.model.spend_limit)
+        else:
+            LOGGER.info("No spend alert set; the model tier will run unmetered.")
 
     try:
         manifest = Agent1(settings).run()
