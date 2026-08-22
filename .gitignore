@@ -21,3 +21,5 @@ lexicon/*_registry.json
 # Operating system noise
 .DS_Store
 Thumbs.db
+lexicon/
+po_join_data/
