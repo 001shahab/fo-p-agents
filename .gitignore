@@ -18,6 +18,9 @@ results/
 cache/
 lexicon/*_registry.json
 
+# Synthetic test data and the results of testing against it, rebuilt on demand
+.testruns/
+
 # Operating system noise
 .DS_Store
 Thumbs.db

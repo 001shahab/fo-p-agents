@@ -36,6 +36,10 @@ python agent4.py
 Results land in `results/`. Nothing else is required: the language model is
 optional, and every agent runs to completion without one.
 
+To see an agent work before pointing it at anything real, `python app.py` opens
+a harness that builds synthetic data for the agent of your choice and tests it
+against it. See [Testing the agents](#testing-the-agents).
+
 ---
 
 ## Contents
@@ -51,6 +55,7 @@ optional, and every agent runs to completion without one.
 - [Agent 3 — Material and service standardisation](#agent-3--material-and-service-standardisation)
 - [Agent 4 — Supplier consolidation](#agent-4--supplier-consolidation)
 - [A worked example](#a-worked-example)
+- [Testing the agents](#testing-the-agents)
 - [Reviewing the output](#reviewing-the-output)
 - [What leaves your machine](#what-leaves-your-machine)
 - [Repeatability](#repeatability)
@@ -760,6 +765,78 @@ The original Finnish text is still on the row at every step.
 
 ---
 
+## Testing the agents
+
+The agents are tested against data invented for the purpose rather than against
+a sample of the real thing. A slice of real data can only tell you that an agent
+produced output, because nobody knows what the right answer was. Here the answer
+is decided first and the data is written backwards from it, so a miss is
+visible: the harness plants a supplier whose portfolio is entirely covered by
+another and then checks that Agent 4 names it, plants nine wordings of one
+purchase and checks that Agent 2 puts them in one group, plants a purchase order
+a transaction can be joined to and checks that Max joins it.
+
+Everything generated is fictitious — the sites, the suppliers, the purchase
+lines in Finnish, Swedish, Polish and English. It is written to look like the
+procurement estate of a Nordic energy utility because the agents are tuned to
+that vocabulary, but no client data is involved at any point.
+
+```bash
+python app.py
+```
+
+That is the whole of the set-up. The server is the standard library's own, so
+nothing has to be installed and nothing has to be built; a browser opens on
+`http://127.0.0.1:8420` and asks three things in turn — which agent to test,
+whether the data it built looks right, and then it runs the agent while you
+watch. The log is streamed line by line as the agent prints it, with a running
+commentary beside it in plain English, and the run ends with a verdict, the list
+of what was checked and every file the agent wrote, previewable and
+downloadable.
+
+The same harness runs from the terminal when a browser is not wanted:
+
+```bash
+python TestAgent.py --list                # what can be tested
+python TestAgent.py --agent agent4        # test one
+python TestAgent.py --all                 # test every one
+python TestAgent.py --agent agent2 --seed 7   # repeat an exact dataset
+```
+
+The exit code is non-zero if anything failed, so this drops into a build without
+further work.
+
+**Checks are graded rather than binary.** A `FAIL` means a contract was broken —
+a missing output file, a lost row, an empty deliverable column, a planted
+finding that was not found. A `WARN` means the agent missed something the data
+was built to offer, which is worth knowing but may be a matter of threshold
+rather than a defect. Each check reports what it measured, so the figure can be
+argued with:
+
+```
+  [PASS]  Different wordings of one purchase landed together
+           98% of lines in the dominant group, averaged over 20 purchases
+  [PASS]  Spellings of one company resolved to one supplier
+           12 suppliers in the master, 15 spellings in the input
+  [PASS]  Purchases with no catalogue entry were left alone
+           40 of 96 lines correctly matched nothing
+```
+
+**The language model is optional here too.** Left off, the harness writes the
+data from its own vocabulary and narrates the run from the agent's log, which is
+what runs when no key is configured. Switched on, it widens the phrasing of the
+test data beyond the examples written into the harness and reads the log back a
+sentence at a time. What the test proves does not change either way, because the
+structure the checks depend on is built deterministically. Its own token use and
+cost are reported at the end of every run, and a request that fails is reported
+rather than passed over in silence.
+
+Generated data and results are written under `.testruns/`, which is ignored by
+Git and rebuilt on demand. `--seed` fixes the dataset so a run can be repeated
+exactly.
+
+---
+
 ## Reviewing the output
 
 The workbook is explicit that a procurement expert confirms whether the
@@ -1053,6 +1130,14 @@ catalogues covering the categories actually being purchased, and read
 ├── agent2.py                          AI purchase group (Category L5)
 ├── agent3.py                          Material and service standardisation
 ├── agent4.py                          Supplier consolidation
+├── TestAgent.py                       synthetic-data test harness
+├── app.py                             the interface to the harness
+├── static/                            the harness interface, no build step
+│   ├── index.html
+│   ├── css/app.css
+│   ├── js/app.js
+│   ├── js/vendor/                     React, vendored
+│   └── img/logo.png
 ├── lexicon/
 │   └── procurement_lexicon.json       controlled procurement vocabulary
 ├── requirements.txt                   Python dependencies
@@ -1067,6 +1152,7 @@ Created at run time and excluded from version control:
 sources/                               client data
 results/                               generated output
 cache/                                 language-model response cache
+.testruns/                             synthetic test data and test results
 lexicon/agent2_group_registry.json     stable group labels
 lexicon/agent4_supplier_registry.json  stable supplier keys and merge overrides
 .env                                   credentials

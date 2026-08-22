@@ -66,6 +66,17 @@ langdetect>=1.0.9
 tqdm>=4.66
 
 # ---------------------------------------------------------------------------
+# The test harness - nothing to install
+# ---------------------------------------------------------------------------
+#
+#   python app.py
+#
+# TestAgent.py and app.py deliberately depend on nothing beyond the standard
+# library, and React is vendored under static/js/vendor rather than fetched or
+# built. A harness that needs its own set-up is a harness people stop running,
+# so it works on a machine where none of the above has been installed yet.
+#
+# ---------------------------------------------------------------------------
 # Language resources - install after the packages above
 # ---------------------------------------------------------------------------
 #
