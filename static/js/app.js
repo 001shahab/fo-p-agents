@@ -2,9 +2,9 @@
    Agent test harness - interface
    Author: Prof. Shahab Anbarjafari
 
-   Three screens: choose an agent, build data for it, watch it run. There is
-   one thing to do on each of them, and the thing to do is always the only
-   orange button on screen.
+   A way in, a welcome, and then three screens: choose an agent, build data for
+   it, watch it run. There is one thing to do on each of them, and the thing to
+   do is always the only orange button on screen.
 
    React is here as two vendored files rather than a build step, so that
    `python app.py` is the whole of the set-up. Views are written with
@@ -19,6 +19,7 @@
     var e = React.createElement;
     var useState = React.useState;
     var useEffect = React.useEffect;
+    var useRef = React.useRef;
     var useCallback = React.useCallback;
 
     /* ui.div(props, ...children) reads closely enough to markup to be
@@ -36,8 +37,16 @@
     // Talking to the server
     // ----------------------------------------------------------------------
 
+    /* Handed out by /api/unlock and required by everything after it. Held here
+       and nowhere else: not in storage, not in a cookie, so closing the tab
+       ends the session and opening the page again asks for the phrase. */
+    var session = "";
+
     function api(path, options) {
-        return fetch(path, options).then(function (response) {
+        var settings = options || {};
+        settings.headers = Object.assign({}, settings.headers,
+            session ? { "X-Session": session } : {});
+        return fetch(path, settings).then(function (response) {
             return response.json().catch(function () {
                 return { error: "The server sent something that was not JSON." };
             }).then(function (payload) {
@@ -55,6 +64,13 @@
         });
     }
 
+    /* An EventSource cannot send a header and neither can a download link, so
+       for those two the token travels in the query string instead. */
+    function withToken(path) {
+        return path + (path.indexOf("?") >= 0 ? "&" : "?") +
+               "token=" + encodeURIComponent(session);
+    }
+
     // ----------------------------------------------------------------------
     // Small shared pieces
     // ----------------------------------------------------------------------
@@ -67,6 +83,13 @@
         if (value < 1024) { return value + " B"; }
         if (value < 1024 * 1024) { return (value / 1024).toFixed(0) + " KB"; }
         return (value / 1024 / 1024).toFixed(1) + " MB";
+    }
+
+    function elapsedWords(seconds) {
+        if (seconds < 60) { return seconds + (seconds === 1 ? " second" : " seconds"); }
+        var minutes = Math.floor(seconds / 60);
+        var rest = seconds % 60;
+        return minutes + "m " + (rest < 10 ? "0" : "") + rest + "s";
     }
 
     function Masthead(props) {
@@ -118,58 +141,100 @@
     }
 
     // ----------------------------------------------------------------------
-    // Gate and welcome
+    // The way in
     // ----------------------------------------------------------------------
 
     function GateScreen(props) {
-        var field = useState("");
-        var value = field[0];
-        var setValue = field[1];
-        var busy = useState(false);
-        var waiting = busy[0];
-        var setWaiting = busy[1];
-        var fault = useState("");
-        var error = fault[0];
-        var setError = fault[1];
+        var entered = useState("");
+        var phrase = entered[0];
+        var setPhrase = entered[1];
+        var refusedState = useState("");
+        var refused = refusedState[0];
+        var setRefused = refusedState[1];
+        var checkingState = useState(false);
+        var checking = checkingState[0];
+        var setChecking = checkingState[1];
+        /* Counts refusals. Used as the form's key so that the shake replays on
+           every wrong answer rather than only the first. */
+        var refusalState = useState(0);
+        var refusals = refusalState[0];
+        var setRefusals = refusalState[1];
+        var field = useRef(null);
+
+        useEffect(function () { if (field.current) { field.current.focus(); } }, [refusals]);
 
         function submit(event) {
-            if (event) { event.preventDefault(); }
-            if (!value || waiting) { return; }
-            setWaiting(true);
-            setError("");
-            postJSON("/api/unlock", { password: value })
-                .then(function () { props.onUnlock(); })
-                .catch(function () { setError("That password is not recognised."); })
-                .then(function () { setWaiting(false); });
+            event.preventDefault();
+            if (!phrase || checking) { return; }
+            setChecking(true);
+            setRefused("");
+            postJSON("/api/unlock", { password: phrase })
+                .then(function (payload) { props.onOpen(payload.token); })
+                .catch(function (problem) {
+                    setChecking(false);
+                    setPhrase("");
+                    setRefused(problem.message);
+                    setRefusals(function (value) { return value + 1; });
+                });
         }
 
         return ui.section({ className: "gate" },
             ui.img({ className: "gate__logo", src: "img/logo.png", alt: "PwC" }),
-            ui.h1({ className: "gate__title" }, "Agents Test AI Platform"),
+            ui.h1({ className: "gate__title" }, "Agents Test AI platform"),
             ui.p({ className: "gate__note" },
-                "Enter to continue. The four agents are waiting on the other side."),
-            ui.form({ className: "gate__form", onSubmit: submit },
+                "This machine runs the procurement agents against invented data. " +
+                "Enter the passphrase to continue."),
+            ui.form({
+                className: "gate__form" + (refused ? " gate__form--wrong" : ""),
+                onSubmit: submit,
+                key: refusals
+            },
                 ui.input({
-                    className: "gate__field",
+                    ref: field,
+                    className: "gate__input",
                     type: "password",
-                    autoFocus: true,
+                    value: phrase,
+                    placeholder: "Passphrase",
                     autoComplete: "off",
-                    placeholder: "Password",
-                    value: value,
-                    onChange: function (event) { setValue(event.target.value); }
+                    spellCheck: false,
+                    "aria-label": "Passphrase",
+                    onChange: function (event) { setPhrase(event.target.value); }
                 }),
                 ui.button({
                     className: "btn btn--primary",
                     type: "submit",
-                    disabled: !value || waiting
-                }, waiting ? "Checking" : "Enter"),
-                ui.p({ className: "gate__error" }, error)));
+                    disabled: !phrase || checking
+                }, checking ? "Checking" : "Enter")),
+            ui.p({ className: "gate__refusal" }, refused));
     }
 
-    function WelcomeScreen() {
-        return ui.section({ className: "welcome" },
-            ui.img({ className: "welcome__logo", src: "img/logo.png", alt: "PwC" }),
-            ui.p({ className: "welcome__line" }, "Welcome to Agents Test AI platform"));
+    /* Three and a half seconds, and it can be cut short by touching anything.
+       Long enough to feel like an arrival, short enough that nobody who runs
+       this twice a day comes to resent it. */
+    function WelcomeScreen(props) {
+        var hintState = useState(false);
+        var hint = hintState[0];
+        var setHint = hintState[1];
+
+        useEffect(function () {
+            var show = window.setTimeout(function () { setHint(true); }, 2100);
+            var leave = window.setTimeout(props.onDone, 3600);
+            function skip() { props.onDone(); }
+            window.addEventListener("keydown", skip);
+            return function () {
+                window.clearTimeout(show);
+                window.clearTimeout(leave);
+                window.removeEventListener("keydown", skip);
+            };
+        }, [props.onDone]);
+
+        return ui.section({ className: "welcome", onClick: props.onDone },
+            ui.div({ className: "welcome__stage" },
+                ui.span({ className: "welcome__glow" }),
+                ui.img({ className: "welcome__logo", src: "img/logo.png", alt: "PwC" })),
+            ui.div({ className: "welcome__rule" }),
+            ui.h1({ className: "welcome__line" }, "Welcome to Agents Test AI platform"),
+            hint ? ui.p({ className: "welcome__hint" }, "Click to continue") : null);
     }
 
     // ----------------------------------------------------------------------
@@ -221,6 +286,29 @@
     // Screen two: the data
     // ----------------------------------------------------------------------
 
+    /* What the agent is for, said once, for a reader who will never run it. */
+    function Brief(props) {
+        var brief = props.brief;
+        if (!brief) { return null; }
+
+        function fact(label, value) {
+            return [
+                ui.span({ key: label + "-k", className: "brief__label" }, label),
+                ui.p({ key: label + "-v", className: "brief__value" }, value)
+            ];
+        }
+
+        return ui.div({ className: "brief" },
+            ui.span({ className: "brief__mark", "aria-hidden": "true" },
+                ui.i({ className: "brief__lozenge" })),
+            ui.p({ className: "brief__purpose" }, brief.purpose),
+            ui.div({ className: "brief__rule" }),
+            ui.div({ className: "brief__facts" },
+                fact("Given", brief.given),
+                fact("Returns", brief.returns),
+                fact("Worth", brief.worth)));
+    }
+
     function ModelSwitch(props) {
         var model = props.model || {};
         var note;
@@ -229,8 +317,8 @@
                    "the log using its own rules. Everything still runs.";
         } else if (props.on) {
             note = "Using " + model.name + " through " + model.label + " to widen the " +
-                   "vocabulary of the test data and to read the agent's log back in " +
-                   "plain English.";
+                   "vocabulary of the test data, describe each file and read the agent's " +
+                   "log back in plain English.";
         } else {
             note = model.name + " is configured through " + model.label +
                    ". Leave this off to run entirely on this machine.";
@@ -276,22 +364,9 @@
 
         return ui.section({ className: "screen" },
             ui.div({ className: "screen__head" },
-                ui.p({ className: "eyebrow" }, "Agent " + props.agent.number + " · " + props.agent.script),
-                ui.h1({ className: "title" }, props.agent.name)),
-
-            ui.div({ className: "brief" },
-                ui.p({ className: "brief__label" }, "What this agent does"),
-                ui.p({ className: "brief__lead" }, props.agent.about),
-                ui.div({ className: "brief__grid" },
-                    ui.div({ className: "brief__cell" },
-                        ui.h3(null, "It reads"),
-                        ui.p(null, props.agent.intake)),
-                    ui.div({ className: "brief__cell" },
-                        ui.h3(null, "It writes"),
-                        ui.p(null, props.agent.deliverable)),
-                    ui.div({ className: "brief__cell" },
-                        ui.h3(null, "What Fortum gains"),
-                        ui.p(null, props.agent.value)))),
+                ui.p({ className: "eyebrow" }, "Agent " + props.agent.number),
+                ui.h1({ className: "title" }, props.agent.name),
+                e(Brief, { brief: props.agent.brief })),
 
             /* The switch sits in the same place whether or not the data has
                been built, because it governs both: the model widens the
@@ -335,11 +410,24 @@
                             return ui.li({ key: index, className: "planted__item" },
                                 ui.span({ className: "planted__mark" }),
                                 ui.span(null, item));
-                        })),
-                        ui.div({ className: "stories" }, files.map(function (item) {
-                            return ui.div({ key: item.name, className: "story" },
-                                ui.p({ className: "story__name" }, item.name),
-                                ui.p({ className: "story__text" }, item.story || item.label));
+                        }))),
+
+                    /* One bubble per file, so the data is understood before it
+                       is looked at. The preview underneath is for anyone who
+                       wants to check the wording for themselves. */
+                    ui.div({ className: "card" },
+                        ui.p({ className: "section-title" },
+                            files.length === 1 ? "The file it was given"
+                                               : "The " + files.length + " files it was given"),
+                        ui.div({ className: "sources" }, files.map(function (item) {
+                            return ui.div({ key: item.name, className: "source" },
+                                ui.div({ className: "source__head" },
+                                    ui.span({ className: "source__name" }, item.name),
+                                    ui.span({ className: "source__meta" },
+                                        count(item.rows) + " rows · " +
+                                        count(item.columns.length) + " columns")),
+                                ui.p({ className: "source__summary" },
+                                    item.summary || item.label));
                         }))),
 
                     ui.div({ className: "card" },
@@ -353,7 +441,6 @@
                                 onClick: function () { setActive(index); setMoreRows(null); }
                             }, item.name);
                         })),
-                        file ? ui.p({ className: "file-note" }, file.label) : null,
                         preview ? e(Grid, { columns: preview.columns, rows: preview.rows }) : null,
                         file
                             ? ui.div({ className: "table-foot" },
@@ -381,24 +468,97 @@
     // Screen three: the run
     // ----------------------------------------------------------------------
 
+    /* The whole of the running screen. One sentence at a time in the middle,
+       the sentences before it receding underneath, and four bars in the brand's
+       colours to say that something is still going on. */
     function Stage(props) {
-        var now = props.notes.length
-            ? props.notes[props.notes.length - 1]
-            : (props.phase || "The agent is beginning its work.");
-        var trail = props.notes.slice(0, -1).slice(-4);
+        var notes = props.notes;
+        var latest = notes.length ? notes[notes.length - 1] : props.waiting;
+        var trail = notes.slice(0, -1).slice(-4).reverse();
+        /* An agent quoting its own figures can run long. Setting a wall of
+           display type at 29px would be shouting, so it steps down instead. */
+        var wordy = latest.length > 92;
 
         return ui.div({ className: "stage" },
-            ui.div({ className: "orbits", "aria-hidden": "true" },
-                ui.div({ className: "orbits__ring" }, ui.span({ className: "orbits__dot" })),
-                ui.div({ className: "orbits__ring orbits__ring--inner" },
-                    ui.span({ className: "orbits__dot" })),
-                ui.div({ className: "orbits__mark" },
-                    ui.img({ src: "img/logo.png", alt: "" }))),
-            ui.p({ className: "stage__now" }, now),
+            ui.p({ className: "stage__caption" }, props.caption),
+            ui.div({ className: "stage__mark", "aria-hidden": "true" },
+                [0, 1, 2, 3].map(function (index) {
+                    return ui.span({ key: index, className: "stage__bar" });
+                })),
+            ui.h2({
+                className: "stage__now" + (wordy ? " stage__now--wordy" : ""),
+                "aria-live": "polite"
+            }, ui.span({ key: latest }, latest)),
             trail.length
                 ? ui.ul({ className: "stage__trail" }, trail.map(function (note, index) {
-                    return ui.li({ key: index }, note);
+                    return ui.li({ key: note + index }, note);
                 }))
+                : null,
+            ui.p({ className: "stage__clock" },
+                props.finishedIn !== null
+                    ? "The agent finished in " + props.finishedIn + " seconds"
+                    : elapsedWords(props.seconds)),
+            ui.div({ className: "stage__meter" }));
+    }
+
+    function classifyLine(line) {
+        if (line.indexOf("$ ") === 0) { return "command"; }
+        var upper = line.toUpperCase();
+        if (upper.indexOf("ERROR") >= 0 || upper.indexOf("TRACEBACK") >= 0) { return "error"; }
+        if (upper.indexOf("WARNING") >= 0) { return "warn"; }
+        if (upper.indexOf("INFO") >= 0) { return "info"; }
+        return "plain";
+    }
+
+    function Console(props) {
+        return ui.div({ className: "console" },
+            props.lines.length === 0
+                ? ui.p({ className: "console__empty" }, "The agent printed nothing.")
+                : props.lines.map(function (line, index) {
+                    return ui.div({
+                        key: index,
+                        className: "console__line console__line--" + classifyLine(line)
+                    }, line);
+                }));
+    }
+
+    function Notes(props) {
+        return ui.div({ className: "notes" },
+            props.notes.length === 0
+                ? ui.p({ className: "notes__empty" }, "There was nothing worth remarking on.")
+                : props.notes.map(function (note, index) {
+                    return ui.div({ key: index, className: "note" },
+                        ui.span({ className: "note__rail" }, ui.span({ className: "note__dot" })),
+                        ui.p({ className: "note__text" }, note));
+                }));
+    }
+
+    /* Everything the run produced, folded away. It is evidence, and evidence
+       should be kept and should not be the first thing anybody sees. */
+    function Record(props) {
+        var openState = useState("");
+        var open = openState[0];
+        var setOpen = openState[1];
+
+        function tab(key, label) {
+            return ui.button({
+                key: key,
+                className: "record__toggle",
+                type: "button",
+                "aria-expanded": open === key,
+                onClick: function () { setOpen(open === key ? "" : key); }
+            }, label);
+        }
+
+        return ui.div({ className: "record" },
+            ui.div({ className: "record__tabs" },
+                tab("steps", "Step by step"),
+                tab("log", "Technical log · " + count(props.logs.length) + " lines")),
+            open === "steps"
+                ? ui.div({ className: "record__body" }, e(Notes, { notes: props.notes }))
+                : null,
+            open === "log"
+                ? ui.div({ className: "record__body" }, e(Console, { lines: props.logs }))
                 : null);
     }
 
@@ -452,8 +612,8 @@
                 }, "Look inside"),
                 ui.a({
                     className: "link",
-                    href: "/api/download?agent=" + encodeURIComponent(props.agent) +
-                          "&file=" + encodeURIComponent(output.relative)
+                    href: withToken("/api/download?agent=" + encodeURIComponent(props.agent) +
+                                    "&file=" + encodeURIComponent(output.relative))
                 }, "Download"));
         }));
     }
@@ -484,10 +644,16 @@
     }
 
     function TestScreen(props) {
-        var state = useState({ logs: [], notes: [], phase: "Starting", running: true,
-                               result: null, error: "" });
+        var state = useState({ logs: [], notes: [], phase: "Starting the agent",
+                               running: true, result: null, error: "" });
         var run = state[0];
         var setRun = state[1];
+        var tick = useState(0);
+        var seconds = tick[0];
+        var setSeconds = tick[1];
+        var shownState = useState(0);
+        var shown = shownState[0];
+        var setShown = shownState[1];
         var looking = useState(null);
         var open = looking[0];
         var setOpen = looking[1];
@@ -496,8 +662,9 @@
         var setSheet = contents[1];
 
         useEffect(function () {
-            var source = new EventSource("/api/run?agent=" + encodeURIComponent(props.agent.key) +
-                                         "&use_model=" + (props.useModel ? "1" : "0"));
+            var source = new EventSource(withToken(
+                "/api/run?agent=" + encodeURIComponent(props.agent.key) +
+                "&use_model=" + (props.useModel ? "1" : "0")));
 
             source.addEventListener("log", function (event) {
                 var line = JSON.parse(event.data).line;
@@ -545,6 +712,29 @@
             return function () { source.close(); };
         }, [props.agent, props.useModel]);
 
+        /* A clock that only counts while the run is going. Without it a quiet
+           stretch is indistinguishable from a stall. */
+        useEffect(function () {
+            if (!run.running) { return undefined; }
+            var timer = window.setInterval(function () {
+                setSeconds(function (value) { return value + 1; });
+            }, 1000);
+            return function () { window.clearInterval(timer); };
+        }, [run.running]);
+
+        /* The narration is revealed a sentence at a time rather than as fast as
+           it arrives. On a few hundred rows these agents finish in well under a
+           second, and an account of the run that appears and vanishes inside
+           one frame is no account at all. The duration reported underneath and
+           in the verdict is the measured one, so nothing here is overstated. */
+        useEffect(function () {
+            if (shown >= run.notes.length) { return undefined; }
+            var timer = window.setTimeout(function () {
+                setShown(function (value) { return value + 1; });
+            }, shown === 0 ? 450 : 900);
+            return function () { window.clearTimeout(timer); };
+        }, [shown, run.notes.length]);
+
         var look = useCallback(function (relative) {
             setOpen(relative);
             setSheet(null);
@@ -556,39 +746,47 @@
 
         var result = run.result;
         var status = result ? result.status : "running";
+        /* Not "the agent has stopped" but "there is nothing left to show":
+           the stage holds until the last sentence has had its moment. */
+        var told = !run.running && shown >= run.notes.length;
 
         return ui.section({ className: "screen" },
             ui.div({ className: "screen__head" },
-                ui.p({ className: "eyebrow" }, "Agent " + props.agent.number + " · " + props.agent.script),
-                ui.h1({ className: "title" },
-                    run.running ? "The agent is at work" : props.agent.name),
-                ui.p({ className: "subtitle" },
-                    run.running
-                        ? props.agent.name
-                        : "Finished in " + (result ? result.seconds : "?") + " seconds. " +
-                          "Everything below was measured against what was planted.")),
+                ui.p({ className: "eyebrow" }, "Agent " + props.agent.number),
+                ui.h1({ className: "title" }, props.agent.name),
+                told && result
+                    ? ui.p({ className: "subtitle" },
+                        "Finished in " + result.seconds + " seconds. Everything below was " +
+                        "measured against what was planted.")
+                    : null),
 
-            e(Problem, { message: run.error }),
+            told ? e(Problem, { message: run.error }) : null,
 
-            result ? e(Verdict, { status: status, verdict: result.verdict }) : null,
-
-            run.running
-                ? e(Stage, { notes: run.notes, phase: run.phase })
+            !told
+                ? e(Stage, {
+                    caption: run.running ? run.phase : "What happened",
+                    notes: run.notes.slice(0, shown),
+                    waiting: "Setting the agent going",
+                    seconds: seconds,
+                    finishedIn: result ? result.seconds : null
+                })
                 : null,
 
-            result
+            told && result ? e(Verdict, { status: status, verdict: result.verdict }) : null,
+
+            told && result
                 ? ui.div({ className: "card", style: { marginTop: "16px" } },
                     ui.p({ className: "section-title" }, "What was checked"),
                     e(Checks, { checks: result.checks }))
                 : null,
 
-            result && result.outputs.length
+            told && result && result.outputs.length
                 ? ui.div({ className: "card" },
                     ui.p({ className: "section-title" }, "What the agent wrote"),
                     e(Outputs, { outputs: result.outputs, agent: props.agent.key, onOpen: look }))
                 : null,
 
-            result && result.usage && (result.usage.requests || result.usage.failures)
+            told && result && result.usage && (result.usage.requests || result.usage.failures)
                 ? ui.div({ className: "card" },
                     ui.p({ className: "section-title" }, "Model usage"),
                     ui.p({ className: "card__body" },
@@ -608,17 +806,19 @@
                         : null)
                 : null,
 
+            told ? e(Record, { notes: run.notes, logs: run.logs }) : null,
+
             ui.div({ className: "actions" },
                 ui.button({
                     className: "btn btn--quiet",
                     type: "button",
-                    disabled: run.running,
+                    disabled: !told,
                     onClick: props.onBack
                 }, "Back to the data"),
                 ui.button({
                     className: "btn btn--primary",
                     type: "button",
-                    disabled: run.running,
+                    disabled: !told,
                     onClick: props.onRestart
                 }, "Start over")),
 
@@ -669,19 +869,15 @@
         var runKey = runKeyState[0];
         var setRunKey = runKeyState[1];
 
-        useEffect(function () {
-            if (step === "gate" || step === "welcome") { return; }
-            if (catalogue) { return; }
+        /* The catalogue is fetched the moment the door opens, so the welcome
+           covers the wait and the first screen is already there behind it. */
+        var open = useCallback(function (token) {
+            session = token;
+            setStep("welcome");
             api("/api/agents")
                 .then(setCatalogue)
                 .catch(function (problem) { setError(problem.message); });
-        }, [step, catalogue]);
-
-        useEffect(function () {
-            if (step !== "welcome") { return; }
-            var timer = window.setTimeout(function () { setStep("choose"); }, 3200);
-            return function () { window.clearTimeout(timer); };
-        }, [step]);
+        }, []);
 
         var agent = catalogue && chosen
             ? catalogue.agents.filter(function (item) { return item.key === chosen; })[0]
@@ -705,6 +901,10 @@
             setError("");
             setStep("choose");
         }, []);
+
+        /* Stable, because the welcome hangs its timers on it: a fresh function
+           every render would restart the countdown on every render. */
+        var enter = useCallback(function () { setStep("choose"); }, []);
 
         var goToData = useCallback(function () {
             if (chosen) { setStep("data"); }
@@ -731,17 +931,15 @@
         }, [step, chosen, dataset, building, goToData, goToTest, build]);
 
         if (step === "gate") {
-            return ui.div({ className: "app" },
-                e(GateScreen, { onUnlock: function () { setStep("welcome"); } }));
+            return ui.div({ className: "app" }, e(GateScreen, { onOpen: open }));
         }
-
         if (step === "welcome") {
-            return ui.div({ className: "app" }, e(WelcomeScreen));
+            return ui.div({ className: "app" }, e(WelcomeScreen, { onDone: enter }));
         }
 
         if (!catalogue) {
             return ui.div({ className: "app" },
-                e(Masthead, { step: "choose" }),
+                e(Masthead, { step: step }),
                 ui.main({ className: "main" },
                     error ? e(Problem, { message: error }) : e(Working, { label: "Starting up" })));
         }

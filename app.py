@@ -16,8 +16,9 @@ notes is a test harness people stop running, so it has none.
 
 How it is put together
 ----------------------
-Three kinds of request, and no more:
+A handful of requests, and no more:
 
+    POST /api/unlock        exchange the passphrase for a session token
     GET  /api/agents        what can be tested, and which model is configured
     POST /api/synthesise    build the data for one agent, return a preview
     GET  /api/run           run the agent, streaming the log as it happens
@@ -27,6 +28,11 @@ of the third screen is to watch the agent work. Each line the agent prints is
 forwarded the moment it is printed, and the harness's reading of those lines
 arrives on the same stream a little behind them.
 
+The passphrase is checked here rather than in the browser. A gate that the page
+enforces on itself is a picture of a lock, and anyone who opened the developer
+tools would be through it; this one issues a token that every later request has
+to carry, so the only way past is to know the phrase.
+
 State lives in memory for as long as the process runs. This is one person's
 tool on one person's machine, and a database would be a way of looking busy.
 """
@@ -34,17 +40,21 @@ tool on one person's machine, and a database would be a way of looking busy.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import mimetypes
+import os
 import queue
+import secrets
 import socket
 import sys
 import threading
+import time
 import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import TestAgent
@@ -55,7 +65,14 @@ STATIC = HERE / "static"
 
 DEFAULT_PORT = 8420
 PREVIEW_ROWS = 12
-GATE_PASSWORD = "PwC%2026"
+
+# Overridable for anyone who would rather not have it written down, but there
+# has to be a working default or the tool needs a set-up note to start.
+PASSPHRASE = os.environ.get("HARNESS_PASSWORD", "PwC%2026")
+
+# Long enough that a wrong guess is never worth automating, short enough that
+# the person who mistyped it does not think the page has hung.
+WRONG_GUESS_PAUSE = 0.6
 
 
 # ===========================================================================
@@ -73,7 +90,21 @@ class Session:
         self._lock = threading.Lock()
         self._harness: Optional[Harness] = None
         self._use_model = False
+        self._tokens: Set[str] = set()
         self.datasets: Dict[str, Dataset] = {}
+
+    # -- who is allowed in --------------------------------------------------
+
+    def grant(self) -> str:
+        """A token for someone who has just given the right passphrase."""
+        token = secrets.token_urlsafe(24)
+        with self._lock:
+            self._tokens.add(token)
+        return token
+
+    def holds(self, token: str) -> bool:
+        with self._lock:
+            return bool(token) and token in self._tokens
 
     def harness(self, use_model: bool) -> Harness:
         """The harness, rebuilt if the model setting changed."""
@@ -146,12 +177,34 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
 
+    # -- the gate -----------------------------------------------------------
+
+    def _admitted(self, query: Dict[str, List[str]]) -> bool:
+        """Whether this request carries a token issued by /api/unlock.
+
+        The header is the normal route. The query string exists because two
+        things the browser does cannot carry headers at all: an EventSource for
+        the run stream, and a plain link for a download.
+        """
+        token = self.headers.get("X-Session") or (query.get("token") or [""])[0]
+        return SESSION.holds(token)
+
+    def unlock(self) -> None:
+        """Trade the passphrase for a token, or say no and wait a moment."""
+        given = str(self._body().get("password") or "")
+        if not hmac.compare_digest(given, PASSPHRASE):
+            time.sleep(WRONG_GUESS_PAUSE)
+            return self._fail(401, "That is not the passphrase.")
+        self._json({"token": SESSION.grant()})
+
     # -- routing ------------------------------------------------------------
 
     def do_GET(self) -> None:                           # noqa: N802 - stdlib name
         route = urlparse(self.path)
         query = parse_qs(route.query)
         try:
+            if route.path.startswith("/api/") and not self._admitted(query):
+                return self._fail(401, "This session is not unlocked.")
             if route.path == "/api/agents":
                 return self.agents()
             if route.path == "/api/preview":
@@ -173,9 +226,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:                          # noqa: N802 - stdlib name
         route = urlparse(self.path)
+        query = parse_qs(route.query)
         try:
             if route.path == "/api/unlock":
                 return self.unlock()
+            if route.path.startswith("/api/") and not self._admitted(query):
+                return self._fail(401, "This session is not unlocked.")
             if route.path == "/api/synthesise":
                 return self.synthesise()
             if route.path == "/api/reset":
@@ -215,16 +271,13 @@ class Handler(BaseHTTPRequestHandler):
             kind = "text/css; charset=utf-8"
         elif target.suffix == ".html":
             kind = "text/html; charset=utf-8"
+        elif target.suffix == ".woff2":
+            # Not in every machine's mime database, and a font served as a
+            # generic byte stream is a font the browser declines to use.
+            kind = "font/woff2"
         self._send(200, target.read_bytes(), kind or "application/octet-stream")
 
     # -- the three things this application does -----------------------------
-
-    def unlock(self) -> None:
-        """Admit the visitor if the password matches. Nothing else is stored."""
-        offered = str((self._body() or {}).get("password") or "")
-        if offered != GATE_PASSWORD:
-            return self._fail(403, "That password is not recognised.")
-        self._json({"ok": True})
 
     def agents(self) -> None:
         """What can be tested, and what the model tier is set to."""
@@ -409,7 +462,8 @@ def check_assets() -> None:
     missing = [name for name in ("index.html", "css/app.css", "js/app.js",
                                  "js/vendor/react.production.min.js",
                                  "js/vendor/react-dom.production.min.js",
-                                 "img/logo.png")
+                                 "img/logo.png",
+                                 "fonts/playfair-display-latin.woff2")
                if not (STATIC / name).is_file()]
     if missing:
         raise SystemExit("The interface is incomplete. Missing from static/: "
@@ -438,6 +492,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  Interface   {address}")
     print(f"  Agents      {len(AGENTS)} available")
     print(f"  Model       {'configured, ' + harness.config.model if harness.config.api_key else 'not configured - the harness will run on local rules'}")
+    print(f"  Passphrase  {PASSPHRASE if 'HARNESS_PASSWORD' not in os.environ else 'taken from HARNESS_PASSWORD'}")
     print()
     print("  Press Ctrl+C to stop.")
     print()

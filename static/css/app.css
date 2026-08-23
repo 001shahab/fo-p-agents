@@ -11,7 +11,23 @@
    for sits in the middle at a size that cannot be missed; everything that
    supports it is quieter, smaller and further out. The single action that
    moves you forward is the only orange thing in view.
+
+   Headings are set in a Didone of the Victorian kind and everything else in
+   the system sans. The two carry different jobs: the serif says what a screen
+   is, the sans says what to do about it, and nothing has to be underlined or
+   coloured to make that difference read.
    ========================================================================== */
+
+/* Vendored rather than fetched from a font service, so the interface looks the
+   same on a machine that has never been online. One file, variable weight.
+   Playfair Display, SIL Open Font License 1.1 - see static/fonts/OFL.txt. */
+@font-face {
+    font-family: "Playfair Display";
+    src: url("../fonts/playfair-display-latin.woff2") format("woff2");
+    font-weight: 400 700;
+    font-style: normal;
+    font-display: swap;
+}
 
 :root {
     /* Brand */
@@ -22,6 +38,14 @@
     --yellow:      #ffb600;
     --rose:        #db536a;
     --red:         #e0301e;
+
+    /* An old, tarnished gold, kept for one job only: the frame around what an
+       agent is for. Because it appears nowhere else, that panel is recognised
+       before it is read. */
+    --gold:      #a8873f;
+    --gold-deep: #7a5c22;
+    --gold-pale: #ddc793;
+    --gold-wash: #fbf8f1;
 
     /* Neutrals, warm rather than blue, to sit with the orange */
     --ink:      #131110;
@@ -46,13 +70,11 @@
 
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue",
             Helvetica, Arial, sans-serif;
-    --serif: "Playfair Display", "Times New Roman", Times, Georgia, serif;
     --mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
-
-    --gold:      #b08d3e;
-    --gold-deep: #8c6d28;
-    --gold-wash: rgba(176, 141, 62, .12);
-    --mist:      #f1eee8;
+    /* The fallbacks are the Didones already on a Mac, so the page keeps its
+       character in the moment before the vendored file has loaded. */
+    --display: "Playfair Display", Didot, "Bodoni 72", "Hoefler Text",
+               Baskerville, Georgia, serif;
 
     /* Everything that moves uses one of these two, so the interface has a
        single sense of pace rather than five competing ones. */
@@ -99,6 +121,153 @@ button, input, select { font: inherit; color: inherit; }
 }
 .boot__logo { width: 74px; opacity: .9; }
 .boot__note { color: var(--grey); font-size: 13px; letter-spacing: .02em; margin: 0; }
+
+
+/* --------------------------------------------------------------------------
+   The way in
+   -------------------------------------------------------------------------- */
+
+.gate, .welcome {
+    min-height: 100vh;
+    display: grid;
+    place-content: center;
+    justify-items: center;
+    text-align: center;
+    padding: 40px 24px 90px;
+}
+
+.gate__logo { width: 108px; margin-bottom: 34px; animation: rise 620ms var(--ease) both; }
+
+.gate__title {
+    margin: 0;
+    font-family: var(--display);
+    font-size: clamp(26px, 3.6vw, 34px);
+    font-weight: 500;
+    letter-spacing: -.004em;
+    animation: rise 620ms var(--ease) 80ms both;
+}
+
+.gate__note {
+    margin: 12px 0 30px;
+    color: var(--grey);
+    font-size: 14.5px;
+    max-width: 42ch;
+    animation: rise 620ms var(--ease) 140ms both;
+}
+
+.gate__form {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    animation: rise 620ms var(--ease) 200ms both;
+}
+
+.gate__input {
+    width: 250px;
+    padding: 13px 20px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--paper);
+    font-family: var(--mono);
+    font-size: 14px;
+    letter-spacing: .18em;
+    text-align: center;
+    transition: border-color var(--quick), box-shadow var(--quick);
+}
+.gate__input::placeholder { letter-spacing: .06em; color: var(--grey-pale); }
+.gate__input:focus {
+    outline: none;
+    border-color: var(--orange);
+    box-shadow: 0 0 0 3px rgba(208, 74, 2, .12);
+}
+
+/* A refusal should be felt before it is read. */
+.gate__form--wrong .gate__input { border-color: var(--red); }
+.gate__form--wrong { animation: shake 380ms var(--ease) both; }
+
+@keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    20%      { transform: translateX(-7px); }
+    45%      { transform: translateX(6px); }
+    70%      { transform: translateX(-3px); }
+}
+
+.gate__refusal {
+    margin: 18px 0 0;
+    color: var(--red);
+    font-size: 13.5px;
+    min-height: 20px;
+}
+
+
+/* --------------------------------------------------------------------------
+   The welcome, which lasts about three seconds and then gets out of the way
+   -------------------------------------------------------------------------- */
+
+.welcome { cursor: pointer; }
+
+.welcome__stage { position: relative; display: grid; place-items: center; }
+
+/* A warm bloom that swells once behind the mark, so the logo arrives rather
+   than simply appearing. */
+.welcome__glow {
+    position: absolute;
+    width: 340px; height: 340px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(235, 140, 0, .20), rgba(235, 140, 0, 0) 62%);
+    animation: bloom 2200ms var(--ease) both;
+}
+
+@keyframes bloom {
+    0%   { opacity: 0; transform: scale(.4); }
+    40%  { opacity: 1; transform: scale(1); }
+    100% { opacity: 0; transform: scale(1.5); }
+}
+
+.welcome__logo {
+    position: relative;
+    width: 196px;
+    animation: arrive 1150ms var(--ease) both;
+}
+
+@keyframes arrive {
+    0%   { opacity: 0; transform: scale(.72) translateY(14px); filter: blur(7px); }
+    60%  { opacity: 1; filter: blur(0); }
+    100% { opacity: 1; transform: none; filter: blur(0); }
+}
+
+/* A gold rule drawn outwards from the centre, the way a nameplate is engraved.
+   Held in from the edges so the colour reads as gold rather than fading to
+   nothing before anyone sees it. */
+.welcome__rule {
+    height: 1px;
+    width: 260px;
+    margin: 36px 0 28px;
+    background: linear-gradient(90deg, transparent, var(--gold) 22%,
+                                var(--gold) 78%, transparent);
+    animation: engrave 900ms var(--ease) 900ms both;
+}
+
+@keyframes engrave { from { width: 0; } }
+
+.welcome__line {
+    margin: 0;
+    font-family: var(--display);
+    font-size: clamp(24px, 3.4vw, 34px);
+    font-weight: 500;
+    line-height: 1.26;
+    letter-spacing: -.004em;
+    animation: rise 900ms var(--ease) 1150ms both;
+}
+
+.welcome__hint {
+    margin: 26px 0 0;
+    font-size: 12px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--grey-pale);
+    animation: fade 700ms var(--ease) 2100ms both;
+}
 
 
 /* --------------------------------------------------------------------------
@@ -184,8 +353,10 @@ button, input, select { font: inherit; color: inherit; }
     to   { opacity: 1; transform: none; }
 }
 
+/* Taken at its word: nothing here needs to move for the interface to work, so
+   when motion is unwelcome all of it stops rather than most of it. */
 @media (prefers-reduced-motion: reduce) {
-    .screen, .card, .note, .check { animation: none !important; }
+    *, *::before, *::after { animation: none !important; }
     * { transition-duration: 1ms !important; }
 }
 
@@ -196,10 +367,10 @@ button, input, select { font: inherit; color: inherit; }
 
 .title {
     margin: 0;
-    font-family: var(--serif);
-    font-size: clamp(32px, 4.6vw, 46px);
-    line-height: 1.18;
-    letter-spacing: -.018em;
+    font-family: var(--display);
+    font-size: clamp(30px, 4.4vw, 44px);
+    line-height: 1.12;
+    letter-spacing: -.006em;
     font-weight: 500;
 }
 
@@ -242,16 +413,16 @@ button, input, select { font: inherit; color: inherit; }
    Choosing an agent
    -------------------------------------------------------------------------- */
 
+/* Four agents, two by two. A row of four would make them read as a toolbar and
+   a column of four as a menu; a square reads as a choice between peers. */
 .agents {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-    max-width: 860px;
-    margin: 0 auto;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
 }
 
 @media (max-width: 720px) {
-    .agents { grid-template-columns: 1fr; }
+    .agents { grid-template-columns: minmax(0, 1fr); }
 }
 
 .agent {
@@ -305,10 +476,12 @@ button, input, select { font: inherit; color: inherit; }
 .agent[aria-pressed="true"] .agent__number { color: var(--orange); }
 
 .agent__name {
-    margin: 0 0 5px;
-    font-size: 16px;
+    margin: 0 0 6px;
+    font-family: var(--display);
+    font-size: 19px;
     font-weight: 600;
-    letter-spacing: -.008em;
+    letter-spacing: -.002em;
+    line-height: 1.24;
     padding-right: 26px;
 }
 
@@ -343,10 +516,11 @@ button, input, select { font: inherit; color: inherit; }
 .card--quiet { background: transparent; border-style: dashed; }
 
 .card__heading {
-    margin: 0 0 6px;
-    font-size: 17px;
+    margin: 0 0 8px;
+    font-family: var(--display);
+    font-size: 21px;
     font-weight: 600;
-    letter-spacing: -.01em;
+    letter-spacing: -.002em;
 }
 
 .card__body {
@@ -354,6 +528,149 @@ button, input, select { font: inherit; color: inherit; }
     color: var(--grey);
     font-size: 14.5px;
     line-height: 1.62;
+}
+
+
+/* --------------------------------------------------------------------------
+   What an agent is for
+   --------------------------------------------------------------------------
+   The one panel on the whole screen that is written for someone who will never
+   run any of this. Grey paper inside a tarnished gold frame, set in the serif:
+   it looks like a plate on a machine rather than another card in a form, and
+   that is the point - it is the only thing here making a claim about value. */
+
+.brief {
+    position: relative;
+    margin: 30px auto 0;
+    max-width: 780px;
+    padding: 30px 34px 28px;
+    background: linear-gradient(180deg, #f6f4f1, #f1efec);
+    border: 1px solid var(--gold);
+    border-radius: 20px;
+    box-shadow: inset 0 0 0 4px rgba(255, 255, 255, .55),
+                0 2px 14px rgba(122, 92, 34, .07);
+    text-align: left;
+    animation: rise 520ms var(--ease) both;
+}
+
+/* A printer's ornament, drawn rather than typed. The obvious characters for it
+   get handed to an emoji font by at least one browser, and a gold lozenge that
+   arrives as a small coloured picture undoes the whole panel. */
+.brief__mark {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 11px;
+    margin-bottom: 18px;
+}
+.brief__mark::before, .brief__mark::after {
+    content: "";
+    width: 38px;
+    height: 1px;
+    background: var(--gold-pale);
+}
+
+.brief__lozenge {
+    width: 6px;
+    height: 6px;
+    background: var(--gold);
+    transform: rotate(45deg);
+}
+
+.brief__purpose {
+    margin: 0;
+    font-family: var(--display);
+    font-size: 20px;
+    line-height: 1.45;
+    color: var(--ink);
+    text-align: center;
+    max-width: 56ch;
+    margin-inline: auto;
+}
+
+.brief__rule {
+    height: 1px;
+    margin: 22px 0 20px;
+    background: linear-gradient(90deg, transparent, var(--gold-pale) 20%,
+                                var(--gold-pale) 80%, transparent);
+}
+
+.brief__facts {
+    display: grid;
+    grid-template-columns: 86px minmax(0, 1fr);
+    gap: 14px 20px;
+    align-items: baseline;
+}
+
+.brief__label {
+    font-size: 10.5px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: var(--gold-deep);
+    white-space: nowrap;
+}
+
+.brief__value {
+    margin: 0;
+    font-size: 14.5px;
+    line-height: 1.6;
+    color: var(--ink-soft);
+}
+
+@media (max-width: 620px) {
+    .brief { padding: 24px 22px; }
+    .brief__facts { grid-template-columns: minmax(0, 1fr); gap: 4px 0; }
+    .brief__value { margin-bottom: 12px; }
+}
+
+
+/* --------------------------------------------------------------------------
+   One bubble per generated file
+   -------------------------------------------------------------------------- */
+
+.sources { display: grid; gap: 12px; }
+
+.source {
+    padding: 18px 22px;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    animation: rise 420ms var(--ease) both;
+    transition: border-color var(--quick), box-shadow var(--quick);
+}
+.source:hover { border-color: #d9d3cd; box-shadow: var(--shadow-sm); }
+
+.source__head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 7px;
+}
+
+.source__name {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.source__meta {
+    font-size: 11.5px;
+    color: var(--grey-pale);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    margin-left: auto;
+}
+
+.source__summary {
+    margin: 0;
+    font-size: 14.5px;
+    line-height: 1.6;
+    color: var(--ink-soft);
+    max-width: 78ch;
 }
 
 
@@ -395,28 +712,6 @@ button, input, select { font: inherit; color: inherit; }
     border-bottom: 1.6px solid var(--orange);
     transform: rotate(-45deg) translate(1px, -1px);
 }
-
-.stats {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    margin-top: 22px;
-}
-
-.stat {
-    background: var(--canvas);
-    border: 1px solid var(--line-soft);
-    border-radius: 999px;
-    padding: 6px 14px;
-    font-size: 12.5px;
-    color: var(--grey);
-}
-.stat b {
-    color: var(--ink);
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-}
-
 
 /* --------------------------------------------------------------------------
    Table preview
@@ -596,7 +891,7 @@ kbd {
     border: 1px solid var(--line);
     border-radius: var(--radius-sm);
     background: var(--paper);
-    margin-top: 18px;
+    margin: 26px 0 16px;
 }
 
 .model__text { flex: 1; min-width: 0; }
@@ -641,45 +936,183 @@ kbd {
 
 /* --------------------------------------------------------------------------
    The run
+   --------------------------------------------------------------------------
+   Nobody standing in front of a test wants to read a log. They want to know
+   that something is happening and what it is. So the running screen is one
+   sentence at a time, set large, with the sentences before it receding
+   underneath; the log is still kept, but it is folded away until asked for. */
+
+.stage {
+    position: relative;
+    overflow: hidden;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    padding: 58px 40px 54px;
+    text-align: center;
+    min-height: 400px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+
+.stage__caption {
+    margin: 0 0 26px;
+    font-size: 11px;
+    letter-spacing: .17em;
+    text-transform: uppercase;
+    color: var(--orange);
+    font-weight: 600;
+}
+
+/* Four skewed bars in the brand's own colours, rising in sequence. A spinner
+   would say the same thing in a borrowed voice. */
+.stage__mark {
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    gap: 7px;
+    height: 46px;
+    margin-bottom: 30px;
+}
+
+.stage__bar {
+    width: 13px;
+    height: 13px;
+    border-radius: 2px;
+    transform: skewX(-16deg);
+    animation: stack 1.5s var(--ease) infinite;
+}
+.stage__bar:nth-child(1) { background: var(--yellow);    animation-delay: 0ms; }
+.stage__bar:nth-child(2) { background: var(--tangerine); animation-delay: 130ms; }
+.stage__bar:nth-child(3) { background: var(--orange);    animation-delay: 260ms; }
+.stage__bar:nth-child(4) { background: var(--rose);      animation-delay: 390ms; }
+
+@keyframes stack {
+    0%, 100% { height: 13px; opacity: .3; }
+    42%      { height: 44px; opacity: 1; }
+}
+
+.stage__now {
+    margin: 0;
+    font-family: var(--display);
+    font-size: clamp(21px, 2.7vw, 29px);
+    line-height: 1.38;
+    font-weight: 500;
+    letter-spacing: -.004em;
+    max-width: 28ch;
+    min-height: 2.76em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.stage__now--wordy {
+    font-size: clamp(18px, 2vw, 22px);
+    line-height: 1.5;
+    max-width: 48ch;
+}
+
+/* Keyed on its own text in the view, so React replaces the node and this runs
+   again: each new sentence arrives instead of the old one changing. */
+.stage__now span { animation: swap 460ms var(--ease) both; }
+
+@keyframes swap {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: none; }
+}
+
+.stage__trail {
+    list-style: none;
+    margin: 30px 0 0;
+    padding: 0;
+    display: grid;
+    gap: 7px;
+    max-width: 58ch;
+}
+
+.stage__trail li {
+    font-size: 13.5px;
+    line-height: 1.5;
+    color: var(--grey);
+    animation: fade 420ms var(--ease) both;
+}
+.stage__trail li:nth-child(1) { opacity: .70; }
+.stage__trail li:nth-child(2) { opacity: .48; }
+.stage__trail li:nth-child(3) { opacity: .30; }
+.stage__trail li:nth-child(4) { opacity: .16; }
+
+.stage__clock {
+    margin: 30px 0 0;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--grey-pale);
+    font-variant-numeric: tabular-nums;
+}
+
+/* One thin line travelling across the foot of the card. It does not claim to
+   know how far along the run is, because nothing here does. */
+.stage__meter {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 2px;
+    background: var(--line-soft);
+    overflow: hidden;
+}
+.stage__meter::after {
+    content: "";
+    position: absolute;
+    top: 0; bottom: 0;
+    width: 34%;
+    background: linear-gradient(90deg, transparent, var(--orange), transparent);
+    animation: travel 1.9s cubic-bezier(.45, 0, .55, 1) infinite;
+}
+
+@keyframes travel {
+    from { transform: translateX(-100%); }
+    to   { transform: translateX(394%); }
+}
+
+
+/* --------------------------------------------------------------------------
+   The record, kept but folded away
    -------------------------------------------------------------------------- */
 
-.run {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 16px;
-    align-items: start;
+.record { margin-top: 20px; }
+
+.record__tabs {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+    flex-wrap: wrap;
 }
 
-@media (max-width: 900px) {
-    .run { grid-template-columns: minmax(0, 1fr); }
+.record__toggle {
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 8px 18px;
+    font-size: 12.5px;
+    color: var(--grey);
+    cursor: pointer;
+    transition: color var(--quick), border-color var(--quick), background var(--quick);
 }
-
-.panel {
+.record__toggle:hover { color: var(--ink-soft); border-color: var(--grey-pale); }
+.record__toggle[aria-expanded="true"] {
+    color: var(--ink);
+    border-color: var(--ink);
     background: var(--paper);
+}
+
+.record__body {
+    margin-top: 14px;
     border: 1px solid var(--line);
     border-radius: var(--radius);
     overflow: hidden;
+    background: var(--paper);
+    animation: rise 320ms var(--ease) both;
 }
-
-.panel__head {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 15px 20px;
-    border-bottom: 1px solid var(--line-soft);
-}
-
-.panel__title {
-    margin: 0;
-    font-size: 12px;
-    letter-spacing: .09em;
-    text-transform: uppercase;
-    color: var(--grey);
-    font-weight: 600;
-    flex: 1;
-}
-
-.panel__body { padding: 20px; }
 
 /* A slow pulse on the dot while the agent is working. Motion is the only
    honest way to say "still running" without a number that means nothing. */
@@ -698,16 +1131,15 @@ kbd {
     50%      { opacity: .3; transform: scale(.75); }
 }
 
-/* The two panels are given the same fixed height rather than being left to
-   size themselves, so that the commentary and the log stay side by side
-   instead of one growing past the other as lines arrive. */
+/* Every note the harness made, in order, for anyone who wants the whole
+   sequence rather than the one sentence the stage had room for. */
 .notes {
     display: flex;
     flex-direction: column;
     gap: 0;
-    height: 430px;
+    max-height: 460px;
     overflow-y: auto;
-    padding: 4px 20px 20px;
+    padding: 6px 24px 22px;
 }
 
 .note {
@@ -751,9 +1183,9 @@ kbd {
 /* The raw log, kept but demoted. It is evidence, not the story. */
 .console {
     background: var(--console);
-    height: 430px;
+    max-height: 460px;
     overflow-y: auto;
-    padding: 16px 20px;
+    padding: 18px 22px;
     font-family: var(--mono);
     font-size: 11.5px;
     line-height: 1.72;
@@ -808,10 +1240,11 @@ kbd {
 
 .verdict__headline {
     margin: 0;
-    font-size: 22px;
-    line-height: 1.34;
+    font-family: var(--display);
+    font-size: 25px;
+    line-height: 1.32;
     font-weight: 500;
-    letter-spacing: -.014em;
+    letter-spacing: -.004em;
     max-width: 54ch;
 }
 
@@ -1079,300 +1512,3 @@ kbd {
     letter-spacing: .02em;
 }
 .colophon span { color: var(--line); margin: 0 9px; }
-
-
-/* --------------------------------------------------------------------------
-   Gate and welcome
-   -------------------------------------------------------------------------- */
-
-.gate {
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 48px 24px 72px;
-    text-align: center;
-}
-
-.gate__logo {
-    width: 118px;
-    height: auto;
-    display: block;
-    margin-bottom: 36px;
-}
-
-.gate__title {
-    font-family: var(--serif);
-    font-size: clamp(30px, 4.4vw, 42px);
-    font-weight: 500;
-    letter-spacing: -.016em;
-    margin: 0 0 10px;
-}
-
-.gate__note {
-    margin: 0 0 32px;
-    color: var(--grey);
-    font-size: 15px;
-    max-width: 36ch;
-}
-
-.gate__form {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 16px;
-    width: min(360px, 100%);
-}
-
-.gate__field {
-    width: 100%;
-    border: 1px solid var(--line);
-    background: var(--paper);
-    border-radius: 999px;
-    padding: 14px 20px;
-    text-align: center;
-    letter-spacing: .08em;
-    font-size: 16px;
-    outline: none;
-    transition: border-color var(--quick), box-shadow var(--quick);
-}
-.gate__field:focus {
-    border-color: var(--orange);
-    box-shadow: 0 0 0 3px var(--orange-wash);
-}
-
-.gate__error {
-    margin: 0;
-    color: var(--red);
-    font-size: 13.5px;
-    min-height: 1.2em;
-}
-
-.welcome {
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 48px 24px;
-    text-align: center;
-}
-
-.welcome__logo {
-    width: 148px;
-    height: auto;
-    display: block;
-    animation: logo-rise 1100ms var(--ease) both;
-}
-
-.welcome__line {
-    margin: 28px 0 0;
-    font-family: var(--serif);
-    font-size: clamp(22px, 3.4vw, 32px);
-    font-weight: 500;
-    font-style: italic;
-    letter-spacing: -.012em;
-    color: var(--ink);
-    max-width: 18ch;
-    animation: welcome-in 900ms var(--ease) 700ms both;
-}
-
-@keyframes logo-rise {
-    from { opacity: 0; transform: scale(.72) translateY(10px); }
-    to   { opacity: 1; transform: none; }
-}
-
-@keyframes welcome-in {
-    from { opacity: 0; transform: translateY(8px); }
-    to   { opacity: 1; transform: none; }
-}
-
-
-/* --------------------------------------------------------------------------
-   Gold-framed brief
-   -------------------------------------------------------------------------- */
-
-.brief {
-    background: var(--mist);
-    border: 1.5px solid var(--gold);
-    box-shadow: 0 0 0 6px var(--gold-wash), var(--shadow-sm);
-    border-radius: 18px;
-    padding: 28px 32px 30px;
-    margin: 8px auto 28px;
-    max-width: 820px;
-}
-
-.brief__label {
-    margin: 0 0 12px;
-    font-size: 11px;
-    letter-spacing: .16em;
-    text-transform: uppercase;
-    color: var(--gold-deep);
-    font-weight: 600;
-}
-
-.brief__lead {
-    margin: 0;
-    font-family: var(--serif);
-    font-size: 20px;
-    line-height: 1.45;
-    font-weight: 500;
-    letter-spacing: -.01em;
-}
-
-.brief__grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
-    gap: 22px;
-    margin-top: 22px;
-    padding-top: 20px;
-    border-top: 1px solid rgba(176, 141, 62, .28);
-}
-
-@media (max-width: 780px) {
-    .brief__grid { grid-template-columns: 1fr; gap: 16px; }
-}
-
-.brief__cell h3 {
-    margin: 0 0 7px;
-    font-size: 11px;
-    letter-spacing: .12em;
-    text-transform: uppercase;
-    color: var(--gold-deep);
-    font-weight: 600;
-}
-
-.brief__cell p {
-    margin: 0;
-    font-size: 14px;
-    line-height: 1.58;
-    color: var(--ink-soft);
-}
-
-
-/* --------------------------------------------------------------------------
-   File stories
-   -------------------------------------------------------------------------- */
-
-.stories {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 12px;
-    margin: 18px 0 4px;
-}
-
-.story {
-    background: var(--mist);
-    border: 1.5px solid var(--gold);
-    box-shadow: 0 0 0 4px var(--gold-wash);
-    border-radius: 14px;
-    padding: 18px 22px 20px;
-}
-
-.story__name {
-    margin: 0 0 8px;
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--gold-deep);
-}
-
-.story__text {
-    margin: 0;
-    font-size: 14.5px;
-    line-height: 1.58;
-    color: var(--ink-soft);
-}
-
-
-/* --------------------------------------------------------------------------
-   Run stage — animation instead of a log
-   -------------------------------------------------------------------------- */
-
-.stage {
-    background: var(--paper);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    padding: 42px 36px 40px;
-    text-align: center;
-    min-height: 360px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-}
-
-.orbits {
-    position: relative;
-    width: 168px;
-    height: 168px;
-    margin-bottom: 28px;
-}
-
-.orbits__ring {
-    position: absolute;
-    inset: 0;
-    border-radius: 50%;
-    border: 1.5px solid rgba(208, 74, 2, .18);
-    animation: orbit-spin 9s linear infinite;
-}
-.orbits__ring--inner {
-    inset: 22px;
-    border-color: rgba(176, 141, 62, .35);
-    animation-duration: 6s;
-    animation-direction: reverse;
-}
-
-.orbits__dot {
-    position: absolute;
-    top: -5px; left: 50%;
-    width: 10px; height: 10px;
-    margin-left: -5px;
-    border-radius: 50%;
-    background: var(--orange);
-    box-shadow: 0 0 0 4px var(--orange-wash);
-}
-.orbits__ring--inner .orbits__dot {
-    background: var(--gold);
-    box-shadow: 0 0 0 4px var(--gold-wash);
-}
-
-.orbits__mark {
-    position: absolute;
-    inset: 46px;
-    display: grid;
-    place-items: center;
-}
-.orbits__mark img { width: 52px; height: auto; }
-
-@keyframes orbit-spin { to { transform: rotate(360deg); } }
-
-.stage__now {
-    margin: 0;
-    font-family: var(--serif);
-    font-size: clamp(22px, 3vw, 28px);
-    font-weight: 500;
-    letter-spacing: -.012em;
-    max-width: 34ch;
-    line-height: 1.35;
-}
-
-.stage__trail {
-    list-style: none;
-    margin: 22px 0 0;
-    padding: 0;
-    display: grid;
-    gap: 8px;
-    max-width: 52ch;
-}
-
-.stage__trail li {
-    color: var(--grey);
-    font-size: 14px;
-    line-height: 1.5;
-}
-
-@media (prefers-reduced-motion: reduce) {
-    .orbits__ring { animation: none; }
-    .welcome__logo, .welcome__line { animation: none; }
-}
