@@ -19,7 +19,6 @@
     var e = React.createElement;
     var useState = React.useState;
     var useEffect = React.useEffect;
-    var useRef = React.useRef;
     var useCallback = React.useCallback;
 
     /* ui.div(props, ...children) reads closely enough to markup to be
@@ -116,6 +115,61 @@
                         return ui.td({ key: name, title: value }, value === "" ? "—" : value);
                     }));
                 }))));
+    }
+
+    // ----------------------------------------------------------------------
+    // Gate and welcome
+    // ----------------------------------------------------------------------
+
+    function GateScreen(props) {
+        var field = useState("");
+        var value = field[0];
+        var setValue = field[1];
+        var busy = useState(false);
+        var waiting = busy[0];
+        var setWaiting = busy[1];
+        var fault = useState("");
+        var error = fault[0];
+        var setError = fault[1];
+
+        function submit(event) {
+            if (event) { event.preventDefault(); }
+            if (!value || waiting) { return; }
+            setWaiting(true);
+            setError("");
+            postJSON("/api/unlock", { password: value })
+                .then(function () { props.onUnlock(); })
+                .catch(function () { setError("That password is not recognised."); })
+                .then(function () { setWaiting(false); });
+        }
+
+        return ui.section({ className: "gate" },
+            ui.img({ className: "gate__logo", src: "img/logo.png", alt: "PwC" }),
+            ui.h1({ className: "gate__title" }, "Agents Test AI Platform"),
+            ui.p({ className: "gate__note" },
+                "Enter to continue. The four agents are waiting on the other side."),
+            ui.form({ className: "gate__form", onSubmit: submit },
+                ui.input({
+                    className: "gate__field",
+                    type: "password",
+                    autoFocus: true,
+                    autoComplete: "off",
+                    placeholder: "Password",
+                    value: value,
+                    onChange: function (event) { setValue(event.target.value); }
+                }),
+                ui.button({
+                    className: "btn btn--primary",
+                    type: "submit",
+                    disabled: !value || waiting
+                }, waiting ? "Checking" : "Enter"),
+                ui.p({ className: "gate__error" }, error)));
+    }
+
+    function WelcomeScreen() {
+        return ui.section({ className: "welcome" },
+            ui.img({ className: "welcome__logo", src: "img/logo.png", alt: "PwC" }),
+            ui.p({ className: "welcome__line" }, "Welcome to Agents Test AI platform"));
     }
 
     // ----------------------------------------------------------------------
@@ -223,8 +277,21 @@
         return ui.section({ className: "screen" },
             ui.div({ className: "screen__head" },
                 ui.p({ className: "eyebrow" }, "Agent " + props.agent.number + " · " + props.agent.script),
-                ui.h1({ className: "title" }, props.agent.name),
-                ui.p({ className: "subtitle" }, props.agent.proves)),
+                ui.h1({ className: "title" }, props.agent.name)),
+
+            ui.div({ className: "brief" },
+                ui.p({ className: "brief__label" }, "What this agent does"),
+                ui.p({ className: "brief__lead" }, props.agent.about),
+                ui.div({ className: "brief__grid" },
+                    ui.div({ className: "brief__cell" },
+                        ui.h3(null, "It reads"),
+                        ui.p(null, props.agent.intake)),
+                    ui.div({ className: "brief__cell" },
+                        ui.h3(null, "It writes"),
+                        ui.p(null, props.agent.deliverable)),
+                    ui.div({ className: "brief__cell" },
+                        ui.h3(null, "What Fortum gains"),
+                        ui.p(null, props.agent.value)))),
 
             /* The switch sits in the same place whether or not the data has
                been built, because it governs both: the model widens the
@@ -269,15 +336,11 @@
                                 ui.span({ className: "planted__mark" }),
                                 ui.span(null, item));
                         })),
-                        ui.div({ className: "stats" },
-                            ui.span({ className: "stat" }, ui.b(null, count(dataset.total_rows)), " rows"),
-                            ui.span({ className: "stat" }, ui.b(null, String(dataset.files.length)),
-                                dataset.files.length === 1 ? " file" : " files"),
-                            ui.span({ className: "stat" }, "seed ", ui.b(null, String(dataset.seed))),
-                            dataset.model_phrasings
-                                ? ui.span({ className: "stat" },
-                                    ui.b(null, count(dataset.model_phrasings)), " model phrasings")
-                                : null)),
+                        ui.div({ className: "stories" }, files.map(function (item) {
+                            return ui.div({ key: item.name, className: "story" },
+                                ui.p({ className: "story__name" }, item.name),
+                                ui.p({ className: "story__text" }, item.story || item.label));
+                        }))),
 
                     ui.div({ className: "card" },
                         ui.p({ className: "section-title" }, "Preview"),
@@ -318,51 +381,25 @@
     // Screen three: the run
     // ----------------------------------------------------------------------
 
-    function classifyLine(line) {
-        if (line.indexOf("$ ") === 0) { return "command"; }
-        var upper = line.toUpperCase();
-        if (upper.indexOf("ERROR") >= 0 || upper.indexOf("TRACEBACK") >= 0) { return "error"; }
-        if (upper.indexOf("WARNING") >= 0) { return "warn"; }
-        if (upper.indexOf("INFO") >= 0) { return "info"; }
-        return "plain";
-    }
+    function Stage(props) {
+        var now = props.notes.length
+            ? props.notes[props.notes.length - 1]
+            : (props.phase || "The agent is beginning its work.");
+        var trail = props.notes.slice(0, -1).slice(-4);
 
-    function Console(props) {
-        var floor = useRef(null);
-        useEffect(function () {
-            if (floor.current && props.following) {
-                floor.current.scrollIntoView({ block: "end" });
-            }
-        }, [props.lines.length, props.following]);
-
-        return ui.div({ className: "console" },
-            props.lines.length === 0
-                ? ui.p({ className: "console__empty" }, "Waiting for the agent to start …")
-                : props.lines.map(function (line, index) {
-                    return ui.div({
-                        key: index,
-                        className: "console__line console__line--" + classifyLine(line)
-                    }, line);
-                }),
-            ui.div({ ref: floor }));
-    }
-
-    function Notes(props) {
-        var floor = useRef(null);
-        useEffect(function () {
-            if (floor.current) { floor.current.scrollIntoView({ block: "end" }); }
-        }, [props.notes.length]);
-
-        return ui.div({ className: "notes" },
-            props.notes.length === 0
-                ? ui.p({ className: "notes__empty" },
-                    "The harness will describe each step as the agent reaches it.")
-                : props.notes.map(function (note, index) {
-                    return ui.div({ key: index, className: "note" },
-                        ui.span({ className: "note__rail" }, ui.span({ className: "note__dot" })),
-                        ui.p({ className: "note__text" }, note));
-                }),
-            ui.div({ ref: floor }));
+        return ui.div({ className: "stage" },
+            ui.div({ className: "orbits", "aria-hidden": "true" },
+                ui.div({ className: "orbits__ring" }, ui.span({ className: "orbits__dot" })),
+                ui.div({ className: "orbits__ring orbits__ring--inner" },
+                    ui.span({ className: "orbits__dot" })),
+                ui.div({ className: "orbits__mark" },
+                    ui.img({ src: "img/logo.png", alt: "" }))),
+            ui.p({ className: "stage__now" }, now),
+            trail.length
+                ? ui.ul({ className: "stage__trail" }, trail.map(function (note, index) {
+                    return ui.li({ key: index }, note);
+                }))
+                : null);
     }
 
     function Verdict(props) {
@@ -524,10 +561,10 @@
             ui.div({ className: "screen__head" },
                 ui.p({ className: "eyebrow" }, "Agent " + props.agent.number + " · " + props.agent.script),
                 ui.h1({ className: "title" },
-                    run.running ? "Testing " + props.agent.name : props.agent.name),
+                    run.running ? "The agent is at work" : props.agent.name),
                 ui.p({ className: "subtitle" },
                     run.running
-                        ? run.phase
+                        ? props.agent.name
                         : "Finished in " + (result ? result.seconds : "?") + " seconds. " +
                           "Everything below was measured against what was planted.")),
 
@@ -535,17 +572,9 @@
 
             result ? e(Verdict, { status: status, verdict: result.verdict }) : null,
 
-            ui.div({ className: "run" },
-                ui.div({ className: "panel" },
-                    ui.div({ className: "panel__head" },
-                        ui.span({ className: "pulse" + (run.running ? "" : " pulse--done") }),
-                        ui.h2({ className: "panel__title" }, "What is happening")),
-                    e(Notes, { notes: run.notes })),
-                ui.div({ className: "panel" },
-                    ui.div({ className: "panel__head" },
-                        ui.h2({ className: "panel__title" }, "Agent log"),
-                        ui.span({ className: "output__meta" }, count(run.logs.length) + " lines")),
-                    e(Console, { lines: run.logs, following: run.running }))),
+            run.running
+                ? e(Stage, { notes: run.notes, phase: run.phase })
+                : null,
 
             result
                 ? ui.div({ className: "card", style: { marginTop: "16px" } },
@@ -608,7 +637,7 @@
     // ----------------------------------------------------------------------
 
     function App() {
-        var screen = useState("choose");
+        var screen = useState("gate");
         var step = screen[0];
         var setStep = screen[1];
 
@@ -641,10 +670,18 @@
         var setRunKey = runKeyState[1];
 
         useEffect(function () {
+            if (step === "gate" || step === "welcome") { return; }
+            if (catalogue) { return; }
             api("/api/agents")
                 .then(setCatalogue)
                 .catch(function (problem) { setError(problem.message); });
-        }, []);
+        }, [step, catalogue]);
+
+        useEffect(function () {
+            if (step !== "welcome") { return; }
+            var timer = window.setTimeout(function () { setStep("choose"); }, 3200);
+            return function () { window.clearTimeout(timer); };
+        }, [step]);
 
         var agent = catalogue && chosen
             ? catalogue.agents.filter(function (item) { return item.key === chosen; })[0]
@@ -693,9 +730,18 @@
             return function () { window.removeEventListener("keydown", onKey); };
         }, [step, chosen, dataset, building, goToData, goToTest, build]);
 
+        if (step === "gate") {
+            return ui.div({ className: "app" },
+                e(GateScreen, { onUnlock: function () { setStep("welcome"); } }));
+        }
+
+        if (step === "welcome") {
+            return ui.div({ className: "app" }, e(WelcomeScreen));
+        }
+
         if (!catalogue) {
             return ui.div({ className: "app" },
-                e(Masthead, { step: step }),
+                e(Masthead, { step: "choose" }),
                 ui.main({ className: "main" },
                     error ? e(Problem, { message: error }) : e(Working, { label: "Starting up" })));
         }

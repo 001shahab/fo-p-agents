@@ -55,6 +55,7 @@ STATIC = HERE / "static"
 
 DEFAULT_PORT = 8420
 PREVIEW_ROWS = 12
+GATE_PASSWORD = "PwC%2026"
 
 
 # ===========================================================================
@@ -173,6 +174,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:                          # noqa: N802 - stdlib name
         route = urlparse(self.path)
         try:
+            if route.path == "/api/unlock":
+                return self.unlock()
             if route.path == "/api/synthesise":
                 return self.synthesise()
             if route.path == "/api/reset":
@@ -215,6 +218,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, target.read_bytes(), kind or "application/octet-stream")
 
     # -- the three things this application does -----------------------------
+
+    def unlock(self) -> None:
+        """Admit the visitor if the password matches. Nothing else is stored."""
+        offered = str((self._body() or {}).get("password") or "")
+        if offered != GATE_PASSWORD:
+            return self._fail(403, "That password is not recognised.")
+        self._json({"ok": True})
 
     def agents(self) -> None:
         """What can be tested, and what the model tier is set to."""

@@ -733,6 +733,8 @@ class GeneratedFile:
     rows: int
     columns: List[str]
 
+    story: str = ""               # two-line business reading of the file
+
     def as_dict(self, root: Path) -> Dict[str, Any]:
         return {
             "name": self.path.name,
@@ -741,6 +743,7 @@ class GeneratedFile:
             "role": self.role,
             "rows": self.rows,
             "columns": self.columns,
+            "story": self.story,
         }
 
 
@@ -1916,6 +1919,10 @@ class AgentSpec:
     name: str
     tagline: str
     proves: str
+    about: str
+    intake: str
+    deliverable: str
+    value: str
     script: str
     build: Callable[[Path, random.Random, PhraseSource], Dataset]
     command: Callable[[Dataset, Path, Path], List[str]]
@@ -1926,6 +1933,8 @@ class AgentSpec:
         return {
             "key": self.key, "number": self.number, "name": self.name,
             "tagline": self.tagline, "proves": self.proves, "script": self.script,
+            "about": self.about, "intake": self.intake,
+            "deliverable": self.deliverable, "value": self.value,
             "outputs": list(self.outputs),
         }
 
@@ -1944,6 +1953,14 @@ AGENTS: Tuple[AgentSpec, ...] = (
         tagline="Turns ERP free text in any language into one clean English description.",
         proves="That four languages, damaged encodings and welded reference numbers all "
                "come out as readable English, with duplicates flagged and confidence scored.",
+        about="This agent reads a purchase line as it was typed into the ERP and writes "
+              "one clear English sentence of what Fortum actually bought.",
+        intake="The raw extracts from Sievo, purchase orders and invoices — Finnish, "
+               "Swedish, Polish or English, often abbreviated, truncated or mixed.",
+        deliverable="A single English description on every line, with a confidence "
+                    "score and whether the buy is a good or a service.",
+        value="Category managers can read the spend without decoding four languages "
+              "or guessing what a half-finished ERP field was meant to say.",
         script="agent1.py",
         build=lambda root, rng, phrases: build_agent1_sources(root, rng, phrases),
         command=lambda dataset, results, cache: (
@@ -1956,6 +1973,14 @@ AGENTS: Tuple[AgentSpec, ...] = (
         tagline="Gathers purchases that mean the same thing into one named group.",
         proves="That the same purchase written nine different ways lands in a single group, "
                "within its category, under a label a person would recognise.",
+        about="This agent gathers purchases that mean the same thing — even when they "
+              "were written differently — into a named group beneath today's categories.",
+        intake="The cleaned English descriptions from Agent 1, still sitting in "
+               "Fortum's existing L1 to L4 category tree.",
+        deliverable="Every line placed in a named Category L5 group, plus a directory "
+                    "of those groups a person can browse.",
+        value="Spend can be read at a level finer than today's categories, so similar "
+              "buys stop hiding behind different wording.",
         script="agent2.py",
         build=lambda root, rng, phrases: build_agent2_input(root, rng, phrases),
         command=lambda dataset, results, cache: (
@@ -1970,6 +1995,14 @@ AGENTS: Tuple[AgentSpec, ...] = (
         tagline="Matches purchases to catalogue items, and nominates what is missing.",
         proves="That a catalogued item is recognised however it was worded, and that repeat "
                "purchases with no catalogue entry are put forward as candidates.",
+        about="This agent asks, for each purchase, whether Fortum already has a standard "
+              "item for it — and if not, whether the buy is repeating often enough to deserve one.",
+        intake="The grouped purchase lines from Agent 2, together with Fortum's item "
+               "catalogues and price lists.",
+        deliverable="A match to a catalogue item where one exists, and a shortlist of "
+                    "repeat purchases that should be added to the catalogue.",
+        value="More of the spend can go through contracted items, and the catalogue "
+              "grows where the business is already buying the same thing again and again.",
         script="agent3.py",
         build=lambda root, rng, phrases: build_agent3_input(root, rng, phrases),
         command=lambda dataset, results, cache: (
@@ -1983,6 +2016,13 @@ AGENTS: Tuple[AgentSpec, ...] = (
         tagline="Finds suppliers whose portfolios overlap enough to be merged.",
         proves="That three spellings of one company resolve to one supplier, and that a "
                "supplier selling nothing another does not is surfaced as an opportunity.",
+        about="This agent finds suppliers whose ranges overlap enough that Fortum could "
+              "buy the same things from fewer of them.",
+        intake="The grouped purchase lines from Agent 2, with supplier names and spend.",
+        deliverable="A supplier master that collapses spelling variants, and a ranked "
+                    "list of consolidation opportunities with the euro at stake attached.",
+        value="Category managers see where a smaller supplier's entire range is already "
+              "covered by a larger one, so the conversation about reducing the tail has numbers.",
         script="agent4.py",
         build=lambda root, rng, phrases: build_agent4_input(root, rng, phrases),
         command=lambda dataset, results, cache: (
@@ -1993,19 +2033,6 @@ AGENTS: Tuple[AgentSpec, ...] = (
         outputs=("agent4_supplier_consolidation.csv", "agent4_supplier_pairs.csv",
                  "agent4_supplier_master.csv"),
     ),
-    AgentSpec(
-        key="max", number="05", name="Wide Dataset Builder",
-        tagline="Joins invoice and purchase order detail onto every transaction.",
-        proves="That transactions are widened rather than multiplied, that every planted "
-               "key is joined, and that the free text on the joined row is read.",
-        script="max.py",
-        build=lambda root, rng, phrases: build_max_sources(root, rng, phrases),
-        command=lambda dataset, results, cache: (
-            ["--sources", str(dataset.root / "sources")] + _common(results, cache)),
-        check=check_max,
-        outputs=("max_stage1_sievo_invoice.csv", "max_stage2_with_po.csv",
-                 "max_stage3_interpreted.csv"),
-    ),
 )
 
 AGENT_BY_KEY: Dict[str, AgentSpec] = {spec.key: spec for spec in AGENTS}
@@ -2014,6 +2041,40 @@ AGENT_BY_KEY: Dict[str, AgentSpec] = {spec.key: spec for spec in AGENTS}
 # ===========================================================================
 # Reading the log back in plain English
 # ===========================================================================
+
+_FILE_STORY_SYSTEM = (
+    "You describe a synthetic procurement file to a Fortum category manager "
+    "who is not a programmer.\n"
+    "Return JSON only, as {\"lines\": [\"...\", \"...\"]}.\n"
+    "Rules:\n"
+    "- Exactly two short sentences.\n"
+    "- Say what the file holds and why a buyer would look at it.\n"
+    "- No file paths, no column names, no jargon, no mention that the data is synthetic."
+)
+
+# Used when the model is off. Written in the same voice the model is asked for,
+# so the screen does not change register when a key is missing.
+_FILE_STORY_FALLBACK: Dict[str, str] = {
+    "sievo_transactions.csv":
+        "The purchase lines as they sit in Fortum's spend cube — one row per "
+        "transaction, in the language the buyer typed. This is the file the "
+        "agent has to make readable.",
+    "purchase_orders.csv":
+        "The purchase-order lines as a buyer wrote them, including the internal "
+        "note they left for the site. It is the second view of the same buys.",
+    "invoice_lines.csv":
+        "The invoice lines in the supplier's own wording, with quantities and "
+        "amounts. It is what arrived on the bill, not what Fortum asked for.",
+    "agent1_unified_lines.csv":
+        "The cleaned English descriptions of what was bought, still sitting in "
+        "today's categories. This is what Agent 1 would hand on.",
+    "agent2_purchase_groups.csv":
+        "The same purchase lines after they have been placed in a named group. "
+        "This is what a category manager would read after Agent 2 has run.",
+    "item_catalogue.csv":
+        "The standard items Fortum already holds on the catalogue, with a "
+        "price and a supplier. The agent matches live purchases against this list.",
+}
 
 _NARRATION_SYSTEM = (
     "You are watching a data-processing agent run and explaining it to a "
@@ -2327,9 +2388,43 @@ class Harness:
         dataset = spec.build(root, rng, phrases)
         dataset.seed = seed
         dataset.model_phrasings = phrases.generated
+        self._tell_file_stories(dataset, spec)
+        self.model.save()
         (root / "dataset.json").write_text(
             json.dumps(dataset.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
         return dataset
+
+    def _tell_file_stories(self, dataset: Dataset, spec: AgentSpec) -> None:
+        """Two business sentences for each generated file.
+
+        The language model is asked first, so the wording is not limited to
+        what is written here. When it is off, or when a request fails, the
+        fallback below is used instead — still two sentences a buyer can read.
+        """
+        for generated in dataset.files:
+            generated.story = self._file_story(generated, spec) or _FILE_STORY_FALLBACK.get(
+                generated.path.name, generated.label)
+
+    def _file_story(self, generated: GeneratedFile, spec: AgentSpec) -> str:
+        if not self.model.available:
+            return ""
+        request = {
+            "agent": spec.name,
+            "file": generated.path.name,
+            "what_the_file_is": generated.label,
+            "columns": generated.columns[:12],
+            "rows": generated.rows,
+        }
+        answer = self.model.ask(_FILE_STORY_SYSTEM,
+                                json.dumps(request, ensure_ascii=False))
+        if not answer:
+            return ""
+        lines = [str(item).strip() for item in (answer.get("lines") or [])
+                 if str(item).strip()]
+        if len(lines) >= 2:
+            return " ".join(lines[:2])
+        single = str(answer.get("description") or "").strip()
+        return single
 
     # -- execution ----------------------------------------------------------
 
