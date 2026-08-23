@@ -14,10 +14,16 @@ standard library's own, the interface is React served from the static folder,
 and the browser opens on its own. A test harness that needs its own set-up
 notes is a test harness people stop running, so it has none.
 
+The same command is what a hosting platform runs. Where one hands the process a
+port to listen on, the defaults invert on their own: every interface rather than
+the loopback, that exact port rather than the first free one, and no attempt to
+open a browser on a machine that has no screen. See ``hosted`` below.
+
 How it is put together
 ----------------------
 A handful of requests, and no more:
 
+    GET  /healthz           a fixed answer for whatever is watching from outside
     POST /api/unlock        exchange the passphrase for a session token
     GET  /api/agents        what can be tested, and which model is configured
     POST /api/synthesise    build the data for one agent, return a preview
@@ -73,6 +79,18 @@ PASSPHRASE = os.environ.get("HARNESS_PASSWORD", "PwC%2026")
 # Long enough that a wrong guess is never worth automating, short enough that
 # the person who mistyped it does not think the page has hung.
 WRONG_GUESS_PAUSE = 0.6
+
+
+def hosted() -> bool:
+    """Whether something other than a person is deciding how this is reached.
+
+    Every platform that runs a web process hands it a port in the environment
+    and then waits for something to answer on exactly that port. That single
+    fact is enough to tell a deployment from somebody's laptop, and all three
+    defaults that differ between the two follow from it, so there is no second
+    switch to remember and nothing to pass on the command line.
+    """
+    return bool(os.environ.get("PORT"))
 
 
 # ===========================================================================
@@ -203,6 +221,8 @@ class Handler(BaseHTTPRequestHandler):
         route = urlparse(self.path)
         query = parse_qs(route.query)
         try:
+            if route.path == "/healthz":
+                return self.health()
             if route.path.startswith("/api/") and not self._admitted(query):
                 return self._fail(401, "This session is not unlocked.")
             if route.path == "/api/agents":
@@ -278,6 +298,19 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, target.read_bytes(), kind or "application/octet-stream")
 
     # -- the three things this application does -----------------------------
+
+    def health(self) -> None:
+        """Confirm the process is up and the interface is intact.
+
+        Outside /api/ and outside the gate, both deliberately. A platform's
+        health check has no passphrase, and a service that answered "locked"
+        would be judged unhealthy and restarted for ever.
+        """
+        self._json({
+            "status": "ok",
+            "version": TestAgent.HARNESS_VERSION,
+            "agents": len(AGENTS),
+        })
 
     def agents(self) -> None:
         """What can be tested, and what the model tier is set to."""
@@ -471,20 +504,38 @@ def check_assets() -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    away = hosted()
     parser = argparse.ArgumentParser(
         prog="app.py",
         description="Start the agent test harness interface.")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
-                        help=f"port to listen on (default {DEFAULT_PORT})")
+    parser.add_argument("--port", type=int,
+                        default=int(os.environ.get("PORT") or DEFAULT_PORT),
+                        help=f"port to listen on (default $PORT, or {DEFAULT_PORT})")
     parser.add_argument("--no-browser", action="store_true",
                         help="do not open a browser window")
-    parser.add_argument("--host", default="127.0.0.1",
-                        help="address to bind (default 127.0.0.1, this machine only)")
+    parser.add_argument("--host", default="0.0.0.0" if away else "127.0.0.1",
+                        help="address to bind (default 127.0.0.1, this machine "
+                             "only; 0.0.0.0 when $PORT is set)")
     args = parser.parse_args(argv)
 
+    if away:
+        # A platform reads this process through a pipe, and a pipe is buffered
+        # in blocks rather than lines, so everything below would sit unwritten
+        # until something eventually filled it. Whoever is reading a deploy log
+        # should not have to wonder whether the process reached the next line.
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(line_buffering=True)
+
     check_assets()
-    port = free_port(args.port)
-    address = f"http://{args.host}:{port}"
+
+    # Stepping to the next free port is the friendly thing to do on a laptop,
+    # where the alternative is a stack trace because yesterday's copy is still
+    # running. It is the wrong thing to do under a platform, which is waiting
+    # on one particular port and will call the deploy a failure if nothing
+    # answers there. Better to fail loudly on the port that was asked for.
+    port = args.port if away else free_port(args.port)
+    address = os.environ.get("RENDER_EXTERNAL_URL") or f"http://{args.host}:{port}"
 
     harness = SESSION.harness(use_model=False)
     print()
@@ -493,14 +544,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  Agents      {len(AGENTS)} available")
     print(f"  Model       {'configured, ' + harness.config.model if harness.config.api_key else 'not configured - the harness will run on local rules'}")
     print(f"  Passphrase  {PASSPHRASE if 'HARNESS_PASSWORD' not in os.environ else 'taken from HARNESS_PASSWORD'}")
+    if away and "HARNESS_PASSWORD" not in os.environ:
+        # On a laptop the built-in phrase is a convenience. On a public address
+        # it is the whole of the security, and it is printed in the repository.
+        print()
+        print("  The built-in passphrase is published in the source. Set")
+        print("  HARNESS_PASSWORD before leaving this reachable from the internet.")
     print()
-    print("  Press Ctrl+C to stop.")
-    print()
+    if not away:
+        print("  Press Ctrl+C to stop.")
+        print()
 
     server = ThreadingHTTPServer((args.host, port), Handler)
     server.daemon_threads = True
 
-    if not args.no_browser:
+    if not args.no_browser and not away:
         threading.Timer(0.6, lambda: webbrowser.open(address)).start()
 
     try:
