@@ -546,6 +546,30 @@ naming it varies freely: "asbestos removal", "asbestos demolition" and "asbestos
 disposal" are one service. The specification comparison then rejects the pairs
 that read alike and are not substitutes, such as a DN50 and a DN200 valve.
 
+### What is matched, and what is already standard
+
+Matching runs against the best *original* description the row carries —
+`Original_Description`, then the PO or invoice line text — because it is the
+original that names the specific product a catalogue entry has to be recognised
+as. The enriched English sentence is the fallback for a row whose original text
+is missing or a placeholder such as `n/a`. `Match_Source_Column` records which
+field was used.
+
+`Standard_item` says whether the line was already raised against a catalogue,
+which each source system reports differently:
+
+| Source | `Standard_item` is `Y` when |
+| --- | --- |
+| Basware | `Item type` is `External webshop` or `Market place` |
+| Maximo | `ITEMNUM` carries any value |
+
+A Basware free-text line is therefore `N` whatever supplier product code it
+happens to carry. `Potential_Standard_Match` then takes one of three values:
+`Yes`, `No`, or `Already standard/catalogue purchase` when `Standard_item` is
+`Y`. Whenever the answer is not `Yes`, every `Matched_*` column and every score
+is left empty, so the file cannot be read as proposing a match it did not make;
+`Match_Rationale` is kept and says why.
+
 ### Thresholds
 
 The plan leaves the similarity threshold to be defined and tested. The defaults

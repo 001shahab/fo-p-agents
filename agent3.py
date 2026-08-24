@@ -101,7 +101,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent3")
 
 AGENT_NAME = "Agent 3 - AI Material and Service Standardisation"
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -1279,6 +1279,56 @@ def extract_json_object(content: str) -> Optional[Dict[str, Any]]:
 PURCHASE_DESCRIPTION_COLUMN = "Enriched_Purchase_Description"
 PURCHASE_GROUP_COLUMN = "AI_Purchase_Group_L5"
 
+# Fortum asked that a catalogue match be made against the best original
+# description rather than the generalised English sentence, because it is the
+# original that carries the specifics identifying the exact catalogue product.
+# Tried in order; the enriched sentence is the fallback when none is populated.
+MATCH_TEXT_COLUMNS: Tuple[str, ...] = (
+    "Original_Description",
+    "PO_Line_Description",
+    "Invoice_Line_Text",
+    "Invoice_Article_Name",
+    PURCHASE_DESCRIPTION_COLUMN,
+)
+
+# Placeholders that mean the field is empty, whatever the source system wrote.
+EMPTY_MARKERS = frozenset({
+    "n/a", "na", "n.a.", "none", "null", "nil", "nan", "-", "--", "?",
+    "unknown", "not defined", "no description", "tbd",
+})
+
+ITEM_TYPE_COLUMN = "Item_Type"
+ITEM_NUMBER_COLUMN = "Item_Number"
+
+# Basware item types that mean the line was raised against a catalogue and is
+# therefore already a standard purchase.
+CATALOGUE_ITEM_TYPES = frozenset({
+    "external webshop", "externalwebshop", "external web shop",
+    "market place", "marketplace",
+})
+
+# The third value Fortum asked for on Potential_Standard_Match. A line that is
+# already a catalogue purchase is neither a standardisation opportunity nor a
+# failed match, so it says so rather than answering Yes or No.
+ALREADY_STANDARD = "Already standard/catalogue purchase"
+
+# Everything that describes a proposed catalogue match. Fortum asked that these
+# be blank whenever Potential_Standard_Match is not Yes, so that the file cannot
+# be read as proposing a match it did not make.
+MATCHED_COLUMNS: Tuple[str, ...] = (
+    "Matched_Item_ID", "Matched_Item_Description", "Matched_Item_Supplier",
+    "Matched_Item_Source", "Matched_Item_Unit_Price", "Similarity_Score",
+    "AI_Confidence", "Match_Band", "Match_Method", "Match_Rationale",
+    "Type_Compatible", "Specification_Agreement", "Price_Difference_Percent",
+    "Alternative_Matches",
+)
+
+
+def is_populated(value: str) -> bool:
+    """True when a field carries a real value rather than a placeholder."""
+    cleaned = normalise_text(value)
+    return bool(cleaned) and cleaned.lower().strip(" .") not in EMPTY_MARKERS
+
 
 @dataclass
 class InputTable:
@@ -1987,7 +2037,7 @@ class Agent3:
 
         distinct: Dict[str, str] = {}
         for row in self.table.rows:
-            description = normalise_text(row.get(PURCHASE_DESCRIPTION_COLUMN, ""))
+            description, _ = self.match_text(row)
             if not description or self.lexicon.is_noise(description):
                 continue
             key = lookup_key(description)
@@ -2131,8 +2181,14 @@ class Agent3:
             if not description or self.lexicon.is_noise(description):
                 continue
 
-            best = self.matches.get(lookup_key(description), [])
-            already_standard = bool(best) and best[0].score >= self.settings.medium_threshold
+            # Profiling groups on the enriched English description, so that the
+            # same purchase written five ways is recognised as recurring. The
+            # match itself is looked up under the text it was made against.
+            match_key, _ = self.match_text(row)
+            best = self.matches.get(lookup_key(match_key), []) if match_key else []
+            already_standard = (
+                self.standard_item(row) == "Y"
+                or (bool(best) and best[0].score >= self.settings.medium_threshold))
 
             posting_date = normalise_text(row.get("Posting_Date", ""))
             period = posting_date[:7] if len(posting_date) >= 7 else ""
@@ -2150,6 +2206,43 @@ class Agent3:
                 already_standard=already_standard,
             )
 
+    # -- row classification -------------------------------------------------
+
+    def match_text(self, row: Dict[str, str]) -> Tuple[str, str]:
+        """The text this row is matched against, and the column it came from.
+
+        The original invoice, PO or Sievo description is preferred, because it
+        names the specific product a catalogue entry has to be recognised as.
+        The enriched English sentence is the fallback for a row whose original
+        text is missing or a placeholder.
+        """
+        for column in MATCH_TEXT_COLUMNS:
+            value = normalise_text(row.get(column, ""))
+            if is_populated(value) and not self.lexicon.is_noise(value):
+                return value, column
+        return "", ""
+
+    def standard_item(self, row: Dict[str, str]) -> str:
+        """Whether the line was already raised as a standard catalogue purchase.
+
+        The two source systems say so differently. Basware says it through the
+        item type: a line raised from an external webshop or a marketplace came
+        off a catalogue, and a free-text line did not, whatever supplier product
+        code it happens to carry. Maximo has no item type and says it by
+        carrying an item number at all, because only a stocked item has one.
+        The merged master table can be told either way.
+        """
+        source = normalise_text(row.get("Source_System", "")).lower()
+        item_type = normalise_text(row.get(ITEM_TYPE_COLUMN, "")).lower().strip(" .")
+        catalogue_type = item_type in CATALOGUE_ITEM_TYPES
+        has_item_number = is_populated(row.get(ITEM_NUMBER_COLUMN, ""))
+
+        if "basware" in source:
+            return "Y" if catalogue_type else "N"
+        if "maximo" in source:
+            return "Y" if has_item_number else "N"
+        return "Y" if catalogue_type or has_item_number else "N"
+
     # -- output -------------------------------------------------------------
 
     def write(self) -> Dict[str, Any]:
@@ -2164,7 +2257,8 @@ class Agent3:
         calibration_path = results_dir / "agent3_match_calibration.csv"
 
         appended = [
-            "Potential_Standard_Match", "Matched_Item_ID", "Matched_Item_Description",
+            "Standard_item", "Potential_Standard_Match", "Match_Source_Column",
+            "Matched_Item_ID", "Matched_Item_Description",
             "Matched_Item_Supplier", "Matched_Item_Source", "Matched_Item_Unit_Price",
             "Similarity_Score", "AI_Confidence", "Match_Band", "Match_Method",
             "Match_Rationale", "Type_Compatible", "Specification_Agreement",
@@ -2176,6 +2270,7 @@ class Agent3:
         band_counts: Counter = Counter()
         best_scores: List[float] = []
         matched_rows = 0
+        standard_rows = 0
 
         with rows_path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=headers, extrasaction="ignore")
@@ -2185,36 +2280,48 @@ class Agent3:
             try:
                 for row in self.table.rows:
                     output = dict(row)
-                    description = normalise_text(row.get(PURCHASE_DESCRIPTION_COLUMN, ""))
+                    description, match_column = self.match_text(row)
                     candidates = self.matches.get(lookup_key(description), []) if description else []
                     best = candidates[0] if candidates else None
+                    standard = self.standard_item(row)
+                    standard_rows += 1 if standard == "Y" else 0
 
-                    if best is None or best.score < self.settings.minimum_threshold:
-                        band = "None"
-                        output.update({
-                            "Potential_Standard_Match": "No",
-                            "Matched_Item_ID": "", "Matched_Item_Description": "",
-                            "Matched_Item_Supplier": "", "Matched_Item_Source": "",
-                            "Matched_Item_Unit_Price": "",
-                            "Similarity_Score": round(best.score, 4) if best else "",
-                            "AI_Confidence": 0, "Match_Band": band,
-                            "Match_Method": best.method if best else "",
-                            "Match_Rationale": ("best candidate below the reporting threshold"
-                                                if best else "no comparable standard item found"),
-                            "Type_Compatible": "", "Specification_Agreement": "",
-                            "Price_Difference_Percent": "", "Alternative_Matches": "",
-                        })
+                    band = "None"
+                    if standard == "Y":
+                        # Already bought off a catalogue, so there is nothing to
+                        # standardise and no match to propose.
+                        verdict = ALREADY_STANDARD
+                    elif best is None or best.score < self.settings.minimum_threshold:
+                        verdict = "No"
                     else:
                         band = self.engine.band(best.score)
-                        accepted = best.score >= self.settings.medium_threshold
+                        verdict = ("Yes" if best.score >= self.settings.medium_threshold
+                                   else "No")
+
+                    output["Standard_item"] = standard
+                    output["Potential_Standard_Match"] = verdict
+                    output["Match_Source_Column"] = match_column
+
+                    if verdict != "Yes":
+                        # Fortum's rule: a row that is not proposing a match must
+                        # not carry the traces of one. The rationale is the only
+                        # thing kept, because it says why there is no match.
+                        for column in MATCHED_COLUMNS:
+                            output[column] = ""
+                        output["Match_Band"] = band
+                        output["Match_Rationale"] = (
+                            "already a standard catalogue purchase"
+                            if standard == "Y" else
+                            "best candidate below the reporting threshold" if best
+                            else "no comparable standard item found")
+                    else:
                         confidence = self._confidence(best)
                         purchase_price = parse_amount(row.get("Unit_Price", ""))
                         difference = self._price_difference(purchase_price, best.item.unit_price)
 
-                        matched_rows += 1 if accepted else 0
+                        matched_rows += 1
                         band_counts[band] += 1
                         output.update({
-                            "Potential_Standard_Match": "Yes" if accepted else "No",
                             "Matched_Item_ID": best.item.item_id,
                             "Matched_Item_Description": best.item.description,
                             "Matched_Item_Supplier": best.item.supplier,
@@ -2277,6 +2384,7 @@ class Agent3:
             "reference_items": len(self.library.items),
             "reference_files": len(self.library.files_read),
             "rows_with_match": matched_rows,
+            "rows_already_standard": standard_rows,
             "match_bands": dict(band_counts),
             "catalogue_candidates": candidate_count,
             "score_percentiles": self._percentiles(best_scores),
@@ -2694,7 +2802,9 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
         for name in manifest["skipped_files"]:
             print(f"    {name}")
 
-    print(f"\n  Lines with a match   : {statistics.get('rows_with_match', 0):,} "
+    print(f"\n  Already standard     : {statistics.get('rows_already_standard', 0):,} "
+          f"(catalogue or stocked item)")
+    print(f"  Lines with a match   : {statistics.get('rows_with_match', 0):,} "
           f"(at or above {settings.medium_threshold:.2f})")
     bands = statistics.get("match_bands", {})
     if bands:
