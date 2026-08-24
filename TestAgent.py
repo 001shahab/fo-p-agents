@@ -1444,9 +1444,41 @@ def build_agent3_input(root: Path, rng: random.Random,
         path, "Grouped purchase lines as Agent 2 hands them on",
         "input", len(rows), columns))
 
+    # A purchase extract dropped into the same folder as the catalogue. Fortum
+    # keeps both in one tree, and Agent 3 used to absorb this as though it were a
+    # price list, then report purchases as matching each other. It must be
+    # refused, so a decoy is planted and the agent is judged on ignoring it.
+    decoy_columns = ["SourceRowId", "Document number", "Document line number",
+                     "Document line desc", "PO number", "PO line number",
+                     "Invoice number", "Posting date", "Spend in EUR",
+                     "ERP supplier name", "Supplier"]
+    decoy: List[Dict[str, Any]] = []
+    for position, concept in enumerate(catalogued):
+        supplier = SUPPLIERS[position % len(SUPPLIERS)]
+        decoy.append({
+            "SourceRowId": f"SRC-{9000 + position}",
+            "Document number": f"D{700000 + position}",
+            "Document line number": 1 + position % 4,
+            "Document line desc": concept.english,
+            "PO number": f"PO{500000 + position}",
+            "PO line number": 1,
+            "Invoice number": f"INV-{400000 + position}",
+            "Posting date": _iso_date(rng),
+            "Spend in EUR": _amount(rng, concept.price),
+            "ERP supplier name": supplier.name,
+            "Supplier": supplier.name,
+        })
+    decoy_path = root / "reference" / "sievo_extract_do_not_use.csv"
+    _write_csv(decoy_path, decoy_columns, decoy)
+    dataset.files.append(GeneratedFile(
+        decoy_path, "A purchase extract sitting beside the catalogue, which must be refused",
+        "reference", len(decoy), decoy_columns))
+
     dataset.facts = {
         "rows": len(rows),
         "catalogue_items": len(catalogue),
+        "decoy_file": decoy_path.name,
+        "decoy_rows": len(decoy),
         "exact_wordings": exact_planted,
         "reworded": equivalent_planted,
         "already_standard": standard_planted,
@@ -1465,6 +1497,8 @@ def build_agent3_input(root: Path, rng: random.Random,
         f"'n/a', which must fall back to the enriched English sentence to match",
         f"{len(candidate_concepts)} purchases with no catalogue entry, each repeated often "
         f"and well past the spend threshold, which should be nominated as catalogue candidates",
+        f"a purchase extract, {decoy_path.name}, sitting in the catalogue folder and naming "
+        f"the same items, which must be refused rather than matched against",
         "Ordinary one-off traffic that should match nothing, so the agent is judged on "
         "restraint as well as recall",
     ]
@@ -1862,6 +1896,29 @@ def check_agent3(dataset: Dataset, results: Path) -> List[CheckResult]:
         "pass" if len(rows) == expected else "fail",
         "Matching annotates rows; it must not add or drop them.",
         f"{len(rows):,} out, {expected:,} in"))
+
+    # The catalogue must be a catalogue. A purchase extract in the same folder
+    # names the same items and would match them beautifully, which is exactly
+    # why absorbing it produced confident matches that meant nothing.
+    decoy = dataset.facts.get("decoy_file", "")
+    if decoy:
+        manifest_path = results / "agent3_run_manifest.json"
+        manifest = (json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if manifest_path.is_file() else {})
+        refused = " ".join(manifest.get("refused_files", []))
+        absorbed = " ".join(manifest.get("reference_files", []))
+        from_decoy = sum(1 for row in rows
+                         if decoy in row.get("Matched_Item_Source", ""))
+        ok = decoy in refused and decoy not in absorbed and not from_decoy
+        checks.append(CheckResult(
+            "A purchase extract was refused as a catalogue",
+            "pass" if ok else "fail",
+            f"{decoy} is a purchase extract sitting beside the catalogue. Matching "
+            f"purchases against other purchases proposes standard items that do not "
+            f"exist, so the file has to be recognised and refused.",
+            f"refused and contributed {from_decoy:,} matches" if ok
+            else (f"absorbed as a catalogue" if decoy in absorbed
+                  else f"not refused; {from_decoy:,} matches came from it")))
 
     matched_column = _first_column(columns, ("Matched_Item_ID", "Matched_Item_Description"))
     band_column = _first_column(columns, ("Match_Band",))

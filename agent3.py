@@ -101,7 +101,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent3")
 
 AGENT_NAME = "Agent 3 - AI Material and Service Standardisation"
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "1.4.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -191,6 +191,11 @@ class Settings:
     lexicon_path: Path
     cache_dir: Path
 
+    # A folder holding item catalogues and nothing else. Fortum sends catalogues
+    # separately from the master data, so they get an input of their own rather
+    # than being fished out of the same tree as the purchase extracts.
+    catalogue_dir: Optional[Path] = None
+
     use_embeddings: bool = True
     use_neural_translation: bool = True
     use_llm: bool = False
@@ -230,6 +235,17 @@ class Settings:
     interactive: bool = True
 
     model: ModelConfig = field(default_factory=ModelConfig)
+
+    def catalogue_roots(self) -> Tuple[Path, ...]:
+        """Where to look for catalogues, most specific folder first.
+
+        When a catalogue folder is named it is the whole answer: the point of
+        naming it is to stop the reference tree, which also holds the purchase
+        extracts, being trawled for anything that resembles a price list.
+        """
+        if self.catalogue_dir is not None:
+            return (self.catalogue_dir,)
+        return (self.reference_dir,)
 
 
 def load_dotenv(path: Path) -> Dict[str, str]:
@@ -1459,6 +1475,62 @@ def normalise_column(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", fold_accents(normalise_text(name)).lower())
 
 
+# A catalogue lists what may be bought. A transaction records what was bought,
+# and so carries the identity of a document and the amounts and dates of one
+# event. Those columns never appear in a catalogue, and finding them is how a
+# purchase extract is told apart from the price list it should be matched
+# against. Fortum's own extracts sit in the same folder tree as the catalogues,
+# and matching purchases against other purchases produced confident nonsense:
+# "Int UK Delivery Costs" was reported as matching a standard item called
+# "Delivery", taken from a Basware purchase order file.
+_TRANSACTION_MARKERS: Tuple[str, ...] = (
+    # identity of a document or one of its lines
+    "sourcerowid", "datasource", "documentnumber", "documentlinenumber",
+    "documentlinedesc", "documentidentifier", "ordernumber", "ponum", "polinenum",
+    "polinenumber", "polinedesc", "requisitionnumber", "invoicenumber",
+    "invoicekey", "invoiceid", "invoicelink",
+    # when the event happened
+    "postingdate", "invoicedate", "duedate", "paymentdate", "orderdate",
+    "pocreationdate", "prcreationdate", "exchangedate",
+    # what the event cost, as opposed to what the item lists at
+    "glaccount", "spendin", "spendineur", "rowtotal", "vatamount", "vatrate",
+    "linecost", "loadedcost", "totalcost", "quantitycharged", "quantitydelivered",
+    "orderqty", "receipts", "exchangerate",
+    # who handled the event, and what state it reached
+    "orderstatus", "orderlinestatus", "requisitionstatus", "costcenter",
+    "pocreator", "prcreator", "purchaseagent", "prowner",
+)
+
+# One marker could be a coincidence in a catalogue that happens to carry, say, a
+# validity date. Two is a purchase extract. Every file Fortum has sent so far
+# carries far more than two, and the demo catalogue carries none.
+_TRANSACTION_MARKER_LIMIT = 2
+
+# Words that make a "supplier" column the name of a product rather than the name
+# of a company: "Supplier product name" describes an item, "ERP supplier name"
+# describes a party.
+_PRODUCT_WORDS: Tuple[str, ...] = ("product", "item", "article", "material",
+                                   "service", "goods", "part")
+
+
+def transaction_markers(headers: Sequence[str]) -> List[str]:
+    """Which purchase-transaction columns a table carries."""
+    keys = {normalise_column(header) for header in headers}
+    keys.discard("")
+    found = [marker for marker in _TRANSACTION_MARKERS
+             if any(marker in key for key in keys)]
+    return found
+
+
+def names_a_party(header: str) -> bool:
+    """Whether a column holds a company name rather than an item description."""
+    key = normalise_column(header)
+    if not any(token in key for token in ("supplier", "vendor", "creditor",
+                                          "manufacturer", "customer")):
+        return False
+    return not any(word in key for word in _PRODUCT_WORDS)
+
+
 def _resolve_reference_columns(headers: Sequence[str]) -> Dict[str, str]:
     """Map reference fields onto the columns of one file."""
     by_key = {}
@@ -1503,23 +1575,59 @@ class ReferenceLibrary:
         self.by_code: Dict[str, List[ReferenceItem]] = defaultdict(list)
         self.files_read: List[str] = []
         self.skipped_files: List[str] = []
+        self.rejected_files: List[str] = []
+        self.unreadable_files: List[str] = []
 
-    def load(self, root: Path) -> None:
-        """Read every usable reference file beneath a folder."""
-        if not root.exists():
-            LOGGER.warning("Reference folder %s does not exist; matching will be skipped.", root)
-            return
+    def load(self, *roots: Path) -> None:
+        """Read every usable catalogue beneath one or more folders."""
+        seen_paths: Set[Path] = set()
+        paths: List[Path] = []
+        for root in roots:
+            if not root.exists():
+                LOGGER.warning("Catalogue folder %s does not exist.", root)
+                continue
+            found = ([root] if root.is_file() else
+                     sorted(path for path in root.rglob("*")
+                            if path.is_file()
+                            and not path.name.startswith((".", "~$"))
+                            and path.suffix.lower() in {".csv", ".tsv", ".txt",
+                                                        ".xlsx", ".xlsm"}))
+            for path in found:
+                resolved = path.resolve()
+                if resolved not in seen_paths:
+                    seen_paths.add(resolved)
+                    paths.append(path)
 
-        paths = ([root] if root.is_file() else
-                 sorted(path for path in root.rglob("*")
-                        if path.is_file()
-                        and not path.name.startswith((".", "~$"))
-                        and path.suffix.lower() in {".csv", ".tsv", ".txt", ".xlsx", ".xlsm"}))
+        if not paths:
+            LOGGER.warning("No catalogue files were found; matching will be skipped.")
 
         for path in paths:
-            tables = ([_read_csv(path)] if path.suffix.lower() in {".csv", ".tsv", ".txt"}
-                      else _read_xlsx(path))
+            spreadsheet = path.suffix.lower() not in {".csv", ".tsv", ".txt"}
+            if spreadsheet and _openpyxl is None:
+                # Silence here is dangerous: the file is a catalogue the client
+                # sent, and dropping it without a word makes an incomplete run
+                # look like a complete one.
+                self.unreadable_files.append(
+                    f"{path.name} (needs openpyxl; install it and run again)")
+                LOGGER.error("Cannot read %s: openpyxl is not installed.", path.name)
+                continue
+            try:
+                tables = [_read_csv(path)] if not spreadsheet else _read_xlsx(path)
+            except Exception as error:                      # noqa: BLE001
+                self.unreadable_files.append(f"{path.name} ({type(error).__name__})")
+                LOGGER.error("Cannot read %s (%s).", path.name, error)
+                continue
+            if not tables:
+                self.unreadable_files.append(f"{path.name} (no readable sheet)")
+                LOGGER.error("No readable sheet in %s.", path.name)
+                continue
+
             for table in tables:
+                refusal = self._refuse(table)
+                if refusal:
+                    self.rejected_files.append(f"{path.name} ({refusal})")
+                    LOGGER.warning("Not treating %s as a catalogue: %s.", path.name, refusal)
+                    continue
                 added = self._absorb(table)
                 if added:
                     self.files_read.append(f"{path.name} ({added} item(s))")
@@ -1528,8 +1636,31 @@ class ReferenceLibrary:
 
         self._render_english()
         self._index()
-        LOGGER.info("Reference library holds %d item(s) from %d file(s).",
-                    len(self.items), len(self.files_read))
+        LOGGER.info("Catalogue holds %d item(s) from %d file(s); "
+                    "%d file(s) refused, %d unreadable.",
+                    len(self.items), len(self.files_read),
+                    len(self.rejected_files), len(self.unreadable_files))
+
+    def _refuse(self, table: InputTable) -> str:
+        """Why this table is not a catalogue, or an empty string if it is one.
+
+        Refusing is safer than absorbing. An item wrongly left out of the
+        catalogue costs a match that could have been proposed; a purchase
+        extract wrongly absorbed proposes matches that do not exist and reports
+        them with a confidence score.
+        """
+        markers = transaction_markers(table.headers)
+        if len(markers) >= _TRANSACTION_MARKER_LIMIT:
+            shown = ", ".join(markers[:4])
+            more = f" and {len(markers) - 4} more" if len(markers) > 4 else ""
+            return f"purchase transactions, not a catalogue: carries {shown}{more}"
+
+        columns = _resolve_reference_columns(table.headers)
+        description = columns.get("description")
+        if description and names_a_party(description):
+            return (f"its only description column, {description!r}, names a company "
+                    f"rather than an item")
+        return ""
 
     def _absorb(self, table: InputTable) -> int:
         """Turn one reference table into items, if it looks like reference data."""
@@ -2417,6 +2548,8 @@ class Agent3:
             "configuration": {
                 "input": str(self.settings.input_path),
                 "reference_dir": str(self.settings.reference_dir),
+                "catalogue_dir": (str(self.settings.catalogue_dir)
+                                  if self.settings.catalogue_dir else None),
                 "results_dir": str(self.settings.results_dir),
                 "thresholds": {
                     "high": self.settings.high_threshold,
@@ -2432,6 +2565,8 @@ class Agent3:
             },
             "reference_files": self.library.files_read,
             "skipped_files": self.library.skipped_files,
+            "refused_files": self.library.rejected_files,
+            "unreadable_files": self.library.unreadable_files,
             "outputs": [rows_path.name, candidates_path.name, calibration_path.name]
                        + ([jsonl_path.name] if self.settings.write_jsonl else []),
             "statistics": statistics,
@@ -2547,7 +2682,7 @@ class Agent3:
         self.table = read_purchase_table(self.settings.input_path)
         self.run_id = stable_hash("agent3-run", self.settings.input_path.name,
                                   str(len(self.table.rows)), AGENT_VERSION)
-        self.library.load(self.settings.reference_dir)
+        self.library.load(*self.settings.catalogue_roots())
         self.match_descriptions()
         self.adjudicate()
         self.profile_candidates()
@@ -2577,8 +2712,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  python agent3.py\n"
             "      Prompt for each path in turn and run with the defaults.\n\n"
             "  python agent3.py --non-interactive --input results/agent2_purchase_groups.csv \\\n"
-            "                   --reference './sources'\n"
-            "      Run unattended against every catalogue found under sources.\n\n"
+            "                   --catalogues './catalogues'\n"
+            "      Run unattended against the item catalogues the client sent.\n\n"
             "  python agent3.py --non-interactive --medium-threshold 0.70\n"
             "      Tighten the accept threshold after reading the calibration file.\n"
         ),
@@ -2587,6 +2722,9 @@ def build_parser() -> argparse.ArgumentParser:
     paths.add_argument("--input", metavar="FILE", help="purchase table from Agent 2 or Agent 1")
     paths.add_argument("--reference", metavar="DIR",
                        help="folder holding catalogues, price lists and standard items")
+    paths.add_argument("--catalogues", metavar="DIR",
+                       help="folder holding item catalogues only; use this when the "
+                            "catalogues are kept apart from the purchase extracts")
     paths.add_argument("--results", metavar="DIR", help="folder to write results into")
     paths.add_argument("--lexicon", metavar="FILE", help="controlled vocabulary JSON file")
     paths.add_argument("--cache", metavar="DIR", help="folder for the model response cache")
@@ -2687,6 +2825,16 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     default_lexicon = Path(args.lexicon) if args.lexicon else here / "lexicon" / "procurement_lexicon.json"
     default_cache = Path(args.cache) if args.cache else here / "cache"
 
+    # A catalogues folder is used when one is named, and also when the standard
+    # one exists, so that dropping the client's catalogues into ./catalogues is
+    # all it takes to keep them apart from the purchase extracts.
+    if args.catalogues:
+        default_catalogues: Optional[Path] = Path(args.catalogues)
+    elif (here / "catalogues").is_dir():
+        default_catalogues = here / "catalogues"
+    else:
+        default_catalogues = None
+
     use_embeddings = not args.no_embeddings
     use_neural = not args.no_neural
     use_llm = args.use_llm
@@ -2697,6 +2845,12 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         print(BANNER)
         print("\nPress Enter to accept the value shown in brackets.\n")
         default_input = Path(ask("Purchase table (from Agent 2, or Agent 1)", str(default_input)))
+        default_catalogues = Path(ask("Item catalogue folder (catalogues only)",
+                                      str(default_catalogues or (here / "catalogues"))))
+        if not default_catalogues.is_dir():
+            print(f"  {default_catalogues} does not exist yet; "
+                  f"falling back to the reference folder.")
+            default_catalogues = None
         default_reference = Path(ask("Reference data folder (catalogues and price lists)",
                                      str(default_reference)))
         default_results = Path(ask("Results folder", str(default_results)))
@@ -2729,6 +2883,8 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     settings = Settings(
         input_path=default_input.expanduser().resolve(),
         reference_dir=default_reference.expanduser().resolve(),
+        catalogue_dir=(default_catalogues.expanduser().resolve()
+                       if default_catalogues is not None else None),
         results_dir=default_results.expanduser().resolve(),
         lexicon_path=default_lexicon.expanduser().resolve(),
         cache_dir=default_cache.expanduser().resolve(),
@@ -2813,6 +2969,16 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
     if manifest["skipped_files"]:
         print("  Files with no recognisable item description (skipped):")
         for name in manifest["skipped_files"]:
+            print(f"    {name}")
+    # Loud, because a refused file is a deliberate decision the reader should see
+    # and an unreadable one is a catalogue that silently did not arrive.
+    if manifest.get("refused_files"):
+        print("  Not treated as catalogues:")
+        for name in manifest["refused_files"]:
+            print(f"    {name}")
+    if manifest.get("unreadable_files"):
+        print("  COULD NOT BE READ - these catalogues were left out of the run:")
+        for name in manifest["unreadable_files"]:
             print(f"    {name}")
 
     print(f"\n  Already standard     : {statistics.get('rows_already_standard', 0):,} "

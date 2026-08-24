@@ -486,6 +486,12 @@ site` instead of becoming a category of its own. A line whose only content word
 is one of them keeps it, because that line really did buy a delivery, and
 `power supply` keeps its head noun.
 
+`site` is the awkward one, because it names the purchase in Fortum's own `Bat
+survey for wind site` and names only the fulfilment in `for site use`. It is
+dropped when it is the site of a *use* and kept everywhere else; without that
+distinction, `Tank cleaning service for site use` split off into a category
+called `Tank cleaning service site`.
+
 The threshold adapts per category to land within the target group count. Lines
 that cannot be grouped confidently go to `Other` rather than being forced into a
 group they do not belong in. The number of Category L5 names is capped at 6000
@@ -533,6 +539,8 @@ complete set of price lists has been supplied.
 $ python agent3.py
 Purchase table (from Agent 2, or Agent 1)
   [/path/to/results/agent2_purchase_groups.csv]:
+Item catalogue folder (catalogues only)
+  [/path/to/catalogues]:
 Reference data folder (catalogues and price lists)
   [/path/to/sources]:
 Results folder
@@ -542,6 +550,35 @@ Use multilingual sentence embeddings (recommended, free)? [Y/n]:
 Translate reference descriptions with the offline models? [Y/n]:
 Let the language model adjudicate borderline matches? [y/N]:
 ```
+
+### Catalogues, and only catalogues
+
+Fortum sends item catalogues separately from the master data, so they get an
+input of their own: put them in `./catalogues`, or name a folder with
+`--catalogues DIR`, and every file beneath it is read whatever its layout.
+
+What a purchase is matched against decides whether the answer means anything. A
+catalogue lists what may be bought; a purchase extract records what *was* bought,
+and carries the identity of a document along with the amounts and dates of one
+event. Any file with two or more of those columns is refused as a catalogue, and
+so is a file whose only description column names a company rather than an item.
+Both refusals are reported by name and reason, because a file left out silently
+makes an incomplete run look like a complete one:
+
+```
+  Not treated as catalogues:
+    Basware PO data.xlsx (purchase transactions, not a catalogue: carries
+    ordernumber, polinenum, polinenumber, requisitionnumber and 9 more)
+```
+
+Without this, pointing `--reference` at a folder that held both gave `Int UK
+Delivery Costs` a confident match to a "standard item" called `Delivery`, taken
+from a purchase order file, and `Sievo with PO line numbers.csv` was absorbed
+with `ERP supplier name` as its item description.
+
+A catalogue that cannot be read is an error rather than an omission. If a
+spreadsheet is present and `openpyxl` is missing, the file is listed under
+`COULD NOT BE READ` and recorded in the manifest instead of vanishing.
 
 ### Functional equivalence, not resemblance
 
