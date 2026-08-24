@@ -90,7 +90,7 @@ from xml.etree import ElementTree
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.3.0"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -609,15 +609,53 @@ def is_code_token(token: str) -> bool:
 # Nordic/Polish/German letters that never belong in the enriched columns.
 _FOREIGN_LETTERS = re.compile(r"[äöåÄÖÅąćęłńóśźżĄĆĘŁŃÓŚŹŻõüÜßøæØÆ]")
 
+# Long morphological endings. Short ones such as "ning" are omitted on purpose:
+# they would flag English "cleaning" and "training".
 _FOREIGN_ENDINGS = (
-    "ukset", "uksen", "uksia", "uksella", "ukseen",
+    "ukset", "uksen", "uksia", "uksella", "ukseen", "uksineen",
     "minen", "mista", "mistä", "ainen", "oinen", "ellinen",
     "työ", "työt", "tyota", "työtä",
-    "ningar", "heter", "elser",
-    "anie", "enia", "owych", "owie",
+    "lle", "ssa", "ssä", "sta", "stä", "lla", "llä",
+    "ointi", "ointi", "tusten", "piston", "puistoon", "pumpun",
+    "sailion", "kattilan", "paatteiden",
+    "ningar", "heter", "elser", "ande", "ende", "arna", "orna",
+    "arbete", "anlaggning", "besiktning", "inventering",
+    "anie", "enia", "owych", "owie", "osci", "ości",
+    "owy", "owa", "owe", "ami", "ach", "owi",
     "ungen", "keiten", "schaft",
-    "lle", "ssa", "ssä",
 )
+
+_POLISH_SHAPE = re.compile(
+    r"(cz|sz|rz|dz|prz|sci|ych|owi|ami|ach|enie|anie)", re.IGNORECASE)
+_SWEDISH_SHAPE = re.compile(
+    r"(hj|sj|skj|lj|ggning|hammande|hjalm|avslut)", re.IGNORECASE)
+_FINNISH_SHAPE = re.compile(
+    r"(kk|pp|tt|aa|ee|ii|uu|yy)", re.IGNORECASE)
+_ENGLISH_SUFFIX = (
+    "tion", "sion", "ment", "ness", "ity", "ies", "ing", "ed", "ly",
+    "ous", "ful", "less", "able", "ible", "ence", "ance", "est",
+    "ive", "ize", "ise", "ers",
+)
+_FOREIGN_FUNCTION = frozenset("""
+och ja tai sekae sekä enligt med till oraz dla
+""".split())
+
+# English words that must never be stripped, even if an ending overlaps.
+_ENGLISH_KEEP = frozenset("""
+a an the and or of for to in on at by with from as
+service services maintenance repair repairs work works
+inspection inspections cleaning removal installation replacement
+pump pumps motor motors cable cables tank tanks boiler plant site
+wind bat survey overall visor helmet safety flame retardant fire
+frequency converter meter meters flow transmitter module modules
+calibration annual periodic industrial environmental impact
+assessment termination underground delivery freight transport
+confirmed plant engineer district heating digital input output
+coverall protective mechanical seal seals gasket gaskets impeller
+centrifugal variable speed drive power according quote offer
+attached number weeks stock warehouse items parts spare
+english polish finnish swedish german
+""".split())
 
 _FOREIGN_TERMS = frozenset("""
 kuljetukset kuljetus kuljetuspalvelu huolto huoltotyo huoltotyö kunnossapito
@@ -625,33 +663,56 @@ vuokra vuokraus vuokran purku purkutyo purkutyö asbestipurku palvelu palvelut
 palvelua korjaus asennus siivous konsultointi koulutus tarkastus hankinta
 varaosa varaosat sopimus lasku tilaus työ tyot työt laite laitteet urakka
 mittaus kaytto käyttö toimituskulut toimitus toimitusaika varastoon
-lepakkoselvitys tuulipuistoon tuulipuisto taajuusmuuttaja vaihto vanhan
-tilalle mekaaninen tiiviste pumpulle polttimen liekinkestava suojahaalari
-tarjous liitteena tarjousnumero viikkoa
+lepakkoselvitys lepakkokartoitus tuulipuistoon tuulipuisto taajuusmuuttaja
+vaihto vanhan tilalle mekaaninen tiiviste pumpulle polttimen liekinkestava
+suojahaalari tarjous liitteena tarjousnumero viikkoa keskipakopumpun
+polttoainesailion kaapelipaatteiden ymparistovaikutusten arviointi
+suojakypara tyokypara visiirilla palosuojattu haalari
 arbete underhall underhåll reparation tjanst tjänst tjanster tjänster
-hyra uthyrning avtal faktura bestallning beställning
+hyra uthyrning avtal faktura bestallning beställning brandhammande
+skyddshjalm arbetshjalm kabelavslutningsarbete pannanlaggning periodisk
+utbytesmodul digitala enligt offert leverans veckor
 inventering fladdermus vindpark miljoteknisk utredning flodesgivare
-flödesgivare genomgang genomgång justering enligt offert leverans veckor
+flödesgivare genomgang genomgång justering
 usluga uslugi usługa usługi usuwanie azbestu konserwacja naprawa
-uszczelka mechaniczna pompy srodowiskowa środowiskowa
-wynajem zamowienie zamówienie instalacja
+uszczelka mechaniczna pompy srodowiskowa środowiskowa srodowisko
+nietoperzy wiatrowa przeplywomierz zgodnie oferta oddzialywania
+falownik urzadzen wynajem zamowienie zamówienie instalacja
 dienstleistung reparatur wartung
 """.split())
 
 
 def is_foreign_common_noun(token: str) -> bool:
-    """True when a token is a Finnish/Swedish/Polish/German common noun."""
+    """True when a token is a Finnish/Swedish/Polish/German common noun.
+
+    ASCII Nordic and Polish words were previously accepted as English because
+    they carry no umlaut. That is how ``Lepakkoselvitys`` and ``Brandhammande``
+    reached the published columns.
+    """
     if not token:
         return False
     key = lookup_key(token)
     if not key or any(ch.isdigit() for ch in key):
         return False
+    if key in _ENGLISH_KEEP:
+        return False
+    if key in _FOREIGN_FUNCTION:
+        return True
     if key in _FOREIGN_TERMS:
         return True
     if _FOREIGN_LETTERS.search(token) and len(key) > 2:
         return True
-    return any(key.endswith(ending) and len(key) > len(ending) + 1
-               for ending in _FOREIGN_ENDINGS)
+    if any(key.endswith(ending) and len(key) > len(ending) + 1
+           for ending in _FOREIGN_ENDINGS):
+        return True
+    if len(key) >= 6 and _POLISH_SHAPE.search(key):
+        return True
+    if len(key) >= 8 and _SWEDISH_SHAPE.search(key):
+        return True
+    if (len(key) >= 8 and _FINNISH_SHAPE.search(key)
+            and not any(key.endswith(suffix) for suffix in _ENGLISH_SUFFIX)):
+        return True
+    return False
 
 
 def foreign_tokens_in(text: str) -> List[str]:
@@ -659,10 +720,34 @@ def foreign_tokens_in(text: str) -> List[str]:
     return [token for token in tokenise(text) if is_foreign_common_noun(token)]
 
 
+def has_non_english(text: str) -> bool:
+    """True when a published description still carries a source-language word."""
+    return bool(foreign_tokens_in(text))
+
+
 def drop_foreign_common_nouns(text: str) -> str:
     """Strip leftover foreign common nouns so an enriched column stays English."""
     kept = [token for token in tokenise(text) if not is_foreign_common_noun(token)]
     return sentence_case(" ".join(kept)) if kept else ""
+
+
+def tidy_published_english(text: str) -> str:
+    """Drop truncated leftovers and repeated words from a published description."""
+    words: List[str] = []
+    seen: Set[str] = set()
+    for token in tokenise(text):
+        key = lookup_key(token)
+        if is_foreign_common_noun(token):
+            continue
+        if (2 <= len(token) <= 3 and key not in _ENGLISH_KEEP
+                and not is_measurement_token(token) and not token.isdigit()
+                and not token.isupper()):
+            continue
+        if key in seen and key not in {"and", "or", "of", "for", "to", "with"}:
+            continue
+        seen.add(key)
+        words.append(token)
+    return sentence_case(" ".join(words)) if words else ""
 
 
 # Maximo's buyer-to-buyer scratchpad. Fortum forbade using it as a description
@@ -672,14 +757,21 @@ _INTERNAL_NOTE_HEADER = re.compile(
     r"xpointernalnote|pointernalnote|internal.?note", re.IGNORECASE)
 
 _NON_PURCHASE = re.compile(
-    r"\b("
-    r"confirmed with site manager|confirmed site manager|"
-    r"quote attached|offer attached|see attachment|see enclosure|"
-    r"according to (the )?(quote|offer|offert|contract)|"
-    r"enligt offert|tarjous liitteena|"
-    r"to stock|varastoon|"
-    r"delivery time|toimitusaika|lead time"
-    r")\b",
+    r"("
+    r"confirmed with(?: the)? (?:site manager|plant engineer)(?: on [\d./-]+)?"
+    r"|quote attached|offer attached|see attachment|see enclosure"
+    r"|according to (?:the )?(?:quote|offer|offert|contract)"
+    r"|enligt offert(?:\s+\d+)?(?:\s*,?\s*leverans(?:\s+\d+)?(?:\s+veckor)?)?"
+    r"|tarjous liitteena(?:\s*,?\s*tarjousnumero\s+\d+)?"
+    r"|zgodnie z oferta(?:\s+\d+)?"
+    r"|zgodnie oferta(?:\s+\d+)?"
+    r"|\d+\s*kpl\s+varastoon"
+    r"|varastoon(?:\s+toimitusaika(?:\s+\d+)?(?:\s+viikkoa)?)?"
+    r"|toimitusaika(?:\s+\d+)?(?:\s+viikkoa)?"
+    r"|delivery time(?:\s+\d+)?(?:\s+weeks)?"
+    r"|lead time"
+    r"|leverans(?:\s+\d+)?(?:\s+veckor)?"
+    r")",
     re.IGNORECASE,
 )
 
@@ -697,7 +789,24 @@ def is_non_purchase_text(text: str) -> bool:
     """
     if not text:
         return True
-    return bool(_NON_PURCHASE.search(text))
+    remainder = strip_non_purchase_text(text)
+    if not remainder:
+        return True
+    return bool(_NON_PURCHASE.search(text)) and not remainder
+
+
+def strip_non_purchase_text(text: str) -> str:
+    """Remove buyer notes, quote references and stock instructions.
+
+    What remains, if anything, is the actual purchase wording.
+    """
+    if not text:
+        return ""
+    cleaned = _NON_PURCHASE.sub(" ", text)
+    cleaned = re.sub(
+        r"\b(tarjousnumero|offert|oferta|quote number|offer number)\b(?:\s+\d+)?",
+        " ", cleaned, flags=re.I)
+    return _WHITESPACE.sub(" ", cleaned).strip(" -,;:|")
 
 
 # A reference number welded onto the front of a word, or a long number welded
@@ -1800,10 +1909,11 @@ def detect_language(text: str, lexicon: Optional[Lexicon] = None) -> Tuple[str, 
         for language, hits in lexicon.language_affinity(tokens).items():
             scores[language] += hits * 2.0
 
-    # An all-ASCII phrase built from common English words is English; without
-    # this, short English phrases score zero everywhere and fall through to the
-    # translation tiers unnecessarily.
-    if all(ord(ch) < 128 for ch in cleaned):
+    # An all-ASCII phrase built from common English words is English. ASCII
+    # Finnish and Polish have no umlauts, so the bonus is withheld when the
+    # tokens themselves look like source-language nouns.
+    if (all(ord(ch) < 128 for ch in cleaned)
+            and not any(is_foreign_common_noun(token) for token in tokens)):
         scores["en"] += 0.8
 
     if not scores:
@@ -2454,8 +2564,8 @@ class TranslationEngine:
 
             if (language == "en"
                     and lookup_key(english) == lookup_key(phrase)
-                    and not foreign_tokens_in(phrase)
-                    and not foreign_tokens_in(english)):
+                    and not has_non_english(phrase)
+                    and not has_non_english(english)):
                 self.results[phrase] = TranslationResult(
                     phrase, phrase, "en", confidence, "native", 1.0)
                 continue
@@ -2465,7 +2575,7 @@ class TranslationEngine:
             # leave alone anyway. Below it, a real translation is worth paying
             # for. Leftover Finnish/Swedish/Polish common nouns are never
             # accepted as done, however high the coverage.
-            if coverage >= 0.85 and not foreign_tokens_in(english):
+            if coverage >= 0.85 and not has_non_english(english):
                 self.results[phrase] = TranslationResult(
                     phrase, english, language, confidence, method, coverage, tuple(unresolved))
                 continue
@@ -2482,14 +2592,14 @@ class TranslationEngine:
         leftover = {
             phrase: (result.language, result.coverage)
             for phrase, result in self.results.items()
-            if foreign_tokens_in(result.english_text)
+            if has_non_english(result.english_text)
         }
         if leftover:
             self._run_model_tier(leftover)
 
         for phrase, result in list(self.results.items()):
-            cleaned = drop_foreign_common_nouns(result.english_text) or result.english_text
-            if cleaned != result.english_text:
+            cleaned = drop_foreign_common_nouns(result.english_text)
+            if cleaned and cleaned != result.english_text and not has_non_english(cleaned):
                 self.results[phrase] = TranslationResult(
                     result.source_text, cleaned, result.language, result.language_confidence,
                     result.method, result.coverage, result.unresolved)
@@ -2517,7 +2627,7 @@ class TranslationEngine:
                 self.results[phrase] = TranslationResult(
                     phrase, english, previous.language, previous.language_confidence,
                     "neural", max(previous.coverage, 0.9), previous.unresolved)
-                if not foreign_tokens_in(english):
+                if not has_non_english(english):
                     pending.pop(phrase, None)
 
     def _run_model_tier(self, pending: Dict[str, Tuple[str, float]]) -> None:
@@ -2601,10 +2711,56 @@ class TranslationEngine:
             return self.results[phrase]
         language, confidence = detect_language(phrase, self.lexicon)
         english, coverage, unresolved, method = self._resolve_with_vocabulary(phrase, language)
+        cleaned = drop_foreign_common_nouns(english)
+        if cleaned and not has_non_english(cleaned):
+            english = cleaned
         result = TranslationResult(phrase, english, language, confidence,
                                    method, coverage, tuple(unresolved))
         self.results[phrase] = result
         return result
+
+    def ensure_english(self, text: str) -> str:
+        """Guarantee a published string contains no source-language nouns.
+
+        Vocabulary, then the local neural model (trying Finnish/Swedish/Polish
+        if identification was unsure), then the language model, then stripping
+        leftover foreign tokens. An empty return means the line must be Unclear.
+        """
+        if not text:
+            return ""
+        language, _ = detect_language(text, self.lexicon)
+        if not has_non_english(text) and language in {"en", "und"}:
+            return tidy_published_english(text)
+
+        english, _, _, _ = self._resolve_with_vocabulary(text, language)
+        if english and not has_non_english(english):
+            return tidy_published_english(english)
+
+        candidates = [language] if language in {"fi", "sv", "pl", "de"} else []
+        for code in ("fi", "sv", "pl", "de"):
+            if code not in candidates:
+                candidates.append(code)
+        if self.settings.use_neural_translation and self.neural.enabled:
+            for code in candidates:
+                if not self.neural.available_for(code):
+                    continue
+                translated = self.neural.translate_batch([text], code).get(text, "")
+                if translated and not has_non_english(translated):
+                    return tidy_published_english(translated)
+
+        if self.model is not None and self.model.config.enabled:
+            pending = {text: (language if language in {"fi", "sv", "pl", "de"} else "fi", 0.0)}
+            self.results.setdefault(text, TranslationResult(
+                text, english or text, language, 0.0, "lexicon", 0.0))
+            self._run_model_tier(pending)
+            forced = self.results.get(text)
+            if forced and forced.english_text and not has_non_english(forced.english_text):
+                return tidy_published_english(forced.english_text)
+
+        cleaned = drop_foreign_common_nouns(english or text)
+        if cleaned and not has_non_english(cleaned):
+            return tidy_published_english(cleaned)
+        return ""
 
     def polish_composed(self, original: str, draft: str, extra: str,
                         short: str, item_or_service: str) -> Tuple[str, str, str]:
@@ -2614,9 +2770,7 @@ class TranslationEngine:
         the draft, so a second run over the same data costs nothing.
         """
         if self.model is None or not self.model.config.enabled:
-            return (drop_foreign_common_nouns(draft) or draft,
-                    drop_foreign_common_nouns(short) or short,
-                    item_or_service)
+            return draft, short, item_or_service
         if not draft:
             return draft, short, item_or_service
 
@@ -2663,8 +2817,8 @@ class TranslationEngine:
         )
         response = self.model.complete_json(prompt, payload)
         if not response:
-            return (drop_foreign_common_nouns(draft) or draft,
-                    drop_foreign_common_nouns(short) or short,
+            return (drop_foreign_common_nouns(draft),
+                    drop_foreign_common_nouns(short),
                     item_or_service)
         self.model.store(cache_key, json.dumps(response, ensure_ascii=False, sort_keys=True))
         return self._take_polish(response, draft, short, item_or_service)
@@ -2678,9 +2832,11 @@ class TranslationEngine:
         raw_description = normalise_text(parsed.get("description"))
         if item == "Unclear" and not raw_description:
             return "", "", "Unclear"
-        description = drop_foreign_common_nouns(raw_description) or drop_foreign_common_nouns(draft) or draft
+        description = drop_foreign_common_nouns(raw_description) or drop_foreign_common_nouns(draft)
         short_out = drop_foreign_common_nouns(
-            normalise_text(parsed.get("short_description"))) or drop_foreign_common_nouns(short) or short
+            normalise_text(parsed.get("short_description"))) or drop_foreign_common_nouns(short)
+        if not description:
+            return "", "", item if item == "Unclear" else (item_or_service or "Unclear")
         return sentence_case(description), sentence_case(short_out), item
 
 
@@ -3130,11 +3286,13 @@ class DescriptionSynthesiser:
         category is a much weaker statement than one derived from the line's own
         text, and the confidence score has to know the difference.
         """
-        cleaned_primary = [self._strip_noise(fragment) for fragment in english_fragments]
+        cleaned_primary = [self._strip_noise(strip_non_purchase_text(fragment))
+                           for fragment in english_fragments]
         cleaned_primary = [fragment for fragment in cleaned_primary
                            if self._is_meaningful(fragment) and not is_non_purchase_text(fragment)]
 
-        cleaned_context = [self._strip_noise(fragment) for fragment in context_fragments]
+        cleaned_context = [self._strip_noise(strip_non_purchase_text(fragment))
+                           for fragment in context_fragments]
         cleaned_context = [fragment for fragment in cleaned_context
                            if self._is_meaningful(fragment) and not is_non_purchase_text(fragment)]
 
@@ -3188,54 +3346,33 @@ class DescriptionSynthesiser:
             used_fragments=tuple(used),
             specificity=self._specificity(description),
         )
-        polished.description = drop_foreign_common_nouns(polished.description) or polished.description
-        polished.short_description = (drop_foreign_common_nouns(polished.short_description)
-                                      or polished.short_description)
         return polished
 
     def _from_fragments(self, fragments: Sequence[str]) -> Tuple[str, Tuple[str, ...]]:
-        """Merge candidate fragments into one description without repetition.
+        """Choose one description fragment rather than concatenating several.
 
-        Fragments arrive from several systems and overlap heavily. Deduplication
-        is on the lemma-free token set, which is enough to recognise that
-        "asbestos removal" and "removal of asbestos" say the same thing.
+        Merging a Finnish line with a Polish invoice article and an English
+        note is how ``Lepakkoselvitys tuulipuistoon Bat`` was published. Fully
+        English fragments win; among those, the longest informative one is kept.
         """
-        ordered = sorted(dict.fromkeys(fragments), key=lambda item: (-len(item), item))
-        selected: List[str] = []
-        seen_signatures: Set[frozenset] = set()
-        seen_words: Set[str] = set()
-
-        for fragment in ordered:
-            phrases = self.analyser.noun_phrases(fragment) or [fragment]
-            for phrase in phrases:
-                words = [word for word in tokenise(phrase)
-                         if not is_code_token(word) or is_measurement_token(word)]
-                words = [word for word in words
-                         if word.lower() not in self.analyser.stopwords
-                         or word.lower() in self._CONNECTORS]
-                if not words:
-                    continue
-
-                signature = frozenset(word.lower() for word in words)
-                if signature in seen_signatures or signature <= seen_words:
-                    continue
-                seen_signatures.add(signature)
-                seen_words |= signature
-                selected.append(" ".join(words))
-
-                if len(tokenise(" ".join(selected))) >= self.settings.max_words:
-                    break
-            if len(tokenise(" ".join(selected))) >= self.settings.max_words:
-                break
-
-        if not selected:
+        unique = [fragment for fragment in dict.fromkeys(fragments) if fragment]
+        if not unique:
             return "", ()
 
-        merged = " ".join(selected)
-        words = tokenise(merged)
+        english = [fragment for fragment in unique if not has_non_english(fragment)]
+        pool = english or unique
+        chosen = max(pool, key=lambda item: (len(tokenise(item)), len(item)))
+
+        words = [word for word in tokenise(chosen)
+                 if not is_code_token(word) or is_measurement_token(word)]
+        words = [word for word in words
+                 if word.lower() not in self.analyser.stopwords
+                 or word.lower() in self._CONNECTORS]
+        if not words:
+            return "", ()
         if len(words) > self.settings.max_words:
-            merged = " ".join(words[: self.settings.max_words])
-        return _WHITESPACE.sub(" ", merged).strip(), tuple(fragments)
+            words = words[: self.settings.max_words]
+        return _WHITESPACE.sub(" ", " ".join(words)).strip(), (chosen,)
 
     def _shorten(self, description: str) -> str:
         """Reduce a description to its head phrase for compact display."""
@@ -3497,7 +3634,10 @@ class Agent1:
                 continue
             value = resolver.value_at(row, header)
             if value and not self.lexicon.is_noise(value):
-                descriptions.append(soften_caps(value))
+                remainder = strip_non_purchase_text(value)
+                if not remainder:
+                    continue
+                descriptions.append(soften_caps(remainder))
                 descriptions_raw.append(value)
                 description_fields.append(header)
                 # One line-level field is the purchase. Concatenating the rest
@@ -3767,9 +3907,12 @@ class Agent1:
         # the model as extra evidence, not concatenated into the draft: a false
         # join is how a Finnish invoice article used to leak into an English
         # line's enriched description.
-        own = [value for value in record.own_descriptions]
-        borrowed = sorted(record.evidence.descriptions - set(own))
-        composing = own or borrowed
+        own = [strip_non_purchase_text(value) for value in record.own_descriptions]
+        own = [value for value in own if value]
+        borrowed = sorted(record.evidence.descriptions - set(record.own_descriptions))
+        borrowed = [strip_non_purchase_text(value) for value in borrowed]
+        borrowed = [value for value in borrowed if value]
+        composing = own[:1] or borrowed[:1]
 
         english_fragments: List[str] = []
         translations: List[TranslationResult] = []
@@ -3788,8 +3931,8 @@ class Agent1:
         language = translations[0].language if translations else "und"
         needs_polish = bool(
             description.description
-            and (foreign_tokens_in(description.description)
-                 or foreign_tokens_in(record.primary_text)
+            and (has_non_english(description.description)
+                 or has_non_english(record.primary_text)
                  or extra
                  or description.basis == "taxonomy"
                  or language not in {"en", "und", ""})
@@ -3805,6 +3948,18 @@ class Agent1:
             if description.item_or_service == "Unclear" and not description.description:
                 description.short_description = ""
 
+        description.description = self.translator.ensure_english(description.description)
+        description.short_description = self.translator.ensure_english(
+            description.short_description)
+        if has_non_english(description.description):
+            description.description = ""
+            description.short_description = ""
+            description.item_or_service = "Unclear"
+        elif description.description and not description.short_description:
+            description.short_description = self.synthesiser._shorten(description.description)
+        if description.item_or_service == "Unclear" and not description.description:
+            description.short_description = ""
+
         # The reported translation is the one for the line's own primary text,
         # which is what a reviewer will want to check against the source cell.
         primary_translation = translations[0] if translations else TranslationResult(
@@ -3817,8 +3972,11 @@ class Agent1:
         """Assemble one row of the unified table."""
         business = record.business
         return {
-            "Enriched_Purchase_Description": description.description,
-            "Enriched_Description_Short": description.short_description,
+            "Enriched_Purchase_Description": (
+                "" if has_non_english(description.description) else description.description),
+            "Enriched_Description_Short": (
+                "" if has_non_english(description.short_description)
+                else description.short_description),
             "Item_Or_Service": (
                 (description.item_or_service or "Unclear")
                 if record.row_type == ROW_TYPE_LINE else ""

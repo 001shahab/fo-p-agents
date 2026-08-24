@@ -19,6 +19,7 @@ feedback/
 # Derived state: caches are reproducible, registries are environment specific
 cache/
 lexicon/*_registry.json
+# Keep the controlled vocabulary in git; only generated registries stay ignored.
 
 # Synthetic test data and the results of testing against it, rebuilt on demand
 .testruns/
@@ -26,5 +27,4 @@ lexicon/*_registry.json
 # Operating system noise
 .DS_Store
 Thumbs.db
-lexicon/
 po_join_data/

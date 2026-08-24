@@ -1450,6 +1450,22 @@ def check_agent1(dataset: Dataset, results: Path) -> List[CheckResult]:
         "The description is the deliverable. A blank one is a line the agent gave up on.",
         f"{described:,} of {len(rows):,}"))
 
+    from agent1 import has_non_english
+    foreign_rows = [
+        row for row in rows
+        if has_non_english(row.get("Enriched_Purchase_Description", ""))
+        or has_non_english(row.get("Enriched_Description_Short", ""))
+    ]
+    sample = (foreign_rows[0].get("Enriched_Purchase_Description", "")[:80]
+              if foreign_rows else "")
+    checks.append(CheckResult(
+        "Enriched descriptions contain no leftover Finnish, Swedish or Polish",
+        "pass" if not foreign_rows else "fail",
+        "The published columns must be English. A source-language noun reaching "
+        "Enriched_Purchase_Description is a defect.",
+        (f"{len(foreign_rows):,} of {len(rows):,} still mixed, e.g. {sample!r}"
+         if foreign_rows else "all English")))
+
     languages = {row.get("Detected_Language", "") for row in rows} - {""}
     planted = set(dataset.facts.get("languages", []))
     found = languages & planted
@@ -2263,9 +2279,12 @@ class Harness:
 
         command = [sys.executable, "-u", str(HERE / spec.script)] + spec.command(
             dataset, results, cache)
+        if self.config.enabled:
+            command.append("--use-llm")
+        logged = spec.command(dataset, results, cache) + (
+            ["--use-llm"] if self.config.enabled else [])
         emit("phase", {"phase": "running", "label": "Working through the data"})
-        emit("log", {"line": f"$ python {spec.script} "
-                             f"{' '.join(spec.command(dataset, results, cache))}"})
+        emit("log", {"line": f"$ python {spec.script} {' '.join(logged)}"})
 
         narrator = Narrator(self.model, spec)
         log: List[str] = []
