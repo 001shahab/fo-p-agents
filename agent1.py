@@ -57,7 +57,9 @@ source systems recorded.
         agent1_unified_lines.jsonl  the same rows with the full evidence bundle
         agent1_run_manifest.json    input hashes, configuration and statistics
 
-    The unified table is the input contract for Agents 2, 3 and 4.
+    The unified table is the input contract for Agents 2, 3 and 4. For the
+    production run, point ``--input`` at Max's ``max_stage3_interpreted.csv``
+    (the master wide table) rather than at the raw extracts.
 
 Usage:
     python agent1.py
@@ -88,7 +90,7 @@ from xml.etree import ElementTree
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -554,21 +556,52 @@ def tokenise(text: str) -> List[str]:
     return _TOKEN.findall(text)
 
 
-def is_code_token(token: str) -> bool:
-    """True for tokens that are identifiers rather than words.
+# Units that sit next to a number and describe the purchase (wattage, size,
+# quantity). Kept in the enriched description; invoice-style identifiers are not.
+_MEASUREMENT_UNITS = frozenset({
+    "kw", "kwh", "mw", "gw", "w", "v", "kv", "a", "ma", "amp", "amps",
+    "mm", "cm", "m", "km", "kg", "g", "t", "ton", "tons",
+    "bar", "pa", "kpa", "mpa", "dn", "pn", "np", "nb",
+    "pcs", "pc", "kpl", "stk", "st", "l", "ml", "h", "hz", "rpm",
+})
+_MEASUREMENT_TOKEN = re.compile(
+    r"^(\d+[.,]?\d*)(" + "|".join(sorted(_MEASUREMENT_UNITS, key=len, reverse=True)) + r")$",
+    re.IGNORECASE,
+)
+_DN_PN_TOKEN = re.compile(r"^(dn|pn)\d+[a-z]?$", re.IGNORECASE)
 
-    A token counts as a code when it contains a digit, is a long unbroken run of
-    capitals, or is too short to carry meaning on its own. Codes are excluded
-    from the generated description but retained in the structured columns, so
-    nothing is lost.
+
+def is_measurement_token(token: str) -> bool:
+    """True for a quantity or rating that belongs in the purchase description."""
+    if not token:
+        return False
+    key = lookup_key(token)
+    if key in _MEASUREMENT_UNITS:
+        return True
+    if token.isdigit() and 1 <= len(token) <= 4:
+        return True
+    if _MEASUREMENT_TOKEN.match(key) or _DN_PN_TOKEN.match(key):
+        return True
+    return False
+
+
+def is_code_token(token: str) -> bool:
+    """True for opaque identifiers, not for words or purchase specifications.
+
+    Long digit runs and document-style hashes are dropped from the composed
+    description. Wattage, quantity, DN/PN size and short item numbers are kept:
+    Fortum asked that numbers which describe the purchase survive enrichment.
     """
     if not token:
         return True
-    if any(ch.isdigit() for ch in token):
+    if is_measurement_token(token):
+        return False
+    if token.isdigit():
+        return len(token) >= 6
+    if len(token) <= 1:
         return True
-    if len(token) <= 2:
-        return True
-    if token.isupper() and len(token) >= 4:
+    # Opaque document or XML identifiers, not catalogue item numbers.
+    if len(token) >= 16 and any(ch.isdigit() for ch in token):
         return True
     return False
 
@@ -583,6 +616,7 @@ _FOREIGN_ENDINGS = (
     "ningar", "heter", "elser",
     "anie", "enia", "owych", "owie",
     "ungen", "keiten", "schaft",
+    "lle", "ssa", "ssä",
 )
 
 _FOREIGN_TERMS = frozenset("""
@@ -590,10 +624,16 @@ kuljetukset kuljetus kuljetuspalvelu huolto huoltotyo huoltotyö kunnossapito
 vuokra vuokraus vuokran purku purkutyo purkutyö asbestipurku palvelu palvelut
 palvelua korjaus asennus siivous konsultointi koulutus tarkastus hankinta
 varaosa varaosat sopimus lasku tilaus työ tyot työt laite laitteet urakka
-mittaus kaytto käyttö
+mittaus kaytto käyttö toimituskulut toimitus toimitusaika varastoon
+lepakkoselvitys tuulipuistoon tuulipuisto taajuusmuuttaja vaihto vanhan
+tilalle mekaaninen tiiviste pumpulle polttimen liekinkestava suojahaalari
+tarjous liitteena tarjousnumero viikkoa
 arbete underhall underhåll reparation tjanst tjänst tjanster tjänster
 hyra uthyrning avtal faktura bestallning beställning
+inventering fladdermus vindpark miljoteknisk utredning flodesgivare
+flödesgivare genomgang genomgång justering enligt offert leverans veckor
 usluga uslugi usługa usługi usuwanie azbestu konserwacja naprawa
+uszczelka mechaniczna pompy srodowiskowa środowiskowa
 wynajem zamowienie zamówienie instalacja
 dienstleistung reparatur wartung
 """.split())
@@ -623,6 +663,41 @@ def drop_foreign_common_nouns(text: str) -> str:
     """Strip leftover foreign common nouns so an enriched column stays English."""
     kept = [token for token in tokenise(text) if not is_foreign_common_noun(token)]
     return sentence_case(" ".join(kept)) if kept else ""
+
+
+# Maximo's buyer-to-buyer scratchpad. Fortum forbade using it as a description
+# source: it carries lead times, stock instructions and "confirmed with site
+# manager", none of which is what was purchased.
+_INTERNAL_NOTE_HEADER = re.compile(
+    r"xpointernalnote|pointernalnote|internal.?note", re.IGNORECASE)
+
+_NON_PURCHASE = re.compile(
+    r"\b("
+    r"confirmed with site manager|confirmed site manager|"
+    r"quote attached|offer attached|see attachment|see enclosure|"
+    r"according to (the )?(quote|offer|offert|contract)|"
+    r"enligt offert|tarjous liitteena|"
+    r"to stock|varastoon|"
+    r"delivery time|toimitusaika|lead time"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def is_internal_note_header(header: str) -> bool:
+    """True for Maximo/Basware internal-note columns that must not be read."""
+    return bool(_INTERNAL_NOTE_HEADER.search(normalise_column(header)))
+
+
+def is_non_purchase_text(text: str) -> bool:
+    """True when the text is a note or instruction, not an item or a service.
+
+    "Confirmed with site manager" is the example Fortum gave: fluent, and still
+    not a purchase.
+    """
+    if not text:
+        return True
+    return bool(_NON_PURCHASE.search(text))
 
 
 # A reference number welded onto the front of a word, or a long number welded
@@ -1217,6 +1292,22 @@ class SourceProfile:
 # permissive ones, because its fingerprint is small.
 KNOWN_PROFILES: Tuple[SourceProfile, ...] = (
     SourceProfile(
+        name="master",
+        fingerprint=("maxrowid", "interpreteddescription", "pomatchlevel",
+                     "invoicematchlevel", "textinterpreted"),
+        description_fields=(
+            "Document line desc", "PO line desc",
+            "PO_Line_Description", "Maximo_LINE_DESCRIPTION", "Maximo_DESCRIPTION",
+            "Basware_Supplier product name",
+        ),
+        context_fields=(
+            "MaterialGroupName", "Category L4", "Category L3", "Category L2",
+            "Category L1", "PO_Category_Sub", "PO_Category_Main",
+            "Invoice_Article_Name",
+        ),
+        code_fields=("PO_Item_Code", "Maximo_ITEMNUM", "MaterialGroupNumber"),
+    ),
+    SourceProfile(
         name="sievo",
         fingerprint=("sourcerowid", "datasource", "documentlinedesc", "categoryl1",
                      "materialgroupnumber", "spendineur"),
@@ -1229,7 +1320,7 @@ KNOWN_PROFILES: Tuple[SourceProfile, ...] = (
         name="maximo",
         fingerprint=("ponum", "linedescription", "itemnum", "commoditygroup",
                      "commodity", "orderqty"),
-        description_fields=("LINE_DESCRIPTION", "DESCRIPTION", "XPOINTERNALNOTE"),
+        description_fields=("LINE_DESCRIPTION", "DESCRIPTION"),
         context_fields=("COMMODITY", "COMMODITYGROUP", "VENDOR", "POTYPE"),
         code_fields=("ITEMNUM", "COMMODITYGROUP", "CONTRACTREFNUM"),
     ),
@@ -1247,7 +1338,7 @@ KNOWN_PROFILES: Tuple[SourceProfile, ...] = (
         name="invoice",
         fingerprint=("xmlfilename", "invoicekey", "articlename", "freetext",
                      "rowtotalexclvat"),
-        description_fields=("article_name", "free_text"),
+        description_fields=("article_name",),
         context_fields=("article_id",),
         code_fields=("article_id",),
     ),
@@ -1267,7 +1358,8 @@ _DESCRIPTIVE_HINTS = ("desc", "description", "text", "name", "note", "comment",
 # even when it also matches a descriptive hint, e.g. "Supplier name".
 _DESCRIPTIVE_BLOCKERS = ("supplier", "vendor", "company", "creditor", "buyer",
                          "creator", "owner", "agent", "requester", "person",
-                         "country", "currency", "status", "file", "user")
+                         "country", "currency", "status", "file", "user",
+                         "xpointernal", "internalnote")
 
 
 def profile_table(table: Table, sample_rows: List[List[str]]) -> Tuple[SourceProfile, float]:
@@ -1313,6 +1405,8 @@ def infer_profile(table: Table, sample_rows: List[List[str]]) -> SourceProfile:
         score += distinct_ratio * 0.25
 
         key = normalise_column(header)
+        if is_internal_note_header(header):
+            continue
         if any(hint in key for hint in _DESCRIPTIVE_HINTS):
             score += 0.25
         if any(blocker in key for blocker in _DESCRIPTIVE_BLOCKERS):
@@ -2458,7 +2552,8 @@ class TranslationEngine:
             "1. The translation MUST be English. Translate every Finnish, "
             "Swedish, Polish or German common noun. Never copy a source-language "
             "word into the translation. Keep part numbers, brand names, place "
-            "names and person names as they appear.\n"
+            "names, person names, wattage, quantities and item numbers as they "
+            "appear.\n"
             "2. Translate only what is written. Never add detail that is not in "
             "the source text.\n"
             "3. Keep part numbers, order references and measurements exactly as "
@@ -2532,7 +2627,7 @@ class TranslationEngine:
             "draft_short": short,
             "draft_item_or_service": item_or_service,
         }, ensure_ascii=False)
-        cache_key = self.model.cache_key("polish_en_v1", payload)
+        cache_key = self.model.cache_key("polish_en_v2", payload)
         cached = self.model.cached(cache_key)
         if cached:
             try:
@@ -2548,18 +2643,23 @@ class TranslationEngine:
             "\"...\", \"item_or_service\": \"Material|Service|Unclear\"}.\n"
             "Rules:\n"
             "1. description, short_description and item_or_service are always "
-            "English. Translate leftover Finnish, Swedish, Polish or German "
-            "common nouns. Keep part numbers, brands, places and person names.\n"
+            "English. Translate every Finnish, Swedish, Polish or German "
+            "common noun. Never copy a source-language word. Keep part numbers, "
+            "brands, places, person names, wattage, quantities and item numbers.\n"
             "2. 'original' is the authoritative purchase line. Ignore "
-            "'extra_evidence' when it describes a different purchase (for "
-            "example an invoice article in another language that does not "
-            "match the line).\n"
-            "3. If the draft is irrelevant to 'original', rewrite it from "
+            "'extra_evidence' when it describes a different purchase, and "
+            "ignore buyer internal notes (stock instructions, lead times, "
+            "'confirmed with site manager').\n"
+            "3. If original does not name an item or a service that was "
+            "purchased, set item_or_service to Unclear and set description to "
+            "an empty string. Do not invent a product from a note or a quote "
+            "reference.\n"
+            "4. If the draft is irrelevant to 'original', rewrite it from "
             "'original' only. Do not invent detail that is not in the source.\n"
-            "4. description is a noun phrase, at most twelve words. "
-            "short_description is a compact form of the same thing.\n"
-            "5. If original is empty or a placeholder, keep a cautious English "
-            "reading of whatever category remains; do not invent a product."
+            "5. description is a noun phrase, at most twelve words, and must "
+            "keep numbers that specify the purchase (for example 55 kW).\n"
+            "6. If original is empty or a placeholder, set item_or_service to "
+            "Unclear rather than guessing from a category."
         )
         response = self.model.complete_json(prompt, payload)
         if not response:
@@ -2572,13 +2672,15 @@ class TranslationEngine:
     @staticmethod
     def _take_polish(parsed: Dict[str, Any], draft: str, short: str,
                      item_or_service: str) -> Tuple[str, str, str]:
-        description = drop_foreign_common_nouns(
-            normalise_text(parsed.get("description"))) or drop_foreign_common_nouns(draft) or draft
-        short_out = drop_foreign_common_nouns(
-            normalise_text(parsed.get("short_description"))) or drop_foreign_common_nouns(short) or short
         item = normalise_text(parsed.get("item_or_service")).title()
         if item not in {"Material", "Service", "Unclear"}:
-            item = item_or_service
+            item = item_or_service or "Unclear"
+        raw_description = normalise_text(parsed.get("description"))
+        if item == "Unclear" and not raw_description:
+            return "", "", "Unclear"
+        description = drop_foreign_common_nouns(raw_description) or drop_foreign_common_nouns(draft) or draft
+        short_out = drop_foreign_common_nouns(
+            normalise_text(parsed.get("short_description"))) or drop_foreign_common_nouns(short) or short
         return sentence_case(description), sentence_case(short_out), item
 
 
@@ -2956,8 +3058,8 @@ class DescriptionSynthesiser:
         text = _DATE_LIKE.sub(" ", text)
         text = self._BOILERPLATE.sub(" ", text)
         text = _LEADING_CODE.sub("", text)
-        text = _LONG_DIGITS.sub(" ", text)
-        text = _ALPHANUM_CODE.sub(" ", text)
+        # Long digit runs that are not a short quantity or a measurement stay
+        # out; wattage and item numbers are kept by is_measurement_token.
         text = re.sub(r"[\"'`*_<>\[\]{}()]+", " ", text)
         text = re.sub(r"\s*[-–—/|:;,]\s*", " ", text)
         return _WHITESPACE.sub(" ", text).strip()
@@ -3029,10 +3131,19 @@ class DescriptionSynthesiser:
         text, and the confidence score has to know the difference.
         """
         cleaned_primary = [self._strip_noise(fragment) for fragment in english_fragments]
-        cleaned_primary = [fragment for fragment in cleaned_primary if self._is_meaningful(fragment)]
+        cleaned_primary = [fragment for fragment in cleaned_primary
+                           if self._is_meaningful(fragment) and not is_non_purchase_text(fragment)]
 
         cleaned_context = [self._strip_noise(fragment) for fragment in context_fragments]
-        cleaned_context = [fragment for fragment in cleaned_context if self._is_meaningful(fragment)]
+        cleaned_context = [fragment for fragment in cleaned_context
+                           if self._is_meaningful(fragment) and not is_non_purchase_text(fragment)]
+
+        # A note that does not name an item or a service is Unclear, not a
+        # guess from the category the line happened to be filed under.
+        if (not cleaned_primary and english_fragments
+                and all(is_non_purchase_text(fragment) or not self._is_meaningful(self._strip_noise(fragment))
+                        for fragment in english_fragments)):
+            return DescriptionResult(item_or_service="Unclear")
 
         if cleaned_primary:
             description, used = self._from_fragments(cleaned_primary)
@@ -3097,7 +3208,8 @@ class DescriptionSynthesiser:
         for fragment in ordered:
             phrases = self.analyser.noun_phrases(fragment) or [fragment]
             for phrase in phrases:
-                words = [word for word in tokenise(phrase) if not is_code_token(word)]
+                words = [word for word in tokenise(phrase)
+                         if not is_code_token(word) or is_measurement_token(word)]
                 words = [word for word in words
                          if word.lower() not in self.analyser.stopwords
                          or word.lower() in self._CONNECTORS]
@@ -3381,11 +3493,17 @@ class Agent1:
         descriptions_raw: List[str] = []
         description_fields: List[str] = []
         for header in profile.description_fields:
+            if is_internal_note_header(header):
+                continue
             value = resolver.value_at(row, header)
             if value and not self.lexicon.is_noise(value):
                 descriptions.append(soften_caps(value))
                 descriptions_raw.append(value)
                 description_fields.append(header)
+                # One line-level field is the purchase. Concatenating the rest
+                # mixes a joined invoice article or a second system's note into
+                # the description, which is how Finnish leaked into English rows.
+                break
 
         context: List[str] = []
         for header in profile.context_fields:
@@ -3667,12 +3785,14 @@ class Agent1:
 
         description = self.synthesiser.compose(record, english_fragments, context_fragments)
         extra = " | ".join(fragment for fragment in extra_fragments if fragment)
+        language = translations[0].language if translations else "und"
         needs_polish = bool(
             description.description
             and (foreign_tokens_in(description.description)
                  or foreign_tokens_in(record.primary_text)
                  or extra
-                 or description.basis == "taxonomy")
+                 or description.basis == "taxonomy"
+                 or language not in {"en", "und", ""})
         )
         if needs_polish:
             polished, short, item = self.translator.polish_composed(
@@ -3681,7 +3801,9 @@ class Agent1:
                 description.short_description, description.item_or_service)
             description.description = polished
             description.short_description = short
-            description.item_or_service = item
+            description.item_or_service = item or "Unclear"
+            if description.item_or_service == "Unclear" and not description.description:
+                description.short_description = ""
 
         # The reported translation is the one for the line's own primary text,
         # which is what a reviewer will want to check against the source cell.
@@ -3697,7 +3819,10 @@ class Agent1:
         return {
             "Enriched_Purchase_Description": description.description,
             "Enriched_Description_Short": description.short_description,
-            "Item_Or_Service": description.item_or_service if description.description else "",
+            "Item_Or_Service": (
+                (description.item_or_service or "Unclear")
+                if record.row_type == ROW_TYPE_LINE else ""
+            ),
             "AI_Confidence": confidence if description.description else "",
             "Confidence_Band": band if description.description else "",
 
@@ -3928,12 +4053,14 @@ def build_parser() -> argparse.ArgumentParser:
             "      Prompt for each path in turn and run with the defaults.\n\n"
             "  python agent1.py --non-interactive --sources ./sources --results ./results\n"
             "      Run unattended with the local NLP stack only.\n\n"
-            "  python agent1.py --non-interactive --use-llm --max-words 10\n"
-            "      Add the language-model tier for phrases the vocabulary cannot resolve.\n"
+            "  python agent1.py --non-interactive --input ./results/max_stage3_interpreted.csv --use-llm\n"
+            "      Run against the Stage 3 master table with the language-model tier.\n"
         ),
     )
     paths = parser.add_argument_group("paths")
     paths.add_argument("--sources", metavar="DIR", help="folder holding the source data")
+    paths.add_argument("--input", metavar="PATH",
+                       help="Stage 3 master file (or folder) to enrich; overrides --sources")
     paths.add_argument("--results", metavar="DIR", help="folder to write results into")
     paths.add_argument("--lexicon", metavar="FILE", help="controlled vocabulary JSON file")
     paths.add_argument("--cache", metavar="DIR", help="folder for the model response cache")
@@ -4029,7 +4156,7 @@ def ask_amount(question: str, default: float) -> float:
 def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     """Combine defaults, command-line arguments and prompts into a settings object."""
     here = Path(__file__).resolve().parent
-    default_sources = Path(args.sources) if args.sources else here / "sources"
+    default_sources = Path(args.input or args.sources) if (args.input or args.sources) else here / "sources"
     default_results = Path(args.results) if args.results else here / "results"
     default_lexicon = Path(args.lexicon) if args.lexicon else here / "lexicon" / "procurement_lexicon.json"
     default_cache = Path(args.cache) if args.cache else here / "cache"
@@ -4043,7 +4170,8 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     if not args.non_interactive:
         print(BANNER)
         print("\nPress Enter to accept the value shown in brackets.\n")
-        default_sources = Path(ask("Source data folder", str(default_sources)))
+        default_sources = Path(ask(
+            "Source data folder or Stage 3 master file", str(default_sources)))
         default_results = Path(ask("Results folder", str(default_results)))
         default_lexicon = Path(ask("Controlled vocabulary file", str(default_lexicon)))
         default_cache = Path(ask("Cache folder", str(default_cache)))
