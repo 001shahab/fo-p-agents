@@ -37,16 +37,37 @@
     // Talking to the server
     // ----------------------------------------------------------------------
 
-    /* Handed out by /api/unlock and required by everything after it. Held here
-       and nowhere else: not in storage, not in a cookie, so closing the tab
-       ends the session and opening the page again asks for the phrase. */
+    /* Handed out by /api/unlock and required by everything after it. Kept in
+       sessionStorage rather than only in memory so that a reload mid-demo does
+       not send the presenter back to the passphrase; it is scoped to the tab, so
+       closing the tab still ends the session. */
+    var SESSION_KEY = "fortum.agents.session";
     var session = "";
+    try { session = window.sessionStorage.getItem(SESSION_KEY) || ""; } catch (e) { session = ""; }
+
+    function rememberSession(token) {
+        session = token || "";
+        try {
+            if (session) { window.sessionStorage.setItem(SESSION_KEY, session); }
+            else { window.sessionStorage.removeItem(SESSION_KEY); }
+        } catch (e) { /* private browsing; the in-memory copy still works */ }
+    }
+
+    /* Called when the server stops recognising the token, which happens if the
+       process was restarted or the token aged out. The tab returns to the gate
+       instead of showing an error it cannot act on. */
+    var onSessionLost = function () {};
 
     function api(path, options) {
         var settings = options || {};
         settings.headers = Object.assign({}, settings.headers,
             session ? { "X-Session": session } : {});
         return fetch(path, settings).then(function (response) {
+            if (response.status === 401 && path !== "/api/unlock") {
+                rememberSession("");
+                onSessionLost();
+                throw new Error("The session ended. Enter the passphrase to carry on.");
+            }
             return response.json().catch(function () {
                 return { error: "The server sent something that was not JSON." };
             }).then(function (payload) {
@@ -700,6 +721,10 @@
             });
             source.onerror = function () {
                 source.close();
+                /* An EventSource reports a rejected token the same way it reports
+                   a dropped connection, so the token is confirmed separately
+                   before the run is blamed for it. */
+                api("/api/agents").catch(function () { });
                 setRun(function (previous) {
                     if (previous.result) { return Object.assign({}, previous, { running: false }); }
                     return Object.assign({}, previous, {
@@ -837,7 +862,10 @@
     // ----------------------------------------------------------------------
 
     function App() {
-        var screen = useState("gate");
+        /* A token surviving in sessionStorage means this tab already unlocked,
+           so a reload lands on the agent list rather than on the gate. If the
+           server has since forgotten it, the first request sends us back. */
+        var screen = useState(session ? "choose" : "gate");
         var step = screen[0];
         var setStep = screen[1];
 
@@ -869,15 +897,35 @@
         var runKey = runKeyState[0];
         var setRunKey = runKeyState[1];
 
-        /* The catalogue is fetched the moment the door opens, so the welcome
-           covers the wait and the first screen is already there behind it. */
-        var open = useCallback(function (token) {
-            session = token;
-            setStep("welcome");
+        var loadCatalogue = useCallback(function () {
             api("/api/agents")
                 .then(setCatalogue)
                 .catch(function (problem) { setError(problem.message); });
         }, []);
+
+        /* The catalogue is fetched the moment the door opens, so the welcome
+           covers the wait and the first screen is already there behind it. */
+        var open = useCallback(function (token) {
+            rememberSession(token);
+            setStep("welcome");
+            loadCatalogue();
+        }, [loadCatalogue]);
+
+        useEffect(function () {
+            onSessionLost = function () {
+                setCatalogue(null);
+                setChosen(null);
+                setDataset(null);
+                setStep("gate");
+            };
+            return function () { onSessionLost = function () {}; };
+        }, []);
+
+        /* A reload restored the token but not the catalogue, so fetch it once.
+           This is also where a token the server no longer knows is discovered. */
+        useEffect(function () {
+            if (session && !catalogue && step !== "gate") { loadCatalogue(); }
+        }, [catalogue, step, loadCatalogue]);
 
         var agent = catalogue && chosen
             ? catalogue.agents.filter(function (item) { return item.key === chosen; })[0]

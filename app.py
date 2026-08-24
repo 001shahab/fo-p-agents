@@ -105,25 +105,67 @@ class Session:
     a preview while a run is streaming, and both touch the same harness.
     """
 
-    def __init__(self) -> None:
+    # Granted tokens are kept on disk as well as in memory. A hosted process
+    # restarts whenever the platform decides to, and until this was persisted a
+    # restart turned every open browser into "This session is not unlocked."
+    # with no way back except a reload. Tokens expire so the file cannot grow
+    # without bound and an old one cannot be used indefinitely.
+    TOKEN_LIFETIME = 12 * 60 * 60
+
+    def __init__(self, store: Optional[Path] = None) -> None:
         self._lock = threading.Lock()
         self._harness: Optional[Harness] = None
         self._use_model = False
-        self._tokens: Set[str] = set()
+        self._store = store
+        self._tokens: Dict[str, float] = self._read()
         self.datasets: Dict[str, Dataset] = {}
 
     # -- who is allowed in --------------------------------------------------
 
+    def _read(self) -> Dict[str, float]:
+        if self._store is None or not self._store.is_file():
+            return {}
+        try:
+            payload = json.loads(self._store.read_text(encoding="utf-8"))
+            issued = {str(token): float(when) for token, when in payload.items()}
+        except (OSError, ValueError, AttributeError):
+            return {}
+        cutoff = time.time() - self.TOKEN_LIFETIME
+        return {token: when for token, when in issued.items() if when >= cutoff}
+
+    def _write(self) -> None:
+        """Persist under the lock. A failure here must not refuse the caller."""
+        if self._store is None:
+            return
+        try:
+            self._store.parent.mkdir(parents=True, exist_ok=True)
+            self._store.write_text(json.dumps(self._tokens), encoding="utf-8")
+        except OSError:
+            pass
+
     def grant(self) -> str:
         """A token for someone who has just given the right passphrase."""
         token = secrets.token_urlsafe(24)
+        cutoff = time.time() - self.TOKEN_LIFETIME
         with self._lock:
-            self._tokens.add(token)
+            self._tokens = {held: when for held, when in self._tokens.items()
+                            if when >= cutoff}
+            self._tokens[token] = time.time()
+            self._write()
         return token
 
     def holds(self, token: str) -> bool:
+        if not token:
+            return False
         with self._lock:
-            return bool(token) and token in self._tokens
+            issued = self._tokens.get(token)
+            if issued is None:
+                return False
+            if issued < time.time() - self.TOKEN_LIFETIME:
+                del self._tokens[token]
+                self._write()
+                return False
+            return True
 
     def harness(self, use_model: bool) -> Harness:
         """The harness, rebuilt if the model setting changed."""
@@ -146,7 +188,7 @@ class Session:
             self.datasets.clear()
 
 
-SESSION = Session()
+SESSION = Session(TestAgent.WORKSPACE / "sessions.json")
 
 
 # ===========================================================================

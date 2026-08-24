@@ -813,7 +813,9 @@ _NON_PURCHASE = re.compile(
     r"("
     r"confirmed with(?: the)? (?:site manager|plant engineer)(?: on [\d./-]+)?"
     r"|quote attached|offer attached|see attachment|see enclosure"
-    r"|according to (?:the )?(?:quote|offer|offert|contract)"
+    r"|according to (?:the )?(?:quote|offer|offert|contract|agreement|order)"
+    r"|as per (?:the )?(?:quote|offer|contract|agreement|order|specification)"
+    r"|per (?:the )?(?:contract|agreement)"
     r"|enligt offert(?:\s+\d+)?(?:\s*,?\s*leverans(?:\s+\d+)?(?:\s+veckor)?)?"
     r"|tarjous liitteena(?:\s*,?\s*tarjousnumero\s+\d+)?"
     r"|zgodnie z oferta(?:\s+\d+)?"
@@ -1530,7 +1532,17 @@ _DESCRIPTIVE_HINTS = ("desc", "description", "text", "name", "note", "comment",
 _DESCRIPTIVE_BLOCKERS = ("supplier", "vendor", "company", "creditor", "buyer",
                          "creator", "owner", "agent", "requester", "person",
                          "country", "currency", "status", "file", "user",
-                         "xpointernal", "internalnote", "itemtype")
+                         "xpointernal", "internalnote", "itemtype",
+                         "code", "unspsc", "glaccount",
+                         # People, not purchases: a name in the description is
+                         # how "Requested by" ends up published as an item.
+                         "requestedby", "requested", "orderedby", "approv",
+                         "contact", "responsible", "employee", "manager")
+
+# A whole field that is a part or document reference: a few letters and then a
+# run of digits. Such a column is not free text however its header reads, and
+# publishing it produces descriptions like "Cab 7225".
+_IDENTIFIER_VALUE = re.compile(r"^[A-Za-z]{0,6}[-_/. ]?\d{3,}[A-Za-z0-9\-_/.]*$")
 
 
 def profile_table(table: Table, sample_rows: List[List[str]]) -> Tuple[SourceProfile, float]:
@@ -1582,6 +1594,10 @@ def infer_profile(table: Table, sample_rows: List[List[str]]) -> SourceProfile:
             score += 0.25
         if any(blocker in key for blocker in _DESCRIPTIVE_BLOCKERS):
             score -= 0.45
+        # Content, not wording: a column of references loses regardless of what
+        # its header claims, which is the point of profiling on the values.
+        identifiers = sum(1 for value in values if _IDENTIFIER_VALUE.match(value.strip()))
+        score -= (identifiers / len(values)) * 0.70
         scores[position] = score
 
     ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
