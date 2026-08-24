@@ -101,7 +101,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent3")
 
 AGENT_NAME = "Agent 3 - AI Material and Service Standardisation"
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.3.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -2272,7 +2272,8 @@ class Agent3:
             "Matched_Item_Supplier", "Matched_Item_Source", "Matched_Item_Unit_Price",
             "Similarity_Score", "AI_Confidence", "Match_Band", "Match_Method",
             "Match_Rationale", "Type_Compatible", "Specification_Agreement",
-            "Price_Difference_Percent", "Alternative_Matches", "Agent3_Run_Id",
+            "Price_Difference_Percent", "Alternative_Matches", "No_Match_Reason",
+            "Agent3_Run_Id",
         ]
         headers = list(self.table.headers) + [name for name in appended
                                               if name not in self.table.headers]
@@ -2314,17 +2315,19 @@ class Agent3:
 
                     if verdict != "Yes":
                         # Fortum's rule: a row that is not proposing a match must
-                        # not carry the traces of one. The rationale is the only
-                        # thing kept, because it says why there is no match.
+                        # not carry the traces of one, so every matched column is
+                        # null. Why there is no match is still worth reading, and
+                        # it goes in a column of its own rather than in a matched
+                        # column that would then read as a match after all.
                         for column in MATCHED_COLUMNS:
                             output[column] = ""
-                        output["Match_Band"] = band
-                        output["Match_Rationale"] = (
+                        output["No_Match_Reason"] = (
                             "already a standard catalogue purchase"
                             if standard == "Y" else
                             "best candidate below the reporting threshold" if best
                             else "no comparable standard item found")
                     else:
+                        output["No_Match_Reason"] = ""
                         confidence = self._confidence(best)
                         purchase_price = parse_amount(row.get("Unit_Price", ""))
                         difference = self._price_difference(purchase_price, best.item.unit_price)

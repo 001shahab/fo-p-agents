@@ -587,9 +587,13 @@ which each source system reports differently:
 A Basware free-text line is therefore `N` whatever supplier product code it
 happens to carry. `Potential_Standard_Match` then takes one of three values:
 `Yes`, `No`, or `Already standard/catalogue purchase` when `Standard_item` is
-`Y`. Whenever the answer is not `Yes`, every `Matched_*` column and every score
-is left empty, so the file cannot be read as proposing a match it did not make;
-`Match_Rationale` is kept and says why.
+`Y`. Whenever the answer is not `Yes`, every matched column is left empty — the
+five `Matched_*` fields, both scores, the band, the method, the rationale, the
+compatibility and specification verdicts, the price difference and the
+alternatives — so the file cannot be read as proposing a match it did not make.
+Why there was no match is still reported, in `No_Match_Reason`, which is a column
+of its own precisely so that nothing in the matched set has to be populated to
+carry it.
 
 ### Thresholds
 
