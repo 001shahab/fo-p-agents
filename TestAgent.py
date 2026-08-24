@@ -1715,6 +1715,30 @@ def check_agent1(dataset: Dataset, results: Path) -> List[CheckResult]:
         "generator deliberately damaged are entitled to come back Unclear.",
         f"{materials:,} goods, {services:,} services, {unclear:,} unclear"))
 
+    # A service is routinely named after the thing it is performed on, so both a
+    # service word and a material word appear: "Centrifugal pump maintenance",
+    # "Cable termination work". Counting marker words alone ties and used to send
+    # such a line to Unclear, but the line says plainly what was bought, and
+    # Fortum reserves Unclear for lines that do not.
+    from agent1 import Lexicon, tokenise, lookup_key
+    lexicon = Lexicon.load(Path("lexicon/procurement_lexicon.json"))
+    both_kinds = []
+    for row in rows:
+        description = row.get("Enriched_Purchase_Description", "")
+        tokens = set(tokenise(lookup_key(description)))
+        if tokens & lexicon.service_markers and tokens & lexicon.material_markers:
+            both_kinds.append(row)
+    undecided = [row for row in both_kinds if row.get("Item_Or_Service") == "Unclear"]
+    if both_kinds:
+        checks.append(CheckResult(
+            "A service named after the thing it acts on is still a service",
+            "pass" if not undecided else "fail",
+            "'Centrifugal pump maintenance' names a pump and a maintenance job. It is a "
+            "service, and answering Unclear because the two words cancel out wastes the "
+            "one label Fortum wants kept for lines that say nothing.",
+            f"{len(both_kinds):,} lines name both a thing and an activity, "
+            f"{len(undecided):,} left Unclear"))
+
     if dataset.facts.get("duplicate_pairs"):
         flagged = sum(1 for row in rows if row.get("Is_Duplicate", "").strip().lower()
                       in {"yes", "true", "1"})

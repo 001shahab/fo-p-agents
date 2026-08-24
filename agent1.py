@@ -3403,10 +3403,65 @@ class DescriptionSynthesiser:
         if own[0] != own[1]:
             return "Service" if own[0] > own[1] else "Material"
 
-        surrounding = self._marker_tally(" ".join(context))
+        # A tie is usually a service named after the thing it acts on: "Pump
+        # repair" counts one marker each way and is plainly a repair. Fortum
+        # reserves Unclear for a line that does not say what was bought, so
+        # counting words alone must not send such a line there. The head of an
+        # English noun phrase is its last word, and that is what was bought.
+        head = self._head_marker(text)
+        if head:
+            return head
+
+        # The head rule is deliberately not applied to the context. The context is
+        # a bag of unrelated labels, so its "last" word is an accident of the
+        # order they were collected in, not the head of a phrase, and reading one
+        # made the same input classify differently from run to run.
+        surrounding = self._marker_tally(" ".join(sorted(context)))
         if surrounding[0] != surrounding[1]:
             return "Service" if surrounding[0] > surrounding[1] else "Material"
         return "Unclear"
+
+    # A phrase that already names a charge is not clarified by adding "service",
+    # and a phrase ending in one of these reads as a fragment once a noun is
+    # stuck on the end: "Hire Charges for service", "Rounding service".
+    _CHARGE_NOUNS = frozenset({"charge", "charges", "cost", "costs", "fee", "fees",
+                               "rate", "rates", "invoice", "invoicing", "surcharge",
+                               "rounding", "adjustment", "credit", "prepayment"})
+
+    def _wants_service_suffix(self, description: str) -> bool:
+        """Whether "service" can be appended without making the text read worse.
+
+        The word is licensed by the input, so it is only added when the text does
+        not already name an activity, and only where it lands on a noun. Appending
+        after a date, a reference number or a dangling preposition produced
+        "Gas Electric Charges 10th 14th March 2024 service".
+        """
+        tokens = tokenise(lookup_key(description))
+        if not tokens:
+            return False
+        if any(token in self.lexicon.service_markers for token in tokens):
+            return False
+        last = tokens[-1]
+        if not last.isalpha() or last in self._CONNECTORS or last in self._CHARGE_NOUNS:
+            return False
+        return True
+
+    def _head_marker(self, source: str) -> str:
+        """Whether the last marker word in a phrase names an activity or a thing."""
+        haystack = lookup_key(source)
+        if not haystack:
+            return ""
+        services = self.lexicon.service_markers
+        materials = self.lexicon.material_markers
+        for token in reversed(tokenise(haystack)):
+            in_service = token in services
+            in_material = token in materials
+            # A word on both lists, such as "assembly", says nothing either way.
+            if in_service and not in_material:
+                return "Service"
+            if in_material and not in_service:
+                return "Material"
+        return ""
 
     def _marker_tally(self, source: str) -> Tuple[int, int]:
         """Count service and material marker words in one body of text."""
@@ -3477,12 +3532,9 @@ class DescriptionSynthesiser:
         # "service" is appended only when the source text actually indicated a
         # service and did not already say so. This is the one place a word is
         # added, and it is licensed by evidence in the input.
-        lowered = description.lower()
         if (item_or_service == "Service"
                 and basis == "description"
-                and not any(marker in lowered for marker in
-                            ("service", "work", "maintenance", "repair", "consulting",
-                             "rental", "training", "inspection", "cleaning", "removal"))
+                and self._wants_service_suffix(description)
                 and len(tokenise(description)) < self.settings.max_words):
             description = f"{description} service"
 

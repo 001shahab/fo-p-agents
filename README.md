@@ -425,6 +425,19 @@ nothing can be published, because the text was a note, because it would not
 render in English, or because there was no text at all, the line is `Unclear`
 rather than an empty cell or an unearned `Material`.
 
+A service is usually named after the thing it is performed on, so a line such as
+`Centrifugal pump maintenance` carries one word of each kind. Counting marker
+words alone ties, which used to send the line to `Unclear` even though it says
+plainly what was bought. The last word of an English noun phrase is its head, and
+that is what was purchased: `Pump repair` is a service, `Repair kit` is a
+material. Ties are broken that way on the line's own text only — never on the
+surrounding categories, whose order carries no meaning.
+
+The word `service` is still the only word the agent adds, and it is now added
+only where it lands on a noun. `Gas Electric Charges 10th 14th March 2024` and
+`Hire Charges for` are left as they were written rather than having a noun
+stuck on the end of a date or a dangling preposition.
+
 ---
 
 ## Agent 2 — AI purchase group, Category L5
