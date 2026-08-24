@@ -96,7 +96,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.6.0"
+AGENT_VERSION = "1.7.0"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -783,6 +783,47 @@ def keep_published_english(text: str) -> str:
     if has_non_english(text):
         return drop_foreign_common_nouns(text)
     return text
+
+
+# Sizes, ratings and ranges as purchase text writes them. Deliberately loose:
+# every match is looked up against the source line, and a span the source does
+# not contain is left exactly as it was, so a false match costs nothing.
+_SPECIFICATION_SPAN = re.compile(
+    r"\b(?:DN|PN)\s*\d+"
+    r"|\bIP\s*\d{2}\b"
+    r"|\b\d+(?:[.,]\d+)?\s*[-\u2013\s]\s*\d+(?:[.,]\d+)?\s*[A-Za-z]{1,4}\b"
+    r"|\b\d+(?:[.,]\d+)?\s*(?:kW|MW|kV|mA|mm|cm|bar|mbar|Nm|rpm|Hz|kg|V|A|W|L)\b",
+    re.IGNORECASE)
+
+
+def _specification_signature(text: str) -> str:
+    """A specification stripped to the characters that identify it."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def restore_source_specifications(published: str, *sources: str) -> str:
+    """Spell every specification the way the source line spelled it.
+
+    A published description is assembled from the folded, lower-cased form of the
+    source, because that is what the vocabulary matches on. The numbers survive
+    that, which is what Fortum asked for, but their spelling does not: ``DN50``
+    arrives as ``dn50`` and ``4-20mA`` as ``4 20ma``. Both are then copied back
+    from the source text, so nothing is guessed at and nothing is invented — a
+    span that does not appear in the source is left untouched.
+    """
+    if not published:
+        return published
+    originals: Dict[str, str] = {}
+    for source in sources:
+        for match in _SPECIFICATION_SPAN.finditer(source or ""):
+            originals.setdefault(_specification_signature(match.group(0)),
+                                 match.group(0).strip())
+    if not originals:
+        return published
+    return _SPECIFICATION_SPAN.sub(
+        lambda match: originals.get(_specification_signature(match.group(0)),
+                                    match.group(0)),
+        published)
 
 
 def tidy_published_english(text: str) -> str:
@@ -4188,12 +4229,14 @@ class Agent1:
                     band: str, factors: Dict[str, float]) -> Dict[str, Any]:
         """Assemble one row of the unified table."""
         business = record.business
+        sources = list(record.own_descriptions_raw) + [record.primary_text]
         return {
             "Enriched_Purchase_Description": (
-                "" if has_non_english(description.description) else description.description),
+                "" if has_non_english(description.description)
+                else restore_source_specifications(description.description, *sources)),
             "Enriched_Description_Short": (
                 "" if has_non_english(description.short_description)
-                else description.short_description),
+                else restore_source_specifications(description.short_description, *sources)),
             # Never blank. Fortum asked for "Unclear" rather than an empty cell,
             # and a header, subtotal or empty row is the clearest case of a line
             # that does not say what was purchased.
