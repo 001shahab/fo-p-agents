@@ -88,7 +88,7 @@ from xml.etree import ElementTree
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -571,6 +571,58 @@ def is_code_token(token: str) -> bool:
     if token.isupper() and len(token) >= 4:
         return True
     return False
+
+
+# Nordic/Polish/German letters that never belong in the enriched columns.
+_FOREIGN_LETTERS = re.compile(r"[äöåÄÖÅąćęłńóśźżĄĆĘŁŃÓŚŹŻõüÜßøæØÆ]")
+
+_FOREIGN_ENDINGS = (
+    "ukset", "uksen", "uksia", "uksella", "ukseen",
+    "minen", "mista", "mistä", "ainen", "oinen", "ellinen",
+    "työ", "työt", "tyota", "työtä",
+    "ningar", "heter", "elser",
+    "anie", "enia", "owych", "owie",
+    "ungen", "keiten", "schaft",
+)
+
+_FOREIGN_TERMS = frozenset("""
+kuljetukset kuljetus kuljetuspalvelu huolto huoltotyo huoltotyö kunnossapito
+vuokra vuokraus vuokran purku purkutyo purkutyö asbestipurku palvelu palvelut
+palvelua korjaus asennus siivous konsultointi koulutus tarkastus hankinta
+varaosa varaosat sopimus lasku tilaus työ tyot työt laite laitteet urakka
+mittaus kaytto käyttö
+arbete underhall underhåll reparation tjanst tjänst tjanster tjänster
+hyra uthyrning avtal faktura bestallning beställning
+usluga uslugi usługa usługi usuwanie azbestu konserwacja naprawa
+wynajem zamowienie zamówienie instalacja
+dienstleistung reparatur wartung
+""".split())
+
+
+def is_foreign_common_noun(token: str) -> bool:
+    """True when a token is a Finnish/Swedish/Polish/German common noun."""
+    if not token:
+        return False
+    key = lookup_key(token)
+    if not key or any(ch.isdigit() for ch in key):
+        return False
+    if key in _FOREIGN_TERMS:
+        return True
+    if _FOREIGN_LETTERS.search(token) and len(key) > 2:
+        return True
+    return any(key.endswith(ending) and len(key) > len(ending) + 1
+               for ending in _FOREIGN_ENDINGS)
+
+
+def foreign_tokens_in(text: str) -> List[str]:
+    """Common nouns in ``text`` that are not English."""
+    return [token for token in tokenise(text) if is_foreign_common_noun(token)]
+
+
+def drop_foreign_common_nouns(text: str) -> str:
+    """Strip leftover foreign common nouns so an enriched column stays English."""
+    kept = [token for token in tokenise(text) if not is_foreign_common_noun(token)]
+    return sentence_case(" ".join(kept)) if kept else ""
 
 
 # A reference number welded onto the front of a word, or a long number welded
@@ -2306,15 +2358,20 @@ class TranslationEngine:
             # in fact changes nothing, the phrase really was English.
             english, coverage, unresolved, method = self._resolve_with_vocabulary(phrase, language)
 
-            if language == "en" and lookup_key(english) == lookup_key(phrase):
+            if (language == "en"
+                    and lookup_key(english) == lookup_key(phrase)
+                    and not foreign_tokens_in(phrase)
+                    and not foreign_tokens_in(english)):
                 self.results[phrase] = TranslationResult(
                     phrase, phrase, "en", confidence, "native", 1.0)
                 continue
 
             # 0.85 is the point at which the remaining unresolved tokens are
             # typically proper nouns or place names, which a translator would
-            # leave alone anyway. Below it, a real translation is worth paying for.
-            if coverage >= 0.85:
+            # leave alone anyway. Below it, a real translation is worth paying
+            # for. Leftover Finnish/Swedish/Polish common nouns are never
+            # accepted as done, however high the coverage.
+            if coverage >= 0.85 and not foreign_tokens_in(english):
                 self.results[phrase] = TranslationResult(
                     phrase, english, language, confidence, method, coverage, tuple(unresolved))
                 continue
@@ -2327,6 +2384,21 @@ class TranslationEngine:
 
         self._run_neural_tier(pending)
         self._run_model_tier(pending)
+
+        leftover = {
+            phrase: (result.language, result.coverage)
+            for phrase, result in self.results.items()
+            if foreign_tokens_in(result.english_text)
+        }
+        if leftover:
+            self._run_model_tier(leftover)
+
+        for phrase, result in list(self.results.items()):
+            cleaned = drop_foreign_common_nouns(result.english_text) or result.english_text
+            if cleaned != result.english_text:
+                self.results[phrase] = TranslationResult(
+                    result.source_text, cleaned, result.language, result.language_confidence,
+                    result.method, result.coverage, result.unresolved)
 
         for result in self.results.values():
             self.method_counts[result.method] += 1
@@ -2351,7 +2423,8 @@ class TranslationEngine:
                 self.results[phrase] = TranslationResult(
                     phrase, english, previous.language, previous.language_confidence,
                     "neural", max(previous.coverage, 0.9), previous.unresolved)
-                pending.pop(phrase, None)
+                if not foreign_tokens_in(english):
+                    pending.pop(phrase, None)
 
     def _run_model_tier(self, pending: Dict[str, Tuple[str, float]]) -> None:
         """Send the residue to the language model, in batches, with caching."""
@@ -2360,12 +2433,13 @@ class TranslationEngine:
 
         outstanding: List[str] = []
         for phrase in sorted(pending):
-            key = self.model.cache_key("translate", phrase)
+            key = self.model.cache_key("translate_en_v2", phrase)
             cached = self.model.cached(key)
             if cached:
                 previous = self.results[phrase]
+                cleaned = drop_foreign_common_nouns(cached) or cached
                 self.results[phrase] = TranslationResult(
-                    phrase, cached, previous.language, previous.language_confidence,
+                    phrase, cleaned, previous.language, previous.language_confidence,
                     "model", 1.0, ())
             else:
                 outstanding.append(phrase)
@@ -2381,15 +2455,21 @@ class TranslationEngine:
             "concise English. These are industrial and energy sector purchases: "
             "materials, spare parts, maintenance work and professional services.\n"
             "Rules:\n"
-            "1. Translate only what is written. Never add detail that is not in "
+            "1. The translation MUST be English. Translate every Finnish, "
+            "Swedish, Polish or German common noun. Never copy a source-language "
+            "word into the translation. Keep part numbers, brand names, place "
+            "names and person names as they appear.\n"
+            "2. Translate only what is written. Never add detail that is not in "
             "the source text.\n"
-            "2. Keep part numbers, order references and measurements exactly as "
+            "3. Keep part numbers, order references and measurements exactly as "
             "they appear.\n"
-            "3. Return a noun phrase describing what was purchased, not a "
+            "4. Return a noun phrase describing what was purchased, not a "
             "sentence and not an explanation.\n"
-            "4. If the text carries no meaning, return it unchanged.\n"
+            "5. If the text carries no meaning, return it unchanged only when it "
+            "is already English; otherwise translate it.\n"
             'Reply with JSON: {"translations": {"<source>": "<english>"}}. '
-            "Every key must be reproduced exactly as given."
+            "Every key must be reproduced exactly as given. Every value must be "
+            "English."
         )
 
         batch_size = max(1, self.model.config.batch_size)
@@ -2404,10 +2484,12 @@ class TranslationEngine:
             if not isinstance(translations, dict):
                 continue
             for phrase in batch:
-                english = normalise_text(translations.get(phrase, ""))
+                english = drop_foreign_common_nouns(
+                    normalise_text(translations.get(phrase, ""))) or normalise_text(
+                    translations.get(phrase, ""))
                 if not english:
                     continue
-                self.model.store(self.model.cache_key("translate", phrase), english)
+                self.model.store(self.model.cache_key("translate_en_v2", phrase), english)
                 previous = self.results[phrase]
                 self.results[phrase] = TranslationResult(
                     phrase, english, previous.language, previous.language_confidence,
@@ -2428,6 +2510,76 @@ class TranslationEngine:
                                    method, coverage, tuple(unresolved))
         self.results[phrase] = result
         return result
+
+    def polish_composed(self, original: str, draft: str, extra: str,
+                        short: str, item_or_service: str) -> Tuple[str, str, str]:
+        """Ask the model to confirm a composed description is English and relevant.
+
+        Used for the three published columns. Cached on the original line plus
+        the draft, so a second run over the same data costs nothing.
+        """
+        if self.model is None or not self.model.config.enabled:
+            return (drop_foreign_common_nouns(draft) or draft,
+                    drop_foreign_common_nouns(short) or short,
+                    item_or_service)
+        if not draft:
+            return draft, short, item_or_service
+
+        payload = json.dumps({
+            "original": original,
+            "extra_evidence": extra,
+            "draft_description": draft,
+            "draft_short": short,
+            "draft_item_or_service": item_or_service,
+        }, ensure_ascii=False)
+        cache_key = self.model.cache_key("polish_en_v1", payload)
+        cached = self.model.cached(cache_key)
+        if cached:
+            try:
+                parsed = json.loads(cached)
+                return self._take_polish(parsed, draft, short, item_or_service)
+            except json.JSONDecodeError:
+                pass
+
+        prompt = (
+            "You review an enriched purchase description. The three output "
+            "fields MUST be English.\n"
+            "Return JSON: {\"description\": \"...\", \"short_description\": "
+            "\"...\", \"item_or_service\": \"Material|Service|Unclear\"}.\n"
+            "Rules:\n"
+            "1. description, short_description and item_or_service are always "
+            "English. Translate leftover Finnish, Swedish, Polish or German "
+            "common nouns. Keep part numbers, brands, places and person names.\n"
+            "2. 'original' is the authoritative purchase line. Ignore "
+            "'extra_evidence' when it describes a different purchase (for "
+            "example an invoice article in another language that does not "
+            "match the line).\n"
+            "3. If the draft is irrelevant to 'original', rewrite it from "
+            "'original' only. Do not invent detail that is not in the source.\n"
+            "4. description is a noun phrase, at most twelve words. "
+            "short_description is a compact form of the same thing.\n"
+            "5. If original is empty or a placeholder, keep a cautious English "
+            "reading of whatever category remains; do not invent a product."
+        )
+        response = self.model.complete_json(prompt, payload)
+        if not response:
+            return (drop_foreign_common_nouns(draft) or draft,
+                    drop_foreign_common_nouns(short) or short,
+                    item_or_service)
+        self.model.store(cache_key, json.dumps(response, ensure_ascii=False, sort_keys=True))
+        return self._take_polish(response, draft, short, item_or_service)
+
+    @staticmethod
+    def _take_polish(parsed: Dict[str, Any], draft: str, short: str,
+                     item_or_service: str) -> Tuple[str, str, str]:
+        description = drop_foreign_common_nouns(
+            normalise_text(parsed.get("description"))) or drop_foreign_common_nouns(draft) or draft
+        short_out = drop_foreign_common_nouns(
+            normalise_text(parsed.get("short_description"))) or drop_foreign_common_nouns(short) or short
+        item = normalise_text(parsed.get("item_or_service")).title()
+        if item not in {"Material", "Service", "Unclear"}:
+            item = item_or_service
+        return sentence_case(description), sentence_case(short_out), item
 
 
 # ===========================================================================
@@ -2917,7 +3069,7 @@ class DescriptionSynthesiser:
             description = f"{description} service"
 
         short = self._shorten(description)
-        return DescriptionResult(
+        polished = DescriptionResult(
             description=sentence_case(description),
             short_description=sentence_case(short),
             item_or_service=item_or_service,
@@ -2925,6 +3077,10 @@ class DescriptionSynthesiser:
             used_fragments=tuple(used),
             specificity=self._specificity(description),
         )
+        polished.description = drop_foreign_common_nouns(polished.description) or polished.description
+        polished.short_description = (drop_foreign_common_nouns(polished.short_description)
+                                      or polished.short_description)
+        return polished
 
     def _from_fragments(self, fragments: Sequence[str]) -> Tuple[str, Tuple[str, ...]]:
         """Merge candidate fragments into one description without repetition.
@@ -3489,22 +3645,43 @@ class Agent1:
         if record.row_type != ROW_TYPE_LINE:
             return DescriptionResult(), TranslationResult("", "", "und", 0.0, "none", 0.0)
 
-        # Own text first, then corroborating text from the other systems.
+        # Own text first. Borrowed fragments from other systems are offered to
+        # the model as extra evidence, not concatenated into the draft: a false
+        # join is how a Finnish invoice article used to leak into an English
+        # line's enriched description.
         own = [value for value in record.own_descriptions]
         borrowed = sorted(record.evidence.descriptions - set(own))
-        ordered_descriptions = own + borrowed
+        composing = own or borrowed
 
         english_fragments: List[str] = []
         translations: List[TranslationResult] = []
-        for fragment in ordered_descriptions:
+        for fragment in composing:
             result = self.translator.translate(fragment)
             english_fragments.append(result.english_text)
             translations.append(result)
 
+        extra_fragments = [self.translator.translate(value).english_text
+                           for value in borrowed] if own else []
         context_fragments = [self.translator.translate(value).english_text
                              for value in sorted(record.evidence.context)]
 
         description = self.synthesiser.compose(record, english_fragments, context_fragments)
+        extra = " | ".join(fragment for fragment in extra_fragments if fragment)
+        needs_polish = bool(
+            description.description
+            and (foreign_tokens_in(description.description)
+                 or foreign_tokens_in(record.primary_text)
+                 or extra
+                 or description.basis == "taxonomy")
+        )
+        if needs_polish:
+            polished, short, item = self.translator.polish_composed(
+                record.primary_text or (own[0] if own else ""),
+                description.description, extra,
+                description.short_description, description.item_or_service)
+            description.description = polished
+            description.short_description = short
+            description.item_or_service = item
 
         # The reported translation is the one for the line's own primary text,
         # which is what a reviewer will want to check against the source cell.

@@ -112,7 +112,7 @@ except ImportError:
 
 
 AGENT_NAME = "Max - wide procurement dataset builder"
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 
 BANNER = f"""
 ===============================================================================
@@ -385,6 +385,69 @@ def compact_key(value: Any) -> str:
 def tokenise(text: str) -> List[str]:
     """Split into word tokens, keeping digits attached to their word."""
     return _TOKEN.findall(text)
+
+
+# Nordic/Polish/German letters that never appear in English output columns.
+_FOREIGN_LETTERS = re.compile(r"[äöåÄÖÅąćęłńóśźżĄĆĘŁŃÓŚŹŻõüÜßøæØÆ]")
+
+# Inflectional endings that mark a Finnish, Swedish, Polish or German common
+# noun. Kept conservative so English words such as "planning" or "training"
+# are not treated as foreign.
+_FOREIGN_ENDINGS = (
+    "ukset", "uksen", "uksia", "uksella", "ukseen",
+    "minen", "mista", "mistä", "ainen", "oinen", "ellinen",
+    "työ", "työt", "tyota", "työtä",
+    "ningar", "heter", "elser",
+    "anie", "enia", "owych", "owie",
+    "ungen", "keiten", "schaft",
+)
+
+# Frequent procurement words that leak into English columns when the local
+# reader treats a Title Case Finnish token as a proper noun. The list is the
+# last line of defence, not a vocabulary.
+_FOREIGN_TERMS = frozenset("""
+kuljetukset kuljetus kuljetuspalvelu huolto huoltotyo huoltotyö kunnossapito
+vuokra vuokraus vuokran purku purkutyo purkutyö asbestipurku palvelu palvelut
+palvelua korjaus asennus siivous konsultointi koulutus tarkastus hankinta
+varaosa varaosat sopimus lasku tilaus työ tyot työt laite laitteet urakka
+mittaus kaytto käyttö
+arbete underhall underhåll reparation tjanst tjänst tjanster tjänster
+hyra uthyrning avtal faktura bestallning beställning
+usluga uslugi usługa usługi usuwanie azbestu konserwacja naprawa
+wynajem zamowienie zamówienie instalacja
+dienstleistung reparatur wartung
+""".split())
+
+
+def is_foreign_common_noun(token: str) -> bool:
+    """True when a token is a Finnish/Swedish/Polish/German common noun.
+
+    Proper nouns (places, people, brands) and part numbers return False: they
+    are the same in English and must be left alone. Common nouns must not
+    appear in the interpreted columns.
+    """
+    if not token:
+        return False
+    key = lookup_key(token)
+    if not key or any(ch.isdigit() for ch in key):
+        return False
+    if key in _FOREIGN_TERMS:
+        return True
+    if _FOREIGN_LETTERS.search(token) and len(key) > 2:
+        return True
+    return any(key.endswith(ending) and len(key) > len(ending) + 1
+               for ending in _FOREIGN_ENDINGS)
+
+
+def foreign_tokens_in(text: str) -> List[str]:
+    """Common nouns in ``text`` that are not English."""
+    return [token for token in tokenise(text) if is_foreign_common_noun(token)]
+
+
+def drop_foreign_common_nouns(text: str) -> str:
+    """Remove leftover foreign common nouns so an output column stays English."""
+    kept = [token for token in tokenise(text) if not is_foreign_common_noun(token)]
+    return sentence_case(" ".join(kept)) if kept else ""
 
 
 def sentence_case(text: str) -> str:
@@ -1596,6 +1659,9 @@ class TextInterpreter:
             lookup_key(prose), self._proper_nouns(prose) if language == "en" else set())
         result.resolved_share = resolved / total if total else 0.0
         result.token_count = total
+        # Foreign common nouns stay on the reading so the model can translate
+        # them; they are stripped from the published columns if the model is
+        # off or does not answer.
         result.description = sentence_case(english)
         result.method = "vocabulary" if resolved else ("passthrough" if english else "none")
 
@@ -1821,7 +1887,10 @@ class TextInterpreter:
         names: Set[str] = set()
         for position, match in enumerate(_TOKEN.finditer(prose)):
             word = match.group(0)
-            if position and word[:1].isupper():
+            # A Title Case Finnish common noun such as Kuljetukset is not a
+            # name. Treating it as one is how untranslated words used to survive
+            # into Interpreted_Description on mixed-language rows.
+            if position and word[:1].isupper() and not is_foreign_common_noun(word):
                 names.add(lookup_key(word))
         return names
 
@@ -1874,6 +1943,13 @@ class TextInterpreter:
             # of the word list is required: inferring it from the detected
             # language would let a whole untranslated Finnish line through as
             # understood on the strength of one ambiguous token.
+            if is_foreign_common_noun(token):
+                # Kept so the model can see what was there, but not counted as
+                # understood, so mixed-language lines fall through to the model
+                # instead of being accepted as English.
+                if len(token) > 2:
+                    rendered.append(token)
+                continue
             if token in self.english_words or token in names:
                 if len(token) > 2 or token in _STOPWORDS["en"]:
                     rendered.append(token)
@@ -2322,22 +2398,58 @@ def extract_json_object(content: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+_MODEL_CACHE_PREFIX = "read_en_v2"
+
 _MODEL_SYSTEM_PROMPT = (
     "You read short procurement free-text lines written in Finnish, Swedish, "
     "Polish, German or English and describe what was bought.\n"
+    "EVERY value you return MUST be English. Translate every Finnish, Swedish, "
+    "Polish or German common noun. Never copy a source-language word into any "
+    "field. Keep part numbers, brand names, place names and person names as they "
+    "are; translate everything else.\n"
     "Return JSON only, in the form {\"items\": [{\"id\": \"...\", "
     "\"description\": \"...\", \"type\": \"Material|Service\", "
     "\"intent\": \"...\"}]}.\n"
     "Rules:\n"
-    "- description: plain English, at most twelve words, naming the goods or "
-    "the activity. No invoice numbers, no supplier names, no prices.\n"
+    "- description: plain English noun phrase, at most twelve words, naming the "
+    "goods or the activity. No invoice numbers, no supplier names, no prices, "
+    "no source-language words.\n"
+    "- Use the 'text' field as the authoritative purchase line. The optional "
+    "'context' field may come from a different document after a join; ignore "
+    "it when it does not describe the same purchase.\n"
+    "- If 'text' is only a category or material group, keep that category in "
+    "English and do not invent a specific item.\n"
     "- type: Material for a physical item, Service for an activity.\n"
-    "- intent: a short category such as Maintenance and repair, Spare parts and "
-    "materials, Consulting and advisory, Travel and accommodation, Freight and "
-    "delivery, Rental and leasing, Training and certification, Licences and "
-    "subscriptions, Fees and charges. Use an empty string when unsure.\n"
+    "- intent: a short English category such as Maintenance and repair, Spare "
+    "parts and materials, Consulting and advisory, Travel and accommodation, "
+    "Freight and delivery, Rental and leasing, Training and certification, "
+    "Licences and subscriptions, Fees and charges. Use an empty string when "
+    "unsure. Intent must be English.\n"
     "- Return one entry for every id supplied, in the same order. Never invent "
     "detail that is not present in the text."
+)
+
+_MODEL_REVIEW_PROMPT = (
+    "You review procurement interpretations for two faults: leftover "
+    "non-English words, and a description that does not match the purchase "
+    "line.\n"
+    "EVERY value you return MUST be English. Translate leftover Finnish, "
+    "Swedish, Polish or German common nouns. Keep part numbers, brands, place "
+    "names and person names.\n"
+    "Return JSON only, in the form {\"items\": [{\"id\": \"...\", "
+    "\"description\": \"...\", \"type\": \"Material|Service\", "
+    "\"intent\": \"...\"}]}.\n"
+    "Rules:\n"
+    "- 'text' is the authoritative purchase line. Ignore 'context' when it "
+    "describes a different purchase (for example an invoice article in another "
+    "language that does not match the line).\n"
+    "- If the draft description is irrelevant to 'text', rewrite it from "
+    "'text' only.\n"
+    "- If 'text' is empty or a placeholder, use a cautious English reading of "
+    "whatever category remains; do not invent a product.\n"
+    "- description: English noun phrase, at most twelve words.\n"
+    "- type and intent: English, same allowed values as the reader prompt.\n"
+    "- Return one entry for every id, in the same order. Never invent detail."
 )
 
 
@@ -2354,13 +2466,23 @@ class ModelReader:
         self.settings = settings
         self.resolved = 0
 
-    def resolve(self, texts: Sequence[str]) -> Dict[str, Dict[str, str]]:
-        """Read a list of distinct strings, returning text -> fields."""
+    def resolve(self, texts: Sequence[str],
+                contexts: Optional[Dict[str, str]] = None,
+                review: bool = False) -> Dict[str, Dict[str, str]]:
+        """Read a list of distinct strings, returning text -> fields.
+
+        ``contexts`` is optional extra evidence, keyed by the same string as
+        ``texts``. It is sent to the model but is not part of the cache key:
+        the purchase line is what was bought, and a joined invoice article
+        must not produce a different description of the same line.
+        """
         answers: Dict[str, Dict[str, str]] = {}
         pending: List[str] = []
+        contexts = contexts or {}
+        prefix = "review_en_v1" if review else _MODEL_CACHE_PREFIX
 
         for text in texts:
-            cached = self.client.cached(self.client.cache_key("read", text))
+            cached = self.client.cached(self.client.cache_key(prefix, text))
             if cached is not None:
                 try:
                     answers[text] = json.loads(cached)
@@ -2376,26 +2498,30 @@ class ModelReader:
         # Sorted so that the batching, and therefore the cache keys of any
         # future run over the same data, are identical every time.
         pending.sort()
+        prompt = _MODEL_REVIEW_PROMPT if review else _MODEL_SYSTEM_PROMPT
         for start in range(0, len(pending), batch_size):
             batch = pending[start:start + batch_size]
             if not self.client.config.enabled:
                 break
-            resolved = self._ask(batch)
+            resolved = self._ask(batch, contexts, prompt)
             for text, fields in resolved.items():
                 answers[text] = fields
-                self.client.store(self.client.cache_key("read", text),
+                self.client.store(self.client.cache_key(prefix, text),
                                   json.dumps(fields, ensure_ascii=False, sort_keys=True))
             self.resolved += len(resolved)
-            LOGGER.info("Model read %d of %d unresolved descriptions.",
+            LOGGER.info("Model %s %d of %d descriptions.",
+                        "reviewed" if review else "read",
                         min(start + batch_size, len(pending)), len(pending))
         return answers
 
-    def _ask(self, batch: Sequence[str]) -> Dict[str, Dict[str, str]]:
+    def _ask(self, batch: Sequence[str], contexts: Dict[str, str],
+             prompt: str) -> Dict[str, Dict[str, str]]:
         identifiers = {stable_hash(text): text for text in batch}
-        payload = {"items": [{"id": key, "text": value}
-                             for key, value in sorted(identifiers.items())]}
-        response = self.client.complete_json(
-            _MODEL_SYSTEM_PROMPT, json.dumps(payload, ensure_ascii=False))
+        payload = {"items": [
+            {"id": key, "text": value, "context": contexts.get(value, "")}
+            for key, value in sorted(identifiers.items())
+        ]}
+        response = self.client.complete_json(prompt, json.dumps(payload, ensure_ascii=False))
         if not response:
             return {}
 
@@ -2406,14 +2532,15 @@ class ModelReader:
             text = identifiers.get(normalise_text(item.get("id")))
             if text is None:
                 continue
-            description = normalise_text(item.get("description"))
+            description = drop_foreign_common_nouns(normalise_text(item.get("description")))
             if not description:
                 continue
             item_type = normalise_text(item.get("type")).title()
+            intent = drop_foreign_common_nouns(normalise_text(item.get("intent")))
             results[text] = {
-                "description": sentence_case(description),
+                "description": description,
                 "type": item_type if item_type in {"Material", "Service"} else "",
-                "intent": normalise_text(item.get("intent")),
+                "intent": intent,
             }
         return results
 
@@ -2811,27 +2938,26 @@ class PurchaseOrderJoiner:
 # Orchestration
 # ===========================================================================
 
-# The free-text fields read in stage 3, in the order they are consulted, each
-# marked as describing the purchase or merely supporting it.
+# The free-text fields read in stage 3, in the order they are consulted.
 #
-# Descriptive fields say what was bought and are the only ones allowed to shape
-# the generated description. Supporting fields — the buyer's note to a
-# colleague, the free-text column on the invoice line — are worth reading for
-# the dates, references, quantities and lead times they carry, but folding them
-# into the description turns "Bearing replacement" into "Bearing replacement
-# order urgent to stock by link". They are scanned for values and then set
-# aside.
-TEXT_SOURCE_COLUMNS: Tuple[Tuple[str, str, bool], ...] = (
-    ("Document line desc", "sievo.document-line", True),
-    ("PO line desc", "sievo.po-line", True),
-    ("Invoice_Article_Name", "invoice.article", True),
-    ("Invoice_Article_Names_All", "invoice.articles", True),
-    ("PO_Line_Description", "po.line", True),
-    ("PO_Header_Description", "po.header", True),
-    ("MaterialGroupName", "sievo.material-group", True),
-    ("PO_Item_Code", "po.item", False),
-    ("PO_Internal_Note", "po.note", False),
-    ("Invoice_Free_Text", "invoice.free-text", False),
+# Primary fields say what was bought and are the only ones that shape the
+# generated description when they are populated. Fallback fields — a joined
+# invoice article, a material group — are used only when the line itself is
+# silent. Concatenating a joined invoice onto a filled line is what used to
+# turn a UK "Booking Fee" into "Booking fee kuljetukset" after a false join.
+# Supporting fields (notes, invoice free text, item codes) are scanned for
+# dates, references and quantities, then set aside.
+TEXT_SOURCE_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
+    ("Document line desc", "sievo.document-line", "primary"),
+    ("PO line desc", "sievo.po-line", "primary"),
+    ("PO_Line_Description", "po.line", "primary"),
+    ("PO_Header_Description", "po.header", "primary"),
+    ("Invoice_Article_Name", "invoice.article", "fallback"),
+    ("Invoice_Article_Names_All", "invoice.articles", "fallback"),
+    ("MaterialGroupName", "sievo.material-group", "fallback"),
+    ("PO_Item_Code", "po.item", "supporting"),
+    ("PO_Internal_Note", "po.note", "supporting"),
+    ("Invoice_Free_Text", "invoice.free-text", "supporting"),
 )
 
 
@@ -3052,18 +3178,46 @@ class Builder:
             # The model is asked about the descriptive text only, and asked once
             # per distinct string: two rows whose notes differ but whose
             # description is the same are one question, not two.
-            residue = sorted({
-                key[0] or key[1] for key, reading in readings.items()
-                if reading.confidence < self.settings.interpretation_floor
-                and reading.token_count >= 2
-            } - {""})
-            LOGGER.info("Stage 3: %d of %d readings fell below the confidence floor, "
-                        "giving %d distinct strings to ask about.",
+            residue: List[str] = []
+            contexts: Dict[str, str] = {}
+            for key, reading in readings.items():
+                describing, supporting = key
+                subject = describing or supporting
+                if not subject:
+                    continue
+                contexts[subject] = supporting if describing else ""
+                if self._needs_model(reading, describing, supporting):
+                    residue.append(subject)
+            residue = sorted(set(residue))
+            LOGGER.info("Stage 3: %d of %d readings need the model "
+                        "(%d below the confidence floor, remainder leftover "
+                        "non-English or mixed evidence).",
+                        len(residue), len(readings),
                         sum(1 for reading in readings.values()
-                            if reading.confidence < self.settings.interpretation_floor),
-                        len(readings), len(residue))
+                            if reading.confidence < self.settings.interpretation_floor))
+            reader = ModelReader(self.model, self.settings)
             if residue:
-                model_answers = ModelReader(self.model, self.settings).resolve(residue)
+                model_answers = reader.resolve(residue, contexts)
+
+            # Second pass: anything that still is not English, or whose extra
+            # evidence looks like a different purchase, is reviewed explicitly.
+            review_texts: List[str] = []
+            for key, reading in readings.items():
+                describing, supporting = key
+                subject = describing or supporting
+                if not subject:
+                    continue
+                preview = ((model_answers.get(subject) or {}).get("description")
+                           or reading.description)
+                if (foreign_tokens_in(preview)
+                        or self._looks_unrelated(describing, supporting)):
+                    review_texts.append(subject)
+            review_texts = sorted(set(review_texts))
+            if review_texts:
+                LOGGER.info("Stage 3: reviewing %d description(s) for English "
+                            "and relevance.", len(review_texts))
+                model_answers.update(
+                    reader.resolve(review_texts, contexts, review=True))
 
         weak = sum(1 for reading in readings.values()
                    if reading.confidence < self.settings.interpretation_floor)
@@ -3112,18 +3266,50 @@ class Builder:
                answer: Optional[Dict[str, str]]) -> Dict[str, str]:
         """Combine a local reading with the model's answer, if there is one.
 
-        The model replaces only the prose: the description, and the two labels
-        when the local reader had none. Every extracted value stays as the rules
-        found it, because those are exact and the model's are not.
+        The model replaces the prose fields. Extracted values stay as the rules
+        found them, because those are exact and the model's are not. Foreign
+        common nouns are stripped from every published prose column so a Finnish
+        leftover cannot reach the output even when the model is off.
         """
         result = Interpretation(**{**reading.__dict__, "sources": sources})
         if answer:
             result.description = answer.get("description") or result.description
-            result.item_or_service = result.item_or_service or answer.get("type", "")
-            result.intent = result.intent or answer.get("intent", "")
+            if answer.get("type"):
+                result.item_or_service = answer.get("type", "")
+            if answer.get("intent"):
+                result.intent = answer.get("intent", "")
             result.method = "model"
             result.confidence = max(result.confidence, 0.60)
+        result.description = drop_foreign_common_nouns(result.description)
+        result.intent = drop_foreign_common_nouns(result.intent)
+        result.keywords = self.interpreter._keywords(result.description)
         return result.as_columns()
+
+    def _needs_model(self, reading: Interpretation, describing: str, supporting: str) -> bool:
+        """Whether the local reading is not yet a safe English description."""
+        if not (describing or supporting):
+            return False
+        if (reading.confidence < self.settings.interpretation_floor
+                and reading.token_count >= 1):
+            return True
+        if foreign_tokens_in(reading.description) or foreign_tokens_in(describing):
+            return True
+        if reading.language and reading.language not in {"en", ""}:
+            return True
+        if reading.method in {"passthrough", "none"} and reading.token_count >= 1:
+            return True
+        return False
+
+    @staticmethod
+    def _looks_unrelated(describing: str, supporting: str) -> bool:
+        """True when extra evidence shares no content words with the line."""
+        if not describing or not supporting:
+            return False
+        primary = {lookup_key(token) for token in tokenise(describing)
+                   if len(token) > 3 and not any(ch.isdigit() for ch in token)}
+        extra = {lookup_key(token) for token in tokenise(supporting)
+                 if len(token) > 3 and not any(ch.isdigit() for ch in token)}
+        return bool(primary) and bool(extra) and not (primary & extra)
 
     @staticmethod
     def _read_rows(path: Path) -> Iterator[Dict[str, str]]:
@@ -3136,13 +3322,16 @@ class Builder:
         """Collect the row's free text, in priority order, without repetition.
 
         Returns the descriptive text, the supporting text and the list of
-        fields that contributed.
+        fields that contributed. A filled purchase line is never concatenated
+        with a joined invoice article: that mix is how a false join used to
+        leak Finnish into an English description.
         """
-        describing: List[str] = []
+        primary: List[str] = []
+        fallback: List[str] = []
         supporting: List[str] = []
         used: List[str] = []
         seen: Set[str] = set()
-        for column, label, is_descriptive in TEXT_SOURCE_COLUMNS:
+        for column, label, role in TEXT_SOURCE_COLUMNS:
             value = normalise_text(row.get(column, ""))
             if not value or is_blank(value):
                 continue
@@ -3150,9 +3339,18 @@ class Builder:
             if key in seen:
                 continue
             seen.add(key)
-            (describing if is_descriptive else supporting).append(value)
+            if role == "primary":
+                primary.append(value)
+            elif role == "fallback":
+                fallback.append(value)
+            else:
+                supporting.append(value)
             used.append(label)
-        return " | ".join(describing), " | ".join(supporting), "; ".join(used)
+        describing = " | ".join(primary) if primary else " | ".join(fallback)
+        extra = list(supporting)
+        if primary:
+            extra = fallback + extra
+        return describing, " | ".join(extra), "; ".join(used)
 
     # -- reporting ----------------------------------------------------------
 
