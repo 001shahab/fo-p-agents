@@ -457,9 +457,19 @@ removal*, this keeps "asbestos" and "removal" and drops the rest, producing
 actually purchased. The language model is offered the few groups where this
 produces a weak name, and nothing else.
 
+Words that say how a purchase was fulfilled rather than what was purchased —
+`delivery`, `incl. delivery`, `for site use`, `replacement`, `supply of`,
+`(standard)` — are removed before the signature is taken. `Bat survey for wind
+site incl. delivery` therefore lands in the same group as `Bat survey for wind
+site` instead of becoming a category of its own. A line whose only content word
+is one of them keeps it, because that line really did buy a delivery, and
+`power supply` keeps its head noun.
+
 The threshold adapts per category to land within the target group count. Lines
 that cannot be grouped confidently go to `Other` rather than being forced into a
-group they do not belong in.
+group they do not belong in. The number of Category L5 names is capped at 6000
+including `Other`; groups are ranked by the spend behind them and anything past
+the ceiling joins `Other`, so no row leaves the analysis.
 
 Useful options:
 
@@ -470,6 +480,7 @@ Useful options:
 | `--no-adaptive` | fix the threshold instead of adapting it |
 | `--bucket-level` | cluster within L1, L2, L3, L4 or `auto` |
 | `--max-label-words` | words in a group name (default 5) |
+| `--max-total-groups` | ceiling on L5 names including `Other` (default 6000) |
 
 ### Output
 

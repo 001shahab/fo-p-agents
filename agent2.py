@@ -91,7 +91,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent2")
 
 AGENT_NAME = "Agent 2 - AI Purchase Group (Category L5)"
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -203,6 +203,11 @@ class Settings:
     max_label_words: int = 5
     bucket_level: str = "auto"          # auto | l4 | l3 | l2 | l1
     max_bucket_size: int = 6000
+
+    # Fortum's ceiling on the number of Category L5 names, counting "Other" as
+    # one of them. Everything below the line is folded into "Other" rather than
+    # dropped, so no row leaves the analysis.
+    max_total_groups: int = 6000
 
     write_jsonl: bool = True
     verbose: bool = False
@@ -645,6 +650,33 @@ class SignatureBuilder:
             return token[:-1]
         return token
 
+    # How a purchase was fulfilled rather than what was purchased. Fortum asked
+    # that "Bat survey wind site delivery" group with "Bat survey wind site"
+    # instead of becoming a category of its own, so these words are removed
+    # before a signature is taken and therefore never split a group or reach a
+    # label. They are removed only while something else remains: a line whose
+    # only content word is "delivery" really did buy a delivery.
+    _FULFILMENT_LEMMAS = frozenset({
+        "delivery", "deliveries", "deliver", "delivered", "shipment",
+        "shipping", "dispatch", "use", "usage", "replacement", "standard",
+        "inclusive", "included",
+    })
+
+    # Fulfilment words that are only noise when they lead. "Supply of gaskets"
+    # is a gasket purchase, but a "power supply" is a component, so this set is
+    # stripped from the front of a description and nowhere else.
+    _LEADING_FULFILMENT_LEMMAS = frozenset({"supply", "supplies", "provision"})
+
+    @classmethod
+    def drop_fulfilment(cls, lemmas: Sequence[str]) -> Tuple[str, ...]:
+        """Remove words that describe fulfilment rather than the purchase."""
+        kept = [lemma for lemma in lemmas if lemma not in cls._FULFILMENT_LEMMAS]
+        if not kept:
+            return tuple(lemmas)
+        while len(kept) > 1 and kept[0] in cls._LEADING_FULFILMENT_LEMMAS:
+            kept = kept[1:]
+        return tuple(kept)
+
     def lemmas(self, text: str) -> Tuple[str, ...]:
         """Content lemmas of a description, in the order they appear.
 
@@ -678,7 +710,7 @@ class SignatureBuilder:
 
         # Deduplicate while preserving first appearance: a description that
         # repeats a word says no more than one that states it once.
-        result = tuple(dict.fromkeys(lemmas))
+        result = self.drop_fulfilment(list(dict.fromkeys(lemmas)))
         self._cache[key] = result
         return result
 
@@ -1891,6 +1923,88 @@ class Agent2:
                 group.label, group.naming_method = proposed, "model"
                 self.statistics["groups_named_by_model"] += 1
 
+    # -- consolidation ------------------------------------------------------
+
+    def merge_equivalent_labels(self) -> None:
+        """Fold together groups whose names differ only by a fulfilment word.
+
+        Signatures already ignore those words, so this catches the remaining
+        route to a near-duplicate name: a label the model proposed after the
+        groups were formed. The surviving group is the one with the most lines
+        behind it, and it takes the shorter of the two names.
+        """
+        by_key: Dict[Tuple[str, Tuple[str, ...]], List[PurchaseGroup]] = defaultdict(list)
+        for group in self.groups.values():
+            if group.group_id == OTHER_GROUP_ID:
+                continue
+            key = self.builder.drop_fulfilment(self.builder.lemmas(group.label))
+            if key:
+                by_key[(group.bucket, key)].append(group)
+
+        merged = 0
+        for members in by_key.values():
+            if len(members) < 2:
+                continue
+            members.sort(key=lambda g: (-g.row_count, -g.spend, len(g.label), g.group_id))
+            survivor = members[0]
+            for group in members[1:]:
+                if len(group.label) < len(survivor.label):
+                    survivor.label = group.label
+                survivor.signatures |= group.signatures
+                survivor.descriptions.extend(group.descriptions)
+                survivor.row_count += group.row_count
+                survivor.spend += group.spend
+                survivor.cohesion = min(survivor.cohesion, group.cohesion)
+                for signature in group.signatures:
+                    self.signature_to_group[signature] = survivor.group_id
+                del self.groups[group.group_id]
+                merged += 1
+
+        if merged:
+            self.statistics["groups_merged_by_label"] = merged
+            LOGGER.info("Merged %d group(s) whose name differed only by a "
+                        "fulfilment word such as delivery or site use.", merged)
+
+    def enforce_group_cap(self) -> None:
+        """Hold the number of Category L5 names at Fortum's ceiling.
+
+        Groups are ranked by the spend behind them, so the names that survive
+        are the ones a category manager would act on first. Everything past the
+        ceiling joins "Other", which occupies one of the places itself.
+        """
+        cap = self.settings.max_total_groups
+        if cap <= 0:
+            return
+
+        named = [group for group in self.groups.values()
+                 if group.group_id != OTHER_GROUP_ID]
+        if len(named) <= cap - 1:
+            return
+
+        named.sort(key=lambda g: (-g.spend, -g.row_count, g.label, g.group_id))
+        demoted = named[cap - 1:]
+
+        other = self.groups.get(OTHER_GROUP_ID)
+        if other is None:
+            other = PurchaseGroup(group_id=OTHER_GROUP_ID, label=OTHER_GROUP_LABEL,
+                                  bucket=demoted[0].bucket, is_new=True,
+                                  naming_method="cap")
+            self.groups[OTHER_GROUP_ID] = other
+
+        for group in demoted:
+            other.signatures |= group.signatures
+            other.descriptions.extend(group.descriptions)
+            other.row_count += group.row_count
+            other.spend += group.spend
+            for signature in group.signatures:
+                self.signature_to_group[signature] = OTHER_GROUP_ID
+            del self.groups[group.group_id]
+
+        self.statistics["groups_folded_into_other"] = len(demoted)
+        LOGGER.info(
+            "Category L5 is capped at %d names including 'Other'; %d group(s) "
+            "below the spend line were folded into 'Other'.", cap, len(demoted))
+
     # -- persistence --------------------------------------------------------
 
     def commit_registry(self) -> None:
@@ -1963,7 +2077,11 @@ class Agent2:
                             "AI_Purchase_Group_Confidence": confidence,
                             "AI_Purchase_Group_Band": band,
                             "AI_Purchase_Group_Size": group.row_count,
-                            "AI_Purchase_Group_Category": group.bucket,
+                            # "Other" spans every category, so the row keeps its
+                            # own category path rather than the group's.
+                            "AI_Purchase_Group_Category": (
+                                self._category_bucket(row)
+                                if group.group_id == OTHER_GROUP_ID else group.bucket),
                             "AI_Purchase_Group_Cohesion": round(group.cohesion, 3),
                             "AI_Purchase_Group_Naming": group.naming_method,
                             "AI_Purchase_Group_Is_New": "Yes" if group.is_new else "No",
@@ -2097,6 +2215,8 @@ class Agent2:
         self.collect()
         self.group()
         self.refine_labels()
+        self.merge_equivalent_labels()
+        self.enforce_group_cap()
         self.commit_registry()
         return self.write()
 
@@ -2152,6 +2272,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help="word budget for a group label (default 5)")
     grouping.add_argument("--max-bucket-size", type=int, default=6000,
                           help="new descriptions per category before splitting (default 6000)")
+    grouping.add_argument("--max-total-groups", type=int, default=6000,
+                          help="ceiling on Category L5 names including 'Other'; "
+                               "groups below the spend line join 'Other' "
+                               "(default 6000, 0 disables the ceiling)")
 
     tiers = parser.add_argument_group("processing tiers")
     tiers.add_argument("--no-embeddings", action="store_true",
@@ -2272,6 +2396,7 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         max_label_words=args.max_label_words,
         bucket_level=args.bucket_level,
         max_bucket_size=args.max_bucket_size,
+        max_total_groups=args.max_total_groups,
         write_jsonl=not args.no_jsonl,
         verbose=args.verbose,
         interactive=not args.non_interactive,
