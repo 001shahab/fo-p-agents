@@ -721,6 +721,25 @@ available from Nordic Automation; the second says only half of Nordic
 Automation's is available from Drive Systems. Drive Systems is the one to
 consolidate away.
 
+### Partners in another country
+
+Fortum has asked to *consider* restricting suggestions by country and has not
+settled it. Until it is settled, the run reports the cross-border pairs rather
+than withholding them, and says how many there are:
+
+```
+  Cross-border best    : 26 of 181 rows name a partner in another country
+    Pass --same-country-only to withhold those; Same_Country says which they are.
+```
+
+That is the figure the decision turns on, and `Same_Country` names the rows.
+`--same-country-only` applies the restriction, and a supplier whose country is
+unknown is treated as foreign rather than assumed local. Country also breaks a
+tie in the partner ranking — where two partners cover the same share, the
+domestic one is easier to consolidate onto — but never more than that. Promoting
+a domestic partner over one that genuinely covers more would put a lower number
+at the top of a row than the row itself reports.
+
 ### Bands
 
 The client asked the agent to propose the ranges rather than be given them. The
@@ -1121,6 +1140,17 @@ line: `Flow transmitter DN50 4-20mA`.
 
 `python TestAgent.py --agent agent1` fails if any entry breaks this, so the rule
 is enforced against the file rather than trusted to review.
+
+Agent 1 also puts the spelling back. Enrichment matches on the folded,
+lower-cased text, so a surviving `DN50` would otherwise be published as `dn50`
+and `4-20mA` as `4 20ma`. Each specification in a published description is
+copied from the source line, and a span the source does not contain is left
+alone, so nothing is guessed at:
+
+```
+Virtauslahetin DN50 4-20mA   ->  Flow transmitter DN50 4-20mA
+Virtauslahetin               ->  Flow transmitter
+```
 
 ---
 

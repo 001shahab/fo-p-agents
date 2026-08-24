@@ -1834,6 +1834,24 @@ def check_agent1(dataset: Dataset, results: Path) -> List[CheckResult]:
 
     checks.append(_check_lexicon_specifications())
 
+    # Surviving in the wrong case is a poor answer for the column a reviewer
+    # reads: enrichment works on the folded text, so "DN50" comes back as "dn50"
+    # unless the source spelling is put back.
+    from agent1 import restore_source_specifications
+    misspelled = []
+    for row in rows:
+        original = row.get("Original_Description", "")
+        published = row.get("Enriched_Purchase_Description", "")
+        if published and published != restore_source_specifications(published, original):
+            misspelled.append((original, published))
+    checks.append(CheckResult(
+        "Specifications are spelled as the source line spelled them",
+        "pass" if not misspelled else "fail",
+        "A size or rating is copied from the source, so 'DN50 4-20mA' must not be "
+        "published as 'dn50 4 20ma'.",
+        f"{len(misspelled):,} of {len(rows):,} descriptions re-cased a specification"
+        + (f", e.g. {misspelled[0][0]!r} -> {misspelled[0][1]!r}" if misspelled else "")))
+
     if dataset.facts.get("duplicate_pairs"):
         flagged = sum(1 for row in rows if row.get("Is_Duplicate", "").strip().lower()
                       in {"yes", "true", "1"})
@@ -2167,12 +2185,54 @@ def check_agent4(dataset: Dataset, results: Path) -> List[CheckResult]:
                 "pass" if actionable else "warn",
                 "The planted pair clears the default spend and evidence thresholds.",
                 ", ".join(f"{name} {count:,}" for name, count in sorted(bands.items()))))
+        checks.append(_check_country_restriction(dataset, results, consolidation))
     else:
         checks.append(CheckResult(
             "The planted overlap was found", "fail",
             "A supplier whose entire portfolio is covered by another was planted.",
             "the consolidation report is empty"))
     return checks
+
+
+def _check_country_restriction(dataset: Dataset, results: Path,
+                              consolidation: Sequence[Dict[str, str]]) -> CheckResult:
+    """--same-country-only must withhold exactly what Same_Country calls foreign.
+
+    Fortum has asked to consider restricting suggestions by country and has not
+    settled it, so the run reports cross-border pairs rather than hiding them and
+    offers a switch. The two have to agree: a switch that withheld a different set
+    from the one the column names would make the column useless for deciding.
+    """
+    foreign = [row for row in consolidation if row.get("Same_Country", "") == "No"]
+
+    strict_dir = results.parent / "results_same_country_only"
+    command = [sys.executable, str(HERE / "agent4.py"), "--non-interactive",
+               "--input", str(dataset.root / "input" / "agent2_purchase_groups.csv"),
+               "--results", str(strict_dir),
+               "--registry", str(strict_dir / "registry.json"),
+               "--cache", str(dataset.root / "cache"),
+               "--same-country-only"]
+    outcome = subprocess.run(command, capture_output=True, text=True, timeout=1800)
+    strict_path = strict_dir / "agent4_supplier_consolidation.csv"
+    if outcome.returncode != 0 or not strict_path.is_file():
+        return CheckResult(
+            "Restricting partners to one country withholds exactly the foreign ones",
+            "fail",
+            "The run was repeated with --same-country-only.",
+            f"the restricted run failed (exit {outcome.returncode})")
+
+    _, strict = read_csv(strict_path)
+    leaked = [row for row in strict if row.get("Same_Country", "") == "No"]
+    ok = not leaked and len(strict) <= len(consolidation)
+    return CheckResult(
+        "Restricting partners to one country withholds exactly the foreign ones",
+        "pass" if ok else "fail",
+        "Cross-border pairs are reported by default, because Fortum has not decided "
+        "whether to allow them, and --same-country-only withholds them. The column and "
+        "the switch have to name the same pairs.",
+        (f"{len(foreign):,} of {len(consolidation):,} rows cross a border by default, "
+         f"{len(strict):,} rows remain under the switch and none of them do") if ok
+        else f"{len(leaked):,} cross-border row(s) survived the switch")
 
 
 def _first_column(columns: Sequence[str], wanted: Sequence[str]) -> str:

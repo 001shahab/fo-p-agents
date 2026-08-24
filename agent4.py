@@ -114,7 +114,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent4")
 
 AGENT_NAME = "Agent 4 - AI Supplier Consolidation"
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -236,6 +236,14 @@ class Settings:
     # both suppliers: a portfolio of two lines cannot evidence a portfolio
     # claim, and neither can a partner who bought the shared item twice.
     min_evidence_lines: int = 3
+
+    # Whether a partner in another country may be suggested at all. Fortum has
+    # asked to consider restricting suggestions by country and has not settled
+    # it, so the restriction is available and off: cross-border pairs are
+    # reported with Same_Country set to No, and the summary says how many best
+    # partners are foreign, which is the figure the decision turns on. Silently
+    # withholding suggestions would answer a question that is still open.
+    same_country_only: bool = False
 
     # Partial credit between two distinct purchase groups. Below this the two
     # are treated as unrelated; the value is deliberately high because a false
@@ -1216,6 +1224,17 @@ class Portfolio:
         ranked = sorted(self.weights.items(), key=lambda item: (-item[1], item[0]))
         return [space.items[key].label for key, _ in ranked[:count]]
 
+    def dominant_country(self) -> str:
+        """Where this supplier does most of its trade in this scope.
+
+        Ties are broken alphabetically so that the answer does not depend on the
+        order the lines happened to arrive in.
+        """
+        if not self.countries:
+            return ""
+        best = max(self.countries.values())
+        return sorted(name for name, count in self.countries.items() if count == best)[0]
+
 
 class PortfolioBuilder:
     """Aggregates purchase lines into supplier portfolios, one set per scope.
@@ -1420,6 +1439,7 @@ class Overlap:
     similarity_band: str = "Low"
     consolidation: str = "Low"
     adjudication: str = ""
+    same_country: bool = False       # both trade mostly in the same country
 
     @property
     def mutual(self) -> float:
@@ -1488,6 +1508,8 @@ class OverlapEngine:
         for supplier_key in sorted(portfolios):
             reaches[supplier_key] = self._reach(supplier_key, portfolios, index, crowded)
 
+        countries = {key: portfolios[key].dominant_country() for key in sorted(portfolios)}
+
         results: Dict[str, List[Overlap]] = {}
         for supplier_key in sorted(reaches):
             overlaps: List[Overlap] = []
@@ -1495,8 +1517,18 @@ class OverlapEngine:
                 forward = reaches[supplier_key][partner_key]
                 if forward.coverage < self.settings.report_similarity:
                     continue
+                # Both countries have to be known before two suppliers can be
+                # called domestic to each other. An unknown country is reported
+                # as a difference rather than assumed away, and under the strict
+                # switch it is not enough to keep the pair.
+                home, away = countries.get(supplier_key, ""), countries.get(partner_key, "")
+                shares_country = bool(home) and home == away
+                if self.settings.same_country_only and not shares_country:
+                    self.statistics["pairs_dropped_as_cross_border"] += 1
+                    continue
                 backward = reaches.get(partner_key, {}).get(supplier_key)
                 overlaps.append(Overlap(
+                    same_country=shares_country,
                     partner_key=partner_key,
                     coverage=forward.coverage,
                     reverse_coverage=backward.coverage if backward else 0.0,
@@ -1513,11 +1545,18 @@ class OverlapEngine:
                 continue
             # Coverage first, because that is what the row reports and a ranking
             # that disagreed with its own headline number would be unreadable.
-            # Where two partners cover the same share, the one with more of its
-            # own trade behind the overlap is the better answer.
-            overlaps.sort(key=lambda entry: (-entry.coverage, -entry.partner_lines,
+            # Where two partners cover the same share, a supplier in the same
+            # country is the easier one to consolidate onto, and after that the
+            # one with more of its own trade behind the overlap is the better
+            # answer. Country only ever breaks a tie: promoting a domestic
+            # partner over one that genuinely covers more would put a smaller
+            # number at the top of the row than the row itself reports.
+            overlaps.sort(key=lambda entry: (-entry.coverage, not entry.same_country,
+                                             -entry.partner_lines,
                                              -entry.addressable_spend, entry.partner_key))
             results[supplier_key] = overlaps[:self.settings.max_partners_retained]
+            if overlaps and not overlaps[0].same_country:
+                self.statistics["best_partner_in_another_country"] += 1
         return results
 
     def _reach(self, supplier_key: str, portfolios: Dict[str, Portfolio],
@@ -2300,6 +2339,7 @@ class Agent4:
                 "min_addressable_spend": self.settings.min_addressable_spend,
                 "item_similarity_floor": self.settings.item_similarity_floor,
             },
+            "same_country_only": self.settings.same_country_only,
             "environment": describe_environment(),
             "statistics": statistics,
             "outputs": outputs,
@@ -2352,8 +2392,14 @@ class Agent4:
                     for entry in overlaps[1:1 + self.settings.top_partners]
                     if entry.partner_key in by_key)
 
-                supplier_country = portfolio.countries.most_common(1)
-                partner_country = portfolios[best.partner_key].countries.most_common(1)
+                # Taken from the overlap, which resolved it once with a stable
+                # tie-break. Reading most_common() here made the answer depend on
+                # the order the lines arrived in whenever a supplier traded
+                # equally in two countries.
+                home = portfolio.dominant_country()
+                away = portfolios[best.partner_key].dominant_country()
+                same_country = ("" if not home or not away
+                                else "Yes" if best.same_country else "No")
 
                 rows.append([
                     scope.level, scope.value,
@@ -2370,7 +2416,7 @@ class Agent4:
                     format_percent(best.mutual),
                     round(best.addressable_spend, 2),
                     best.exact_items, best.similar_items, best.partner_lines,
-                    self._same(supplier_country, partner_country),
+                    same_country,
                     self._same_text(supplier.dominant_business_area(),
                                     partner.dominant_business_area()),
                     len(overlaps), others,
@@ -2392,12 +2438,6 @@ class Agent4:
             str(row[4]),
         ))
         return rows
-
-    @staticmethod
-    def _same(left: Sequence[Tuple[str, int]], right: Sequence[Tuple[str, int]]) -> str:
-        if not left or not right:
-            return ""
-        return "Yes" if left[0][0] == right[0][0] else "No"
 
     @staticmethod
     def _same_text(left: str, right: str) -> str:
@@ -2643,6 +2683,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "credit (default 0.75)")
     bands.add_argument("--top-partners", type=int, default=5,
                        help="alternative suppliers listed per row (default 5)")
+    bands.add_argument("--same-country-only", action="store_true",
+                       help="suggest a partner only where both suppliers trade mostly "
+                            "in the same country; off by default, and the summary "
+                            "reports how many best partners are foreign either way")
 
     limits = parser.add_argument_group("limits")
     limits.add_argument("--item-cap", type=int, default=60_000,
@@ -2786,6 +2830,7 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         report_similarity=args.report_similarity,
         min_addressable_spend=args.min_addressable_spend,
         min_evidence_lines=args.min_evidence_lines,
+        same_country_only=args.same_country_only,
         item_similarity_floor=args.item_similarity_floor,
         top_partners=args.top_partners,
         item_cap=args.item_cap,
@@ -2880,6 +2925,19 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
         print(f"    High is a partner covering at least "
               f"{format_percent(settings.high_similarity)}% of a supplier's portfolio "
               f"with at least {settings.min_addressable_spend:,.0f} EUR at stake.")
+
+    # Fortum is still deciding whether a partner in another country counts as a
+    # suggestion at all, so the size of the question is reported either way.
+    rows_total = statistics.get("supplier_scope_rows", 0)
+    if settings.same_country_only:
+        dropped = statistics.get("pairs_dropped_as_cross_border", 0)
+        print(f"  Cross-border pairs   : {dropped:,} withheld by --same-country-only")
+    elif rows_total:
+        foreign = statistics.get("best_partner_in_another_country", 0)
+        print(f"  Cross-border best    : {foreign:,} of {rows_total:,} rows name a "
+              f"partner in another country")
+        print("    Pass --same-country-only to withhold those; Same_Country says which "
+              "they are.")
 
     adjudicated = statistics.get("pairs_adjudicated", 0)
     if adjudicated:
