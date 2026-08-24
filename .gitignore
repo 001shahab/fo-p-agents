@@ -10,9 +10,11 @@ __pycache__/
 # Client data and generated output never belong in version control
 sources/
 results/
+feedback/
 
 # Credentials
 .env
+*.jsonl
 
 # Derived state: caches are reproducible, registries are environment specific
 cache/
