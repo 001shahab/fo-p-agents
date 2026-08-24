@@ -1129,7 +1129,8 @@ UNIFIED_SUBSET: Tuple[str, ...] = (
     "Enriched_Purchase_Description", "Enriched_Description_Short", "Item_Or_Service",
     "AI_Confidence", "Detected_Language", "Original_Description",
     "Source_System", "Document_Number", "Document_Line_Number", "PO_Number",
-    "PO_Line_Number", "Item_Number", "Item_Type", "Supplier_Id", "Supplier_Name",
+    "PO_Line_Number", "Item_Number", "Stock_Item_Number", "Item_Type",
+    "Supplier_Id", "Supplier_Name",
     "Category_L1", "Category_L2", "Category_L3", "Category_L4",
     "Material_Group_Number", "Material_Group_Name", "Business_Area", "Division",
     "Company_Code", "Company_Name", "Country", "Quantity", "Unit", "Unit_Price",
@@ -1159,10 +1160,13 @@ def _standard_item_fields(rng: random.Random, concept: Concept,
         # Present either way: a free-text Basware line still carries the
         # supplier's product code, and it must not be read as a catalogue line.
         item_number = f"{concept.key[:3].upper()}-{rng.randrange(1000, 9999)}"
+        stock_number = ""
     else:
         item_type = ""
         item_number = f"{rng.randrange(100000, 999999)}" if already_standard else ""
-    return {"Source_System": system, "Item_Type": item_type, "Item_Number": item_number}
+        stock_number = item_number
+    return {"Source_System": system, "Item_Type": item_type,
+            "Item_Number": item_number, "Stock_Item_Number": stock_number}
 
 
 def _unified_row(index: int, concept: Concept, supplier: Supplier, site: Site,
@@ -1879,11 +1883,12 @@ def check_agent3(dataset: Dataset, results: Path) -> List[CheckResult]:
         for row in rows:
             source = row.get("Source_System", "").lower()
             item_type = row.get("Item_Type", "").strip().lower()
-            has_number = bool(row.get("Item_Number", "").strip())
+            stocked = bool(row.get("Stock_Item_Number", "").strip()
+                           or ("maximo" in source and row.get("Item_Number", "").strip()))
             if "basware" in source:
                 want = "Y" if item_type in {"external webshop", "market place"} else "N"
             elif "maximo" in source:
-                want = "Y" if has_number else "N"
+                want = "Y" if stocked else "N"
             else:
                 continue
             if row.get("Standard_item", "").strip() != want:

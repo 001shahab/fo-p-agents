@@ -1298,6 +1298,10 @@ EMPTY_MARKERS = frozenset({
 })
 
 ITEM_TYPE_COLUMN = "Item_Type"
+# Maximo's ITEMNUM, isolated by Agent 1 from the general-purpose item key. A
+# Basware supplier product code is an item number too and must not be read as
+# evidence that a line came off a catalogue.
+STOCK_NUMBER_COLUMN = "Stock_Item_Number"
 ITEM_NUMBER_COLUMN = "Item_Number"
 
 # Basware item types that mean the line was raised against a catalogue and is
@@ -2229,19 +2233,25 @@ class Agent3:
         item type: a line raised from an external webshop or a marketplace came
         off a catalogue, and a free-text line did not, whatever supplier product
         code it happens to carry. Maximo has no item type and says it by
-        carrying an item number at all, because only a stocked item has one.
-        The merged master table can be told either way.
+        carrying an ITEMNUM at all, because only a stocked item has one. The
+        merged master table carries both and can be told either way.
         """
         source = normalise_text(row.get("Source_System", "")).lower()
         item_type = normalise_text(row.get(ITEM_TYPE_COLUMN, "")).lower().strip(" .")
         catalogue_type = item_type in CATALOGUE_ITEM_TYPES
-        has_item_number = is_populated(row.get(ITEM_NUMBER_COLUMN, ""))
+
+        # On a Maximo extract the general item key *is* the ITEMNUM, so it is
+        # accepted there and nowhere else.
+        stock_number = row.get(STOCK_NUMBER_COLUMN, "")
+        if not is_populated(stock_number) and "maximo" in source:
+            stock_number = row.get(ITEM_NUMBER_COLUMN, "")
+        has_stock_number = is_populated(stock_number)
 
         if "basware" in source:
             return "Y" if catalogue_type else "N"
         if "maximo" in source:
-            return "Y" if has_item_number else "N"
-        return "Y" if catalogue_type or has_item_number else "N"
+            return "Y" if has_stock_number else "N"
+        return "Y" if catalogue_type or has_stock_number else "N"
 
     # -- output -------------------------------------------------------------
 

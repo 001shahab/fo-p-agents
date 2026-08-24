@@ -417,6 +417,14 @@ only free text was a buyer note — Fortum's `Confirmed with site manager` — i
 reported as `Unclear` with an empty description rather than guessed from its
 category or its supplier.
 
+Two rules keep that promise. Columns that name a party or a person — `Supplier
+name`, `Requested by`, `Approved by` — are never read as purchase text, in an
+inferred profile or a declared one, so a note-only line cannot fall through and
+be published as its supplier's name. And `Item_Or_Service` is never blank: when
+nothing can be published, because the text was a note, because it would not
+render in English, or because there was no text at all, the line is `Unclear`
+rather than an empty cell or an unearned `Material`.
+
 ---
 
 ## Agent 2 — AI purchase group, Category L5

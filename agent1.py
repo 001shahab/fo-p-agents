@@ -96,7 +96,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.5.0"
+AGENT_VERSION = "1.6.0"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -191,6 +191,7 @@ UNIFIED_COLUMNS: Tuple[str, ...] = (
     "PO_Line_Number",
     "Invoice_Number",
     "Item_Number",
+    "Stock_Item_Number",
     "Item_Type",
     "Supplier_Id",
     "Supplier_Name",
@@ -1403,12 +1404,22 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "po_number": ("ponumber", "ordernumber", "ponum", "purchaseordernumber", "poid"),
     "po_line_number": ("polinenumber", "polinenum", "polinenumber", "polinenr"),
     "invoice_number": ("invoicenumber", "invoiceid", "invoiceno", "invoicekey"),
-    "item_number": ("itemnum", "itemid", "articleid", "materialnumber",
-                    "supplierproductcode", "itemcode", "itemnumber"),
+    # The master table prefixes every column with the system it came from, so
+    # both the bare and the prefixed spellings are listed.
+    "item_number": ("itemnum", "maximoitemnum", "itemnumber", "itemid",
+                    "baswareitemid", "articleid", "materialnumber",
+                    "supplierproductcode", "baswaresupplierproductcode",
+                    "itemcode", "poitemcode"),
+    # Only a number that means the item is stocked or catalogued. Fortum's rule
+    # for Maximo is that any ITEMNUM makes the line a standard purchase, and a
+    # Basware supplier product code must not be mistaken for one: a free-text
+    # Basware line carries a product code and is still not a catalogue purchase.
+    "stock_item_number": ("itemnum", "maximoitemnum", "stocknum", "maximostocknum",
+                          "maximoitemnumber"),
     # Basware records how a line was raised. Agent 3 turns "External webshop"
-    # and "Market place" into Standard_item = Yes, so the value has to survive
-    # the unified table rather than being read from the extract a second time.
-    "item_type": ("itemtype", "itemtypename", "lineitemtype", "baswareitemtype",
+    # and "Market place" into Standard_item = Y, so the value has to survive the
+    # unified table rather than being read from the extract a second time.
+    "item_type": ("itemtype", "baswareitemtype", "itemtypename", "lineitemtype",
                   "purchasingtype", "requisitiontype"),
     "supplier_id": ("erpsuppliernumber", "suppliercode", "vendorid", "suppliernumber",
                     "vendornum", "supplierid"),
@@ -1544,6 +1555,23 @@ _DESCRIPTIVE_BLOCKERS = ("supplier", "vendor", "company", "creditor", "buyer",
 # publishing it produces descriptions like "Cab 7225".
 _IDENTIFIER_VALUE = re.compile(r"^[A-Za-z]{0,6}[-_/. ]?\d{3,}[A-Za-z0-9\-_/.]*$")
 
+# Naming a party or a person is never describing a purchase. These columns read
+# like free text and score like it — long, wordy, highly distinct — so a penalty
+# is not enough: "Supplier name" outscored the penalty and became a fallback
+# description field, which is how a line whose only text was "As per contract"
+# came back published as "Safeline Workwear". Fortum's rule is that such a line
+# is Unclear, so these columns are refused outright.
+_NEVER_DESCRIPTIVE = ("supplier", "vendor", "creditor", "company", "customer",
+                      "buyer", "creator", "owner", "requester", "requestedby",
+                      "requested", "orderedby", "approver", "approvedby",
+                      "contact", "responsible", "employee", "manager", "person",
+                      "user")
+
+
+def is_never_descriptive(header: str) -> bool:
+    """True when a column names a party or a person rather than a purchase."""
+    return any(token in normalise_column(header) for token in _NEVER_DESCRIPTIVE)
+
 
 def profile_table(table: Table, sample_rows: List[List[str]]) -> Tuple[SourceProfile, float]:
     """Identify which system a table came from, inferring a profile if unknown."""
@@ -1588,7 +1616,7 @@ def infer_profile(table: Table, sample_rows: List[List[str]]) -> SourceProfile:
         score += distinct_ratio * 0.25
 
         key = normalise_column(header)
-        if is_internal_note_header(header):
+        if is_internal_note_header(header) or is_never_descriptive(header):
             continue
         if any(hint in key for hint in _DESCRIPTIVE_HINTS):
             score += 0.25
@@ -1631,6 +1659,7 @@ class ColumnResolver:
             if key and key not in self._by_key:
                 self._by_key[key] = position
         self._resolved: Dict[str, Optional[int]] = {}
+        self._candidates: Dict[str, List[int]] = {}
 
     def position_of(self, header_name: str) -> Optional[int]:
         """Index of a column addressed by its literal name."""
@@ -1683,6 +1712,38 @@ class ColumnResolver:
             return ""
         return row[position]
 
+    def positions(self, logical_field: str) -> List[int]:
+        """Every column that could carry a logical field, best alias first."""
+        if logical_field in self._candidates:
+            return self._candidates[logical_field]
+
+        found: List[int] = []
+        for alias in FIELD_ALIASES.get(logical_field, ()):
+            position = self._by_key.get(alias)
+            if position is not None and position not in found:
+                found.append(position)
+        if not found:
+            position = self.resolve(logical_field)
+            if position is not None:
+                found.append(position)
+
+        self._candidates[logical_field] = found
+        return found
+
+    def first_value(self, row: Sequence[str], logical_field: str) -> str:
+        """First populated candidate for a field in one row.
+
+        The wide master table carries one column per source system side by side,
+        so ``Basware_Item ID`` and ``Maximo_ITEMNUM`` both exist and a single
+        table-wide binding would always read whichever came first and report the
+        other system's rows as blank. Each row originates in one system, so the
+        first populated candidate is the value that row actually has.
+        """
+        for position in self.positions(logical_field):
+            if position < len(row) and row[position].strip():
+                return row[position]
+        return ""
+
 
 # ===========================================================================
 # Row typing
@@ -1720,7 +1781,7 @@ def classify_row(resolver: ColumnResolver, row: Sequence[str], description: str)
                             or resolver.value(row, "po_line_number")).strip())
     has_quantity = parse_amount(resolver.value(row, "quantity")) is not None
     has_amount = parse_amount(resolver.value(row, "spend")) is not None
-    has_item = bool(resolver.value(row, "item_number").strip())
+    has_item = bool(resolver.first_value(row, "item_number").strip())
 
     if has_line_number or has_quantity or has_item:
         return ROW_TYPE_LINE
@@ -3671,7 +3732,7 @@ class Agent1:
             "po_number": resolver.value(row, "po_number"),
             "po_line_number": resolver.value(row, "po_line_number"),
             "invoice_number": resolver.value(row, "invoice_number"),
-            "item_number": resolver.value(row, "item_number"),
+            "item_number": resolver.first_value(row, "item_number"),
         }
 
     @staticmethod
@@ -3727,7 +3788,7 @@ class Agent1:
         description_fields: List[str] = []
         note_only = False
         for header in profile.description_fields:
-            if is_internal_note_header(header):
+            if is_internal_note_header(header) or is_never_descriptive(header):
                 continue
             value = resolver.value_at(row, header)
             if value and not self.lexicon.is_noise(value):
@@ -3745,6 +3806,8 @@ class Agent1:
 
         context: List[str] = []
         for header in profile.context_fields:
+            if is_never_descriptive(header):
+                continue
             value = resolver.value_at(row, header)
             if value and not self.lexicon.is_noise(value):
                 context.append(soften_caps(value))
@@ -3944,7 +4007,8 @@ class Agent1:
             "category_l3": category_values[2],
             "category_l4": category_values[3],
             "category_path": " > ".join(value for value in category_values if value),
-            "item_type": resolver.value(row, "item_type"),
+            "item_type": resolver.first_value(row, "item_type"),
+            "stock_item_number": resolver.first_value(row, "stock_item_number"),
             "material_group_number": resolver.value(row, "material_group_number"),
             "material_group_name": resolver.value(row, "material_group_name"),
             "business_area": resolver.value(row, "business_area"),
@@ -4051,11 +4115,15 @@ class Agent1:
         if has_non_english(description.description):
             description.description = ""
             description.short_description = ""
-            description.item_or_service = "Unclear"
         elif description.description and not description.short_description:
             description.short_description = self.synthesiser._shorten(description.description)
-        if description.item_or_service == "Unclear" and not description.description:
+        # Nothing publishable, whatever the reason: the text was a buyer note, it
+        # would not render in English, or there was no text to work from. Fortum
+        # asked for "Unclear" rather than a blank, and calling such a line
+        # Material or Service claims a reading the output does not show.
+        if not description.description:
             description.short_description = ""
+            description.item_or_service = "Unclear"
 
         # The reported translation is the one for the line's own primary text,
         # which is what a reviewer will want to check against the source cell.
@@ -4074,10 +4142,11 @@ class Agent1:
             "Enriched_Description_Short": (
                 "" if has_non_english(description.short_description)
                 else description.short_description),
-            "Item_Or_Service": (
-                (description.item_or_service or "Unclear")
-                if record.row_type == ROW_TYPE_LINE else ""
-            ),
+            # Never blank. Fortum asked for "Unclear" rather than an empty cell,
+            # and a header, subtotal or empty row is the clearest case of a line
+            # that does not say what was purchased.
+            "Item_Or_Service": (description.item_or_service or "Unclear"
+                                if record.row_type == ROW_TYPE_LINE else "Unclear"),
             "AI_Confidence": confidence if description.description else "",
             "Confidence_Band": band if description.description else "",
 
@@ -4104,6 +4173,7 @@ class Agent1:
             "PO_Line_Number": record.keys.get("po_line_number", ""),
             "Invoice_Number": record.keys.get("invoice_number", ""),
             "Item_Number": record.keys.get("item_number", ""),
+            "Stock_Item_Number": business.get("stock_item_number", ""),
             "Item_Type": business.get("item_type", ""),
             "Supplier_Id": business.get("supplier_id", ""),
             "Supplier_Name": business.get("supplier_name", ""),
