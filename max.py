@@ -91,6 +91,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 from xml.etree import ElementTree
 
+from runtime import configure_process_logging
+
 # --- Optional components ---------------------------------------------------
 # All of these are optional. Each improves speed or reach; none is required, and
 # the tool reports at start-up which ones it found.
@@ -3646,11 +3648,7 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
 
 
 def configure_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s  %(levelname)-7s %(message)s",
-        datefmt="%H:%M:%S", stream=sys.stdout,
-    )
+    configure_process_logging(verbose)
 
 
 def print_token_usage(statistics: Dict[str, Any], settings: Settings) -> None:

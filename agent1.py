@@ -87,6 +87,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 from xml.etree import ElementTree
 
+from runtime import configure_process_logging, load_sentence_transformer
+
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
@@ -2895,9 +2897,8 @@ class EnglishAnalyser:
                 return self._pipeline
             except Exception:
                 continue
-        LOGGER.warning(
-            "No spaCy English model is installed; falling back to rule-based "
-            "phrase extraction. Install one with: python -m spacy download en_core_web_sm")
+        LOGGER.info(
+            "No spaCy English model is installed; using rule-based phrase extraction.")
         self.enabled = False
         return None
 
@@ -3031,7 +3032,7 @@ class SemanticIndex:
 
         try:
             LOGGER.info("Loading embedding model %s ...", self.MODEL_NAME)
-            self._model = _sentence_transformers.SentenceTransformer(self.MODEL_NAME)
+            self._model = load_sentence_transformer(_sentence_transformers, self.MODEL_NAME)
             LOGGER.info("Embedding %d distinct phrase(s) ...", len(self.phrases))
             self._matrix = self._model.encode(
                 self.phrases, batch_size=64, convert_to_numpy=True,
@@ -4385,12 +4386,7 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
 
 def configure_logging(verbose: bool) -> None:
     """Send progress to stdout in a format that reads well in a terminal."""
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s  %(levelname)-7s %(message)s",
-        datefmt="%H:%M:%S",
-        stream=sys.stdout,
-    )
+    configure_process_logging(verbose)
 
 
 def print_token_usage(statistics: Dict[str, Any], settings: Settings) -> None:

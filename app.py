@@ -65,6 +65,7 @@ from urllib.parse import parse_qs, urlparse
 
 import TestAgent
 from TestAgent import AGENTS, AGENT_BY_KEY, Dataset, Harness, preview_file
+from runtime import prepare_hub_environment
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
@@ -504,6 +505,7 @@ def check_assets() -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    prepare_hub_environment()
     away = hosted()
     parser = argparse.ArgumentParser(
         prog="app.py",

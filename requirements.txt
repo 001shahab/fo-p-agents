@@ -28,9 +28,10 @@ openpyxl>=3.1
 nltk>=3.8
 
 # spaCy supplies tokenisation, lemmatisation, part-of-speech tagging and named
-# entity recognition. The per-language pipelines are installed separately; see
-# the model block at the bottom of this file.
-spacy>=3.7
+# entity recognition. The English pipeline is installed as a pip package so
+# Render gets it from `pip install -r requirements.txt` without a second step.
+spacy>=3.8.0,<3.9
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 
 # Vectorisation, nearest-neighbour search and agglomerative clustering.
 scikit-learn>=1.3
@@ -80,7 +81,6 @@ tqdm>=4.66
 # Language resources - install after the packages above
 # ---------------------------------------------------------------------------
 #
-#   python -m spacy download en_core_web_sm
 #   python -m spacy download fi_core_news_sm
 #   python -m spacy download sv_core_news_sm
 #   python -m spacy download pl_core_news_sm

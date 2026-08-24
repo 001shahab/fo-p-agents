@@ -92,6 +92,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from runtime import configure_process_logging, load_sentence_transformer
+
 LOGGER = logging.getLogger("agent3")
 
 AGENT_NAME = "Agent 3 - AI Material and Service Standardisation"
@@ -1616,7 +1618,8 @@ class MatchEngine:
         if self.use_embeddings:
             try:
                 LOGGER.info("Loading embedding model %s ...", self.EMBEDDING_MODEL)
-                self._embedder = _sentence_transformers.SentenceTransformer(self.EMBEDDING_MODEL)
+                self._embedder = load_sentence_transformer(
+                    _sentence_transformers, self.EMBEDDING_MODEL)
                 LOGGER.info("Embedding %d reference item(s) ...", len(texts))
                 self._reference_vectors = self._embedder.encode(
                     texts, batch_size=64, convert_to_numpy=True,
@@ -2615,11 +2618,7 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
 
 
 def configure_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s  %(levelname)-7s %(message)s",
-        datefmt="%H:%M:%S", stream=sys.stdout,
-    )
+    configure_process_logging(verbose)
 
 
 def print_token_usage(statistics: Dict[str, Any], settings: Settings) -> None:
