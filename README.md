@@ -1105,6 +1105,23 @@ token, which makes it the highest-leverage file in the repository.
 Bump `version` on every change. The value is written into every output row, so
 any result can be traced back to the vocabulary that produced it.
 
+### One rule about numbers
+
+An entry translates words, never specifications. It must not name a size, rating
+or standard that the phrase it translates does not name, and it must not match one
+in order to replace it — a phrase substitution swaps out the whole span it
+matches, so `DN50` inside the matched text disappears.
+
+The vocabulary broke both halves of this. Every Finnish, Swedish and Polish word
+for a heat meter translated to `District heating meter DN25`, so a line that
+never mentioned a size acquired one; and `Virtauslahetin DN50 4-20mA` came back
+as `Flow transmitter 4-20 mA`, with the stated `DN50` silently replaced. Both are
+now `District heating meter` and `Flow transmitter`, and the size comes from the
+line: `Flow transmitter DN50 4-20mA`.
+
+`python TestAgent.py --agent agent1` fails if any entry breaks this, so the rule
+is enforced against the file rather than trusted to review.
+
 ---
 
 ## Troubleshooting

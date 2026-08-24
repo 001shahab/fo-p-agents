@@ -70,7 +70,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from runtime import (
     DEFAULT_AZURE_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT,
@@ -1640,6 +1640,62 @@ def _files_exist(results: Path, names: Sequence[str]) -> List[CheckResult]:
     return checks
 
 
+# Sizes, ratings and standards, as they are written in purchase text: DN50, PN16,
+# 55 kW, 4-20 mA, IP65, M12, EN 1092. Deliberately narrow, so that an ordinary
+# quantity such as "2 pcs" is not mistaken for a specification.
+_SPECIFICATION = re.compile(r"""(
+    \bDN\s?\d+ | \bPN\s?\d+ | \bIP\d{2}\b | \bM\d+(?:x\d+)?\b
+  | \b\d+(?:[.,]\d+)?\s?(?:kW|MW|kV|mA|bar|mbar|mm|Nm|rpm|Hz)\b
+  | \b\d+\s?[-\u2013]\s?\d+\s?(?:mA|V|bar|mm|kW)\b
+  | \b(?:EN|ISO|SFS|IEC|DIN)\s?\d+
+)""", re.IGNORECASE | re.VERBOSE)
+
+
+def _specifications(text: str) -> Set[str]:
+    return {match.group(0).lower().replace(" ", "")
+            for match in _SPECIFICATION.finditer(text)}
+
+
+def _check_lexicon_specifications() -> CheckResult:
+    """No vocabulary entry may invent, or swallow, a specification.
+
+    Fortum's rule is that the numbers on a purchase line are kept. A translation
+    that adds a size the source never stated invents a fact about what was
+    bought, and one that matches a size in order to replace it loses the fact.
+    The vocabulary had both: every Finnish, Swedish and Polish word for a heat
+    meter translated to "District heating meter DN25", and "Virtauslahetin DN50
+    4-20mA" came back as "Flow transmitter 4-20 mA", with the DN50 gone.
+    """
+    path = HERE / "lexicon" / "procurement_lexicon.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    invents: List[str] = []
+    swallows: List[str] = []
+    for section in ("phrases", "terms"):
+        for language, entries in (payload.get(section) or {}).items():
+            for source, target in entries.items():
+                added = _specifications(target) - _specifications(source)
+                if added:
+                    invents.append(f"[{language}] {source!r} -> {target!r}")
+                # An entry whose source names a specification replaces it
+                # wholesale, because substitution swaps the matched span out.
+                if _specifications(source):
+                    swallows.append(f"[{language}] {source!r} -> {target!r}")
+
+    faults = len(invents) + len(swallows)
+    detail = f"{len(payload.get('phrases', {}))} language(s) checked, none at fault"
+    if faults:
+        first = (invents + swallows)[0]
+        detail = (f"{len(invents):,} invent a specification, "
+                  f"{len(swallows):,} match one in order to replace it, e.g. {first}")
+    return CheckResult(
+        "The vocabulary neither invents nor swallows a specification",
+        "pass" if not faults else "fail",
+        "A translation must carry over the sizes and ratings the source states, and "
+        "must add none of its own. Fortum asked that the numbers on a line survive.",
+        detail)
+
+
 def check_agent1(dataset: Dataset, results: Path) -> List[CheckResult]:
     checks = _files_exist(results, ["agent1_unified_lines.csv"])
     columns, rows = read_csv(results / "agent1_unified_lines.csv")
@@ -1749,6 +1805,9 @@ def check_agent1(dataset: Dataset, results: Path) -> List[CheckResult]:
         "generator deliberately damaged are entitled to come back Unclear.",
         f"{materials:,} goods, {services:,} services, {unclear:,} unclear"))
 
+    # The vocabulary is data, and every agent carries its own copy of the loader,
+    # so the invariant is checked against the file itself rather than five times
+    # over in code.
     # A service is routinely named after the thing it is performed on, so both a
     # service word and a material word appear: "Centrifugal pump maintenance",
     # "Cable termination work". Counting marker words alone ties and used to send
@@ -1772,6 +1831,8 @@ def check_agent1(dataset: Dataset, results: Path) -> List[CheckResult]:
             "one label Fortum wants kept for lines that say nothing.",
             f"{len(both_kinds):,} lines name both a thing and an activity, "
             f"{len(undecided):,} left Unclear"))
+
+    checks.append(_check_lexicon_specifications())
 
     if dataset.facts.get("duplicate_pairs"):
         flagged = sum(1 for row in rows if row.get("Is_Duplicate", "").strip().lower()
