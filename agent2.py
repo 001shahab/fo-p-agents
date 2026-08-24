@@ -91,7 +91,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent2")
 
 AGENT_NAME = "Agent 2 - AI Purchase Group (Category L5)"
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.2.1"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -667,10 +667,25 @@ class SignatureBuilder:
     # stripped from the front of a description and nowhere else.
     _LEADING_FULFILMENT_LEMMAS = frozenset({"supply", "supplies", "provision"})
 
+    # Where a thing is used, as opposed to what the thing is.
+    _USE_LEMMAS = frozenset({"use", "usage"})
+
     @classmethod
     def drop_fulfilment(cls, lemmas: Sequence[str]) -> Tuple[str, ...]:
         """Remove words that describe fulfilment rather than the purchase."""
-        kept = [lemma for lemma in lemmas if lemma not in cls._FULFILMENT_LEMMAS]
+        kept: List[str] = []
+        for position, lemma in enumerate(lemmas):
+            if lemma in cls._FULFILMENT_LEMMAS:
+                continue
+            # "site" is the purchase in Fortum's own "Bat survey wind site" and
+            # mere fulfilment in "for site use". Only the following word tells
+            # the two apart, so it is dropped when it is the site of a use and
+            # kept everywhere else. Without this, "Tank cleaning service for
+            # site use" became a category called "Tank cleaning service site".
+            if (lemma == "site" and position + 1 < len(lemmas)
+                    and lemmas[position + 1] in cls._USE_LEMMAS):
+                continue
+            kept.append(lemma)
         if not kept:
             return tuple(lemmas)
         while len(kept) > 1 and kept[0] in cls._LEADING_FULFILMENT_LEMMAS:
