@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import Any
+from typing import Any, Dict, Optional, Tuple
 
 
 _HUB_ENV = {
@@ -94,3 +94,76 @@ def load_sentence_transformer(package: Any, name: str) -> Any:
         return package.SentenceTransformer(name, local_files_only=True)
     except Exception:
         return package.SentenceTransformer(name)
+
+
+# ---------------------------------------------------------------------------
+# Chat model defaults shared by every agent
+# ---------------------------------------------------------------------------
+
+DEFAULT_OPENAI_MODEL = "gpt-5.6-luna"
+DEFAULT_AZURE_MODEL = "openai.eu.gpt-5.6.luna"
+DEFAULT_REASONING_EFFORT = "low"
+
+
+def chat_completion_body(model: str, system_prompt: str, user_prompt: str,
+                         omit_temperature: bool = False,
+                         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+                         reasoning_style: str = "effort") -> Dict[str, Any]:
+    """Build a chat-completions JSON body for gpt-5.6-luna.
+
+    ``reasoning_style`` is ``effort`` (OpenAI ``reasoning_effort``), ``nested``
+    (Azure ``reasoning.effort``), or ``omit`` after the endpoint has rejected
+    the parameter.
+    """
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    if not omit_temperature:
+        body["temperature"] = 0
+    effort = (reasoning_effort or "").strip().lower()
+    if effort and effort not in {"none", "off", "0"}:
+        if reasoning_style == "nested":
+            body["reasoning"] = {"effort": effort}
+        elif reasoning_style != "omit":
+            body["reasoning_effort"] = effort
+    return body
+
+
+def retry_chat_body(status: int, error_text: str,
+                    body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return an alternate body when the model rejects a generation parameter.
+
+    gpt-5 family models commonly refuse ``temperature``. Azure and OpenAI also
+    spell the reasoning control differently, so a 400 mentioning reasoning is
+    retried with the other spelling before the field is dropped.
+    """
+    if status != 400:
+        return None
+    summary = (error_text or "").lower()
+    if "temperature" in body and "temperature" in summary:
+        return {key: value for key, value in body.items() if key != "temperature"}
+    if "reasoning_effort" in body and "reasoning" in summary:
+        effort = body["reasoning_effort"]
+        alternate = {key: value for key, value in body.items() if key != "reasoning_effort"}
+        alternate["reasoning"] = {"effort": effort}
+        return alternate
+    if isinstance(body.get("reasoning"), dict) and "reasoning" in summary:
+        return {key: value for key, value in body.items() if key != "reasoning"}
+    return None
+
+
+def note_reasoning_retry(body: Dict[str, Any], retry: Dict[str, Any]
+                         ) -> Tuple[bool, str]:
+    """Describe how the client should remember a successful retry shape."""
+    omit_temperature = "temperature" in body and "temperature" not in retry
+    if "reasoning_effort" in body and "reasoning_effort" not in retry:
+        style = "nested" if "reasoning" in retry else "omit"
+        return omit_temperature, style
+    if "reasoning" in body and "reasoning" not in retry:
+        return omit_temperature, "omit"
+    return omit_temperature, ""

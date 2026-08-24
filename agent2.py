@@ -82,12 +82,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-from runtime import configure_process_logging, load_sentence_transformer
+from runtime import (
+    DEFAULT_AZURE_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT,
+    chat_completion_body, configure_process_logging, load_sentence_transformer,
+    retry_chat_body,
+)
 
 LOGGER = logging.getLogger("agent2")
 
 AGENT_NAME = "Agent 2 - AI Purchase Group (Category L5)"
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -156,9 +160,10 @@ class ModelConfig:
     backend: str = "openai"
     api_key: str = ""
     base_url: str = "https://api.openai.com/v1"
-    model: str = "gpt-5.1"
+    model: str = DEFAULT_OPENAI_MODEL
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
     batch_size: int = 25
-    timeout: int = 90
+    timeout: int = 120
     max_requests: int = 0
     spend_limit: float = 0.0         # dollars; 0 means no alert
     input_cost_per_mtok: float = INPUT_COST_PER_MTOK
@@ -260,7 +265,7 @@ def resolve_model_config(env: Dict[str, str], use_llm: bool,
     """Select the language-model backend. Mirrors Agent 1 exactly."""
     config = ModelConfig(enabled=use_llm)
     config.batch_size = max(1, _env_int(env.get("LLM_BATCH_SIZE"), 25))
-    config.timeout = max(5, _env_int(env.get("LLM_TIMEOUT"), 90))
+    config.timeout = max(5, _env_int(env.get("LLM_TIMEOUT"), 120))
     config.max_requests = max(0, _env_int(env.get("LLM_MAX_REQUESTS"), 0))
 
     if spend_limit is None:
@@ -278,13 +283,17 @@ def resolve_model_config(env: Dict[str, str], use_llm: bool,
         config.base_url = (env.get("AZURE_OPENAI_BASE_URL") or env.get("AZURE_BASE_URL")
                            or env.get("BASE_URL")
                            or "https://genai-sharedservice-emea.pwcinternal.com/v1/chat/completions")
-        config.model = env.get("AZURE_OPENAI_MODEL") or env.get("MODEL_NAME") or "azure.gpt-5.1"
+        config.model = env.get("AZURE_OPENAI_MODEL") or env.get("MODEL_NAME") or DEFAULT_AZURE_MODEL
+        config.reasoning_effort = (
+            env.get("LLM_REASONING_EFFORT") or DEFAULT_REASONING_EFFORT).strip().lower()
     else:
         config.backend = "openai"
         config.api_key = env.get("OPENAI_API_KEY", "")
         # Never inherits BASE_URL; see the note in .env.example.
         config.base_url = env.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
-        config.model = env.get("OPENAI_MODEL") or "gpt-5.1"
+        config.model = env.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+        config.reasoning_effort = (
+            env.get("LLM_REASONING_EFFORT") or DEFAULT_REASONING_EFFORT).strip().lower()
 
     if config.enabled and not config.api_key:
         LOGGER.warning("Language-model tier requested but no API key was found for the "
@@ -1311,6 +1320,7 @@ class LanguageModelClient:
         self._cache: Dict[str, str] = self._load_cache()
         self._cache_dirty = False
         self._omit_temperature = False
+        self._reasoning_style = "effort"
 
     def _load_cache(self) -> Dict[str, str]:
         if not self.cache_path.is_file():
@@ -1375,9 +1385,15 @@ class LanguageModelClient:
 
         if status != 200:
             summary = text[:300].replace("\n", " ")
-            if status == 400 and "temperature" in summary.lower():
-                self._omit_temperature = True
-                return self._post({k: v for k, v in body.items() if k != "temperature"})
+            retry = retry_chat_body(status, text, body)
+            if retry is not None:
+                if "temperature" in body and "temperature" not in retry:
+                    self._omit_temperature = True
+                if "reasoning_effort" in body and "reasoning_effort" not in retry:
+                    self._reasoning_style = "nested" if "reasoning" in retry else "omit"
+                elif "reasoning" in body and "reasoning" not in retry:
+                    self._reasoning_style = "omit"
+                return self._post(retry)
             LOGGER.warning("Language-model request returned HTTP %s: %s", status, summary)
             self.usage.failed_requests += 1
             return None
@@ -1395,14 +1411,12 @@ class LanguageModelClient:
             LOGGER.warning("Language-model request cap (%d) reached.", self.config.max_requests)
             return None
 
-        body: Dict[str, Any] = {
-            "model": self.config.model,
-            "messages": [{"role": "system", "content": system_prompt},
-                         {"role": "user", "content": user_prompt}],
-            "response_format": {"type": "json_object"},
-        }
-        if not self._omit_temperature:
-            body["temperature"] = 0
+        body: Dict[str, Any] = chat_completion_body(
+            self.config.model, system_prompt, user_prompt,
+            omit_temperature=self._omit_temperature,
+            reasoning_effort=getattr(self.config, "reasoning_effort", DEFAULT_REASONING_EFFORT),
+            reasoning_style=self._reasoning_style,
+        )
 
         response = self._post(body)
         if response is None:
@@ -2369,6 +2383,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "AZURE_ENABLE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
         "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_MODEL",
         "BASE_URL", "MODEL_NAME", "LLM_BATCH_SIZE", "LLM_TIMEOUT", "LLM_MAX_REQUESTS",
+        "LLM_REASONING_EFFORT",
     }})
 
     try:

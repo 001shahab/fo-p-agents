@@ -241,15 +241,16 @@ AZURE_ENABLE=false
 
 OPENAI_API_KEY="sk-..."
 OPENAI_BASE_URL="https://api.openai.com/v1"
-OPENAI_MODEL="gpt-5.1"
+OPENAI_MODEL="gpt-5.6-luna"
 
 AZURE_OPENAI_API_KEY="sk-..."
 AZURE_OPENAI_BASE_URL="https://genai-sharedservice-emea.pwcinternal.com/v1/chat/completions"
-AZURE_OPENAI_MODEL="azure.gpt-5.1"
+AZURE_OPENAI_MODEL="openai.eu.gpt-5.6.luna"
 
 LLM_BATCH_SIZE=25
-LLM_TIMEOUT=90
+LLM_TIMEOUT=120
 LLM_MAX_REQUESTS=0            # 0 = no cap
+LLM_REASONING_EFFORT=low      # gpt-5.6-luna reasoning depth
 
 LLM_SPEND_LIMIT=25.00         # ask before spending past this; 0 = no alert
 LLM_INPUT_COST_PER_MTOK=1.25  # dollars per million input tokens
@@ -261,8 +262,8 @@ Both blocks are read independently, so both can be populated at once and
 fall back to the shared-service URL, so a direct OpenAI key cannot be sent to
 the shared-service endpoint by accident.
 
-The shared service prefixes deployment names with the hosting platform, hence
-`azure.gpt-5.1` rather than `gpt-5.1`.
+The shared service uses the Azure deployment name `openai.eu.gpt-5.6.luna`.
+Direct OpenAI uses `gpt-5.6-luna`. Reasoning effort defaults to `low`.
 
 Real environment variables override `.env`, which is what makes the agents
 usable from a scheduler without a file on disk.
@@ -312,7 +313,7 @@ When the language-model tier is used, the run ends with a token and cost report:
 -------------------------------------------------------------------------------
 Language model usage
 -------------------------------------------------------------------------------
-  Model                : gpt-5.1 (openai)
+  Model                : gpt-5.6-luna (openai)
   Requests sent        : 18
   Served from cache    : 240 (no tokens consumed)
   Input tokens         : 24,517
@@ -367,8 +368,10 @@ Translation runs as a cascade, cheapest first:
    every inflected form.
 3. **Offline neural translation** — Helsinki-NLP `opus-mt` models running
    locally on CPU. This tier removes the largest single language-model cost.
-4. **Language model** — only for what the first three could not resolve, batched
-   and cached.
+4. **Language model** — gpt-5.6-luna with low reasoning. When this tier is on,
+   it also re-reads every line and writes `Enriched_Purchase_Description` as
+   one or two English sentences. Residue the local stack could not translate
+   is batched and cached in the same pass.
 
 The tier that produced each description is recorded in `Translation_Method`, and
 `Translation_Coverage` gives the share of content tokens the local stack
@@ -391,7 +394,7 @@ Key columns:
 
 | Column | Meaning |
 | --- | --- |
-| `Enriched_Purchase_Description` | the deliverable: what was bought, in English |
+| `Enriched_Purchase_Description` | one or two English sentences naming what was bought |
 | `Enriched_Description_Short` | a compact form for narrow reports |
 | `Item_Or_Service` | material or service |
 | `AI_Confidence` / `Confidence_Band` | 0–100 and High/Medium/Low |
@@ -714,7 +717,7 @@ Spend         : 4 820,00
 through the controlled vocabulary at no token cost, and the evidence is kept:
 
 ```
-Enriched_Purchase_Description : Asbestos removal work
+Enriched_Purchase_Description : Asbestos removal work was carried out at the site.
 Item_Or_Service               : Service
 Detected_Language             : fi
 Translation_Method            : vocabulary

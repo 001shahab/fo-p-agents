@@ -21,11 +21,11 @@ source systems recorded.
     --------
     The agent gathers evidence for each purchase line from every system that
     says anything about it, renders that evidence in English, and composes a
-    description from it. Composition is deliberate: the description is built by
-    template from validated fragments rather than generated as free text, which
-    is what allows the "no invented information" requirement to be enforced
-    mechanically rather than hoped for. Any word that cannot be traced back to
-    the source data or to the controlled vocabulary is dropped before output.
+    description from it. Composition starts from validated fragments. When the
+    language model is on, each line is then read carefully and rewritten as one
+    or two English sentences that still contain only facts from the source.
+    Any word that cannot be traced back to the source data or to the controlled
+    vocabulary is dropped before output.
 
     Cost
     ----
@@ -87,12 +87,16 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 from xml.etree import ElementTree
 
-from runtime import configure_process_logging, load_sentence_transformer
+from runtime import (
+    DEFAULT_AZURE_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT,
+    chat_completion_body, configure_process_logging, load_sentence_transformer,
+    retry_chat_body,
+)
 
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "1.4.0"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -268,9 +272,10 @@ class ModelConfig:
     backend: str = "openai"          # "openai" or "azure"
     api_key: str = ""
     base_url: str = "https://api.openai.com/v1"
-    model: str = "gpt-5.1"
+    model: str = DEFAULT_OPENAI_MODEL
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
     batch_size: int = 25
-    timeout: int = 90
+    timeout: int = 120
     max_requests: int = 0            # 0 means no cap
     spend_limit: float = 0.0         # dollars; 0 means no alert
     input_cost_per_mtok: float = INPUT_COST_PER_MTOK
@@ -306,8 +311,8 @@ class Settings:
     fuzzy_threshold: float = 0.86
     semantic_threshold: float = 0.72
     top_k: int = 5
-    max_words: int = 12
-    max_short_words: int = 4
+    max_words: int = 40
+    max_short_words: int = 12
     semantic_phrase_cap: int = 200_000
 
     full_columns: bool = False
@@ -391,7 +396,7 @@ def resolve_model_config(env: Dict[str, str], use_llm: bool,
     """
     config = ModelConfig(enabled=use_llm)
     config.batch_size = max(1, _env_int(env.get("LLM_BATCH_SIZE"), 25))
-    config.timeout = max(5, _env_int(env.get("LLM_TIMEOUT"), 90))
+    config.timeout = max(5, _env_int(env.get("LLM_TIMEOUT"), 120))
     config.max_requests = max(0, _env_int(env.get("LLM_MAX_REQUESTS"), 0))
 
     if spend_limit is None:
@@ -419,13 +424,17 @@ def resolve_model_config(env: Dict[str, str], use_llm: bool,
         config.model = (
             env.get("AZURE_OPENAI_MODEL")
             or env.get("MODEL_NAME")
-            or "azure.gpt-5.1"
+            or DEFAULT_AZURE_MODEL
         )
+        config.reasoning_effort = (
+            env.get("LLM_REASONING_EFFORT") or DEFAULT_REASONING_EFFORT).strip().lower()
     else:
         config.backend = "openai"
         config.api_key = env.get("OPENAI_API_KEY", "")
         config.base_url = env.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
-        config.model = env.get("OPENAI_MODEL") or "gpt-5.1"
+        config.model = env.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+        config.reasoning_effort = (
+            env.get("LLM_REASONING_EFFORT") or DEFAULT_REASONING_EFFORT).strip().lower()
 
     if config.enabled and not config.api_key:
         LOGGER.warning(
@@ -731,6 +740,20 @@ def drop_foreign_common_nouns(text: str) -> str:
     """Strip leftover foreign common nouns so an enriched column stays English."""
     kept = [token for token in tokenise(text) if not is_foreign_common_noun(token)]
     return sentence_case(" ".join(kept)) if kept else ""
+
+
+def keep_published_english(text: str) -> str:
+    """Keep punctuation when the string is already English.
+
+    ``drop_foreign_common_nouns`` tokenises, which would turn a polished
+    sentence back into a noun phrase.
+    """
+    text = normalise_text(text)
+    if not text:
+        return ""
+    if has_non_english(text):
+        return drop_foreign_common_nouns(text)
+    return text
 
 
 def tidy_published_english(text: str) -> str:
@@ -2240,6 +2263,7 @@ class LanguageModelClient:
         self._cache: Dict[str, str] = self._load_cache()
         self._cache_dirty = False
         self._omit_temperature = False
+        self._reasoning_style = "effort"
 
     # -- cache --------------------------------------------------------------
 
@@ -2330,13 +2354,17 @@ class LanguageModelClient:
 
         if status != 200:
             summary = text[:300].replace("\n", " ")
-            # Reasoning models reject sampling parameters outright. Rather than
-            # failing the run, drop the parameter and let the caller retry; the
-            # model's own default is deterministic enough for this workload.
-            if status == 400 and "temperature" in summary.lower():
-                self._omit_temperature = True
-                LOGGER.info("Model rejected the temperature parameter; retrying without it.")
-                return self._post({k: v for k, v in body.items() if k != "temperature"})
+            retry = retry_chat_body(status, text, body)
+            if retry is not None:
+                if "temperature" in body and "temperature" not in retry:
+                    self._omit_temperature = True
+                    LOGGER.info("Model rejected the temperature parameter; retrying without it.")
+                if "reasoning_effort" in body and "reasoning_effort" not in retry:
+                    self._reasoning_style = "nested" if "reasoning" in retry else "omit"
+                    LOGGER.info("Retrying with the reasoning control this endpoint accepts.")
+                elif "reasoning" in body and "reasoning" not in retry:
+                    self._reasoning_style = "omit"
+                return self._post(retry)
             LOGGER.warning("Language-model request returned HTTP %s: %s", status, summary)
             self.usage.failed_requests += 1
             return None
@@ -2361,16 +2389,12 @@ class LanguageModelClient:
             LOGGER.warning("Language-model request cap (%d) reached.", self.config.max_requests)
             return None
 
-        body: Dict[str, Any] = {
-            "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "response_format": {"type": "json_object"},
-        }
-        if not self._omit_temperature:
-            body["temperature"] = 0
+        body: Dict[str, Any] = chat_completion_body(
+            self.config.model, system_prompt, user_prompt,
+            omit_temperature=self._omit_temperature,
+            reasoning_effort=self.config.reasoning_effort or DEFAULT_REASONING_EFFORT,
+            reasoning_style=self._reasoning_style,
+        )
 
         response = self._post(body)
         if response is None:
@@ -2732,7 +2756,7 @@ class TranslationEngine:
             return ""
         language, _ = detect_language(text, self.lexicon)
         if not has_non_english(text) and language in {"en", "und"}:
-            return tidy_published_english(text)
+            return text.strip()
 
         english, _, _, _ = self._resolve_with_vocabulary(text, language)
         if english and not has_non_english(english):
@@ -2783,7 +2807,7 @@ class TranslationEngine:
             "draft_short": short,
             "draft_item_or_service": item_or_service,
         }, ensure_ascii=False)
-        cache_key = self.model.cache_key("polish_en_v2", payload)
+        cache_key = self.model.cache_key("polish_sentence_v1", payload)
         cached = self.model.cached(cache_key)
         if cached:
             try:
@@ -2793,34 +2817,36 @@ class TranslationEngine:
                 pass
 
         prompt = (
-            "You review an enriched purchase description. The three output "
-            "fields MUST be English.\n"
+            "You write one clear English sentence that says what was purchased. "
+            "Read the original line carefully. Do not rush.\n"
             "Return JSON: {\"description\": \"...\", \"short_description\": "
             "\"...\", \"item_or_service\": \"Material|Service|Unclear\"}.\n"
             "Rules:\n"
-            "1. description, short_description and item_or_service are always "
-            "English. Translate every Finnish, Swedish, Polish or German "
-            "common noun. Never copy a source-language word. Keep part numbers, "
-            "brands, places, person names, wattage, quantities and item numbers.\n"
-            "2. 'original' is the authoritative purchase line. Ignore "
+            "1. description is one or two complete English sentences with a verb "
+            "(purchased, supplied, carried out, and so on), typically 12 to 30 "
+            "words. Never return a title or a noun phrase. It must name the item "
+            "or the service, keep wattage, quantities, sizes and item numbers, "
+            "and be something a buyer can read without guessing. Never copy "
+            "Finnish, Swedish, Polish or German.\n"
+            "2. short_description is a compact English noun phrase of at most "
+            "twelve words for the same purchase.\n"
+            "3. 'original' is the authoritative purchase line. Ignore "
             "'extra_evidence' when it describes a different purchase, and "
             "ignore buyer internal notes (stock instructions, lead times, "
             "'confirmed with site manager').\n"
-            "3. If original does not name an item or a service that was "
+            "4. If original does not name an item or a service that was "
             "purchased, set item_or_service to Unclear and set description to "
             "an empty string. Do not invent a product from a note or a quote "
             "reference.\n"
-            "4. If the draft is irrelevant to 'original', rewrite it from "
-            "'original' only. Do not invent detail that is not in the source.\n"
-            "5. description is a noun phrase, at most twelve words, and must "
-            "keep numbers that specify the purchase (for example 55 kW).\n"
+            "5. If the draft is a fragment, expand it into a sentence using "
+            "only facts in original. Do not invent detail that is not in the source.\n"
             "6. If original is empty or a placeholder, set item_or_service to "
             "Unclear rather than guessing from a category."
         )
         response = self.model.complete_json(prompt, payload)
         if not response:
-            return (drop_foreign_common_nouns(draft),
-                    drop_foreign_common_nouns(short),
+            return (keep_published_english(draft),
+                    keep_published_english(short),
                     item_or_service)
         self.model.store(cache_key, json.dumps(response, ensure_ascii=False, sort_keys=True))
         return self._take_polish(response, draft, short, item_or_service)
@@ -2831,12 +2857,12 @@ class TranslationEngine:
         item = normalise_text(parsed.get("item_or_service")).title()
         if item not in {"Material", "Service", "Unclear"}:
             item = item_or_service or "Unclear"
-        raw_description = normalise_text(parsed.get("description"))
+        raw_description = keep_published_english(parsed.get("description"))
         if item == "Unclear" and not raw_description:
             return "", "", "Unclear"
-        description = drop_foreign_common_nouns(raw_description) or drop_foreign_common_nouns(draft)
-        short_out = drop_foreign_common_nouns(
-            normalise_text(parsed.get("short_description"))) or drop_foreign_common_nouns(short)
+        description = raw_description or keep_published_english(draft)
+        short_out = (keep_published_english(parsed.get("short_description"))
+                     or keep_published_english(short))
         if not description:
             return "", "", item if item == "Unclear" else (item_or_service or "Unclear")
         return sentence_case(description), sentence_case(short_out), item
@@ -3929,19 +3955,14 @@ class Agent1:
 
         description = self.synthesiser.compose(record, english_fragments, context_fragments)
         extra = " | ".join(fragment for fragment in extra_fragments if fragment)
-        language = translations[0].language if translations else "und"
-        needs_polish = bool(
-            description.description
-            and (has_non_english(description.description)
-                 or has_non_english(record.primary_text)
-                 or extra
-                 or description.basis == "taxonomy"
-                 or language not in {"en", "und", ""})
-        )
-        if needs_polish:
+        source = record.primary_text or (own[0] if own else "")
+        # Every line is read by the language model when that tier is on, so the
+        # published description is a sentence rather than a leftover fragment.
+        if (self.translator.model is not None and self.translator.model.config.enabled
+                and (description.description or source)):
             polished, short, item = self.translator.polish_composed(
-                record.primary_text or (own[0] if own else ""),
-                description.description, extra,
+                source,
+                description.description or source, extra,
                 description.short_description, description.item_or_service)
             description.description = polished
             description.short_description = short
@@ -4242,8 +4263,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="minimum cosine similarity for a semantic match (default 0.72)")
     tuning.add_argument("--top-k", type=int, default=5,
                         help="candidate matches retained per line (default 5)")
-    tuning.add_argument("--max-words", type=int, default=12,
-                        help="word budget for a generated description (default 12)")
+    tuning.add_argument("--max-words", type=int, default=40,
+                        help="word budget for a generated description (default 40)")
 
     output = parser.add_argument_group("output")
     output.add_argument("--full-columns", action="store_true",
@@ -4492,6 +4513,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "AZURE_ENABLE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
         "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_MODEL",
         "BASE_URL", "MODEL_NAME", "LLM_BATCH_SIZE", "LLM_TIMEOUT", "LLM_MAX_REQUESTS",
+        "LLM_REASONING_EFFORT",
     }})
 
     try:

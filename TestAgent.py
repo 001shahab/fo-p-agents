@@ -72,11 +72,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from runtime import (
+    DEFAULT_AZURE_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT,
+    chat_completion_body, retry_chat_body,
+)
+
 HERE = Path(__file__).resolve().parent
 WORKSPACE = HERE / ".testruns"
 
 HARNESS_NAME = "TestAgent"
-HARNESS_VERSION = "1.0.0"
+HARNESS_VERSION = "1.1.0"
 
 # Prices for the default model tier, in dollars per million tokens. Kept here so
 # the harness can report what a run cost in the same terms the agents do.
@@ -96,8 +101,9 @@ class ModelConfig:
     backend: str = "openai"
     api_key: str = ""
     base_url: str = "https://api.openai.com/v1"
-    model: str = "gpt-5.1"
-    timeout: int = 60
+    model: str = DEFAULT_OPENAI_MODEL
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
+    timeout: int = 120
 
     @property
     def endpoint(self) -> str:
@@ -140,6 +146,12 @@ def _flag(value: Optional[str]) -> bool:
 def resolve_model_config(env: Dict[str, str], enabled: bool) -> ModelConfig:
     """Select the backend, following the same rules as the agents."""
     config = ModelConfig(enabled=enabled)
+    try:
+        config.timeout = max(5, int(str(env.get("LLM_TIMEOUT") or 120).strip()))
+    except ValueError:
+        config.timeout = 120
+    config.reasoning_effort = (
+        env.get("LLM_REASONING_EFFORT") or DEFAULT_REASONING_EFFORT).strip().lower()
     if _flag(env.get("AZURE_ENABLE")):
         config.backend = "azure"
         config.api_key = (env.get("AZURE_OPENAI_API_KEY") or env.get("AZURE_API_KEY")
@@ -147,7 +159,7 @@ def resolve_model_config(env: Dict[str, str], enabled: bool) -> ModelConfig:
         config.base_url = (env.get("AZURE_OPENAI_BASE_URL") or env.get("AZURE_BASE_URL")
                            or env.get("BASE_URL")
                            or "https://genai-sharedservice-emea.pwcinternal.com/v1/chat/completions")
-        config.model = env.get("AZURE_OPENAI_MODEL") or env.get("MODEL_NAME") or "azure.gpt-5.1"
+        config.model = env.get("AZURE_OPENAI_MODEL") or env.get("MODEL_NAME") or DEFAULT_AZURE_MODEL
     else:
         # Deliberately does not inherit BASE_URL: on this project that variable
         # points at the shared service, and inheriting it would send a personal
@@ -155,7 +167,7 @@ def resolve_model_config(env: Dict[str, str], enabled: bool) -> ModelConfig:
         config.backend = "openai"
         config.api_key = env.get("OPENAI_API_KEY") or ""
         config.base_url = env.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
-        config.model = env.get("OPENAI_MODEL") or "gpt-5.1"
+        config.model = env.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
 
     if config.enabled and not config.api_key:
         config.enabled = False
@@ -204,6 +216,8 @@ class LanguageModel:
         self._cache = self._load()
         self._dirty = False
         self._lock = threading.Lock()
+        self._omit_temperature = False
+        self._reasoning_style = "effort"
 
     def _load(self) -> Dict[str, str]:
         if not self.cache_path.is_file():
@@ -245,13 +259,12 @@ class LanguageModel:
                 except json.JSONDecodeError:
                     pass
 
-        body = {
-            "model": self.config.model,
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": user}],
-            "response_format": {"type": "json_object"},
-            "temperature": 0,
-        }
+        body = chat_completion_body(
+            self.config.model, system, user,
+            omit_temperature=self._omit_temperature,
+            reasoning_effort=getattr(self.config, "reasoning_effort", DEFAULT_REASONING_EFFORT),
+            reasoning_style=self._reasoning_style,
+        )
         answer = self._post(body)
         if answer is None:
             return None
@@ -282,17 +295,24 @@ class LanguageModel:
         except urllib.error.HTTPError as error:
             status = error.code
             text = error.read().decode("utf-8", "replace")
-            if status == 400 and "temperature" in text.lower():
-                return self._post({k: v for k, v in body.items() if k != "temperature"})
         except Exception:
             self.usage.failures += 1
             return None
 
-        self.usage.requests += 1
         if status != 200:
+            retry = retry_chat_body(status, text, body)
+            if retry is not None:
+                if "temperature" in body and "temperature" not in retry:
+                    self._omit_temperature = True
+                if "reasoning_effort" in body and "reasoning_effort" not in retry:
+                    self._reasoning_style = "nested" if "reasoning" in retry else "omit"
+                elif "reasoning" in body and "reasoning" not in retry:
+                    self._reasoning_style = "omit"
+                return self._post(retry)
             self.usage.failures += 1
             return None
 
+        self.usage.requests += 1
         try:
             response = json.loads(text)
             usage = response.get("usage") or {}
