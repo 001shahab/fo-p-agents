@@ -96,7 +96,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.4.0"
+AGENT_VERSION = "1.5.0"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -191,6 +191,7 @@ UNIFIED_COLUMNS: Tuple[str, ...] = (
     "PO_Line_Number",
     "Invoice_Number",
     "Item_Number",
+    "Item_Type",
     "Supplier_Id",
     "Supplier_Name",
     "Category_L1",
@@ -615,6 +616,33 @@ def is_code_token(token: str) -> bool:
     if len(token) >= 16 and any(ch.isdigit() for ch in token):
         return True
     return False
+
+
+# Words that say what the number after them identifies. Fortum asked that an
+# item number survive enrichment; a bare long digit run is still an invoice or
+# document reference, so the number is kept only where the text labels it.
+_ITEM_NUMBER_MARKERS = frozenset({
+    "item", "items", "itemnum", "itemno", "itemnumber", "article", "articleno",
+    "art", "code", "part", "partno", "pos", "position", "ref", "nro", "nr",
+    "no", "nimike", "tuote", "artikel", "artikelnr", "pozycja", "numer",
+})
+
+
+def keep_purchase_tokens(tokens: Sequence[str]) -> List[str]:
+    """Drop opaque codes, keeping numbers that describe the purchase.
+
+    Wattage, sizes and short quantities are kept by ``is_measurement_token``.
+    A longer number is kept when a preceding word names it, as in "item 970094".
+    """
+    kept: List[str] = []
+    for index, token in enumerate(tokens):
+        if is_measurement_token(token) or not is_code_token(token):
+            kept.append(token)
+            continue
+        previous = lookup_key(tokens[index - 1]) if index else ""
+        if token.isdigit() and previous in _ITEM_NUMBER_MARKERS:
+            kept.append(token)
+    return kept
 
 
 # Nordic/Polish/German letters that never belong in the enriched columns.
@@ -1375,6 +1403,11 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "invoice_number": ("invoicenumber", "invoiceid", "invoiceno", "invoicekey"),
     "item_number": ("itemnum", "itemid", "articleid", "materialnumber",
                     "supplierproductcode", "itemcode", "itemnumber"),
+    # Basware records how a line was raised. Agent 3 turns "External webshop"
+    # and "Market place" into Standard_item = Yes, so the value has to survive
+    # the unified table rather than being read from the extract a second time.
+    "item_type": ("itemtype", "itemtypename", "lineitemtype", "baswareitemtype",
+                  "purchasingtype", "requisitiontype"),
     "supplier_id": ("erpsuppliernumber", "suppliercode", "vendorid", "suppliernumber",
                     "vendornum", "supplierid"),
     "supplier_name": ("erpsuppliername", "suppliername", "supplier", "vendor",
@@ -1446,8 +1479,10 @@ KNOWN_PROFILES: Tuple[SourceProfile, ...] = (
         fingerprint=("sourcerowid", "datasource", "documentlinedesc", "categoryl1",
                      "materialgroupnumber", "spendineur"),
         description_fields=("Document line desc", "PO line desc"),
+        # A supplier name is who was paid, never what was bought, so it is not
+        # offered as evidence for the description.
         context_fields=("MaterialGroupName", "Category L4", "Category L3",
-                        "Category L2", "Category L1", "ERP supplier name"),
+                        "Category L2", "Category L1"),
         code_fields=("MaterialGroupNumber", "GLAccountNumber"),
     ),
     SourceProfile(
@@ -1455,7 +1490,7 @@ KNOWN_PROFILES: Tuple[SourceProfile, ...] = (
         fingerprint=("ponum", "linedescription", "itemnum", "commoditygroup",
                      "commodity", "orderqty"),
         description_fields=("LINE_DESCRIPTION", "DESCRIPTION"),
-        context_fields=("COMMODITY", "COMMODITYGROUP", "VENDOR", "POTYPE"),
+        context_fields=("COMMODITY", "COMMODITYGROUP"),
         code_fields=("ITEMNUM", "COMMODITYGROUP", "CONTRACTREFNUM"),
     ),
     SourceProfile(
@@ -1464,8 +1499,10 @@ KNOWN_PROFILES: Tuple[SourceProfile, ...] = (
                      "unspsc", "maincategory", "subcategory"),
         description_fields=("Supplier product name", "PO line text1", "PO line text2",
                             "PO line text3", "PO line text4", "PO line text5"),
-        context_fields=("Sub category", "Main category", "Account name", "Item type",
-                        "Project name", "Supplier name"),
+        # "Item type" is deliberately absent: it says how the line was raised,
+        # not what was bought, and it now travels as its own column instead.
+        context_fields=("Sub category", "Main category", "Account name",
+                        "Project name"),
         code_fields=("Supplier product code", "Item ID", "UNSPSC", "Category code"),
     ),
     SourceProfile(
@@ -1493,7 +1530,7 @@ _DESCRIPTIVE_HINTS = ("desc", "description", "text", "name", "note", "comment",
 _DESCRIPTIVE_BLOCKERS = ("supplier", "vendor", "company", "creditor", "buyer",
                          "creator", "owner", "agent", "requester", "person",
                          "country", "currency", "status", "file", "user",
-                         "xpointernal", "internalnote")
+                         "xpointernal", "internalnote", "itemtype")
 
 
 def profile_table(table: Table, sample_rows: List[List[str]]) -> Tuple[SourceProfile, float]:
@@ -3165,6 +3202,10 @@ class LineRecord:
     own_context: List[str] = field(default_factory=list)
     own_codes: List[str] = field(default_factory=list)
 
+    # The row's free text was present and was entirely a buyer note, so the
+    # line is Unclear rather than a guess from its category or its supplier.
+    own_text_was_note: bool = False
+
     evidence: EvidenceBundle = field(default_factory=EvidenceBundle)
     match_tier: str = "none"
     match_score: float = 0.0
@@ -3213,7 +3254,8 @@ class DescriptionSynthesiser:
     """
 
     # The only words the synthesiser may add. Everything else must be traceable.
-    _CONNECTORS = frozenset({"and", "for", "with", "service", "services", "work"})
+    _CONNECTORS = frozenset({"and", "for", "with", "service", "services", "work",
+                             "item", "no", "nr", "ref", "part", "code"})
 
     _BOILERPLATE = re.compile(
         r"\b(according to contract|as per contract|per agreement|see attachment|"
@@ -3324,7 +3366,10 @@ class DescriptionSynthesiser:
                            if self._is_meaningful(fragment) and not is_non_purchase_text(fragment)]
 
         # A note that does not name an item or a service is Unclear, not a
-        # guess from the category the line happened to be filed under.
+        # guess from the category the line happened to be filed under. The same
+        # applies when the note was stripped before it reached this method.
+        if not cleaned_primary and record.own_text_was_note:
+            return DescriptionResult(item_or_service="Unclear")
         if (not cleaned_primary and english_fragments
                 and all(is_non_purchase_text(fragment) or not self._is_meaningful(self._strip_noise(fragment))
                         for fragment in english_fragments)):
@@ -3390,10 +3435,10 @@ class DescriptionSynthesiser:
         pool = english or unique
         chosen = max(pool, key=lambda item: (len(tokenise(item)), len(item)))
 
-        words = [word for word in tokenise(chosen)
-                 if not is_code_token(word) or is_measurement_token(word)]
+        words = keep_purchase_tokens(tokenise(chosen))
         words = [word for word in words
-                 if word.lower() not in self.analyser.stopwords
+                 if word.isdigit()
+                 or word.lower() not in self.analyser.stopwords
                  or word.lower() in self._CONNECTORS]
         if not words:
             return "", ()
@@ -3406,6 +3451,9 @@ class DescriptionSynthesiser:
         phrases = self.analyser.noun_phrases(description)
         candidate = phrases[0] if phrases else description
         words = tokenise(candidate)[: self.settings.max_short_words]
+        # Truncation can leave "... item" with the number it introduced cut off.
+        while words and lookup_key(words[-1]) in _ITEM_NUMBER_MARKERS:
+            words.pop()
         return " ".join(words)
 
     @staticmethod
@@ -3645,17 +3693,23 @@ class Agent1:
 
     def _extract_texts(self, profile: SourceProfile, resolver: ColumnResolver,
                        row: Sequence[str]) -> Tuple[List[str], List[str], List[str],
-                                                    List[str], List[str]]:
+                                                    List[str], List[str], bool]:
         """Pull the descriptive, contextual and code values out of one row.
 
         Description fields are returned in the profile's declared order, which
         encodes which field is the better free-text source for that system. The
         descriptions come back twice: once softened for analysis and once
         exactly as the client wrote them, for the audit trail.
+
+        The final flag says the row did carry free text and all of it was a
+        buyer note. Fortum's rule is that such a line is Unclear, so the
+        difference between "nothing was written" and "only a note was written"
+        has to survive this method.
         """
         descriptions: List[str] = []
         descriptions_raw: List[str] = []
         description_fields: List[str] = []
+        note_only = False
         for header in profile.description_fields:
             if is_internal_note_header(header):
                 continue
@@ -3663,6 +3717,7 @@ class Agent1:
             if value and not self.lexicon.is_noise(value):
                 remainder = strip_non_purchase_text(value)
                 if not remainder:
+                    note_only = True
                     continue
                 descriptions.append(soften_caps(remainder))
                 descriptions_raw.append(value)
@@ -3684,7 +3739,8 @@ class Agent1:
             if value and not self.lexicon.is_noise(value):
                 codes.append(value)
 
-        return descriptions, descriptions_raw, description_fields, context, codes
+        return (descriptions, descriptions_raw, description_fields, context,
+                codes, note_only and not descriptions)
 
     def collect(self) -> None:
         """First pass: index phrases, evidence and duplicates."""
@@ -3694,7 +3750,8 @@ class Agent1:
             rows_read = 0
             for row_number, row in table.iter_rows():
                 rows_read += 1
-                descriptions, _, _, context, codes = self._extract_texts(profile, resolver, row)
+                descriptions, _, _, context, codes, _ = self._extract_texts(
+                    profile, resolver, row)
                 primary = descriptions[0] if descriptions else ""
                 row_type = classify_row(resolver, row, primary)
 
@@ -3839,7 +3896,7 @@ class Agent1:
                    table: Table, row_number: int, row: Sequence[str]) -> LineRecord:
         """Build the complete enriched record for one input row."""
         (descriptions, descriptions_raw, description_fields,
-         context, codes) = self._extract_texts(profile, resolver, row)
+         context, codes, note_only) = self._extract_texts(profile, resolver, row)
         primary = descriptions[0] if descriptions else ""
         row_type = classify_row(resolver, row, primary)
 
@@ -3860,6 +3917,7 @@ class Agent1:
             own_description_fields=description_fields,
             own_context=context,
             own_codes=codes,
+            own_text_was_note=note_only,
         )
 
         record.business = {
@@ -3870,6 +3928,7 @@ class Agent1:
             "category_l3": category_values[2],
             "category_l4": category_values[3],
             "category_path": " > ".join(value for value in category_values if value),
+            "item_type": resolver.value(row, "item_type"),
             "material_group_number": resolver.value(row, "material_group_number"),
             "material_group_name": resolver.value(row, "material_group_name"),
             "business_area": resolver.value(row, "business_area"),
@@ -4029,6 +4088,7 @@ class Agent1:
             "PO_Line_Number": record.keys.get("po_line_number", ""),
             "Invoice_Number": record.keys.get("invoice_number", ""),
             "Item_Number": record.keys.get("item_number", ""),
+            "Item_Type": business.get("item_type", ""),
             "Supplier_Id": business.get("supplier_id", ""),
             "Supplier_Name": business.get("supplier_name", ""),
             "Category_L1": business.get("category_l1", ""),

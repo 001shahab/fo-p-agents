@@ -396,9 +396,10 @@ Key columns:
 | --- | --- |
 | `Enriched_Purchase_Description` | one or two English sentences naming what was bought |
 | `Enriched_Description_Short` | a compact form for narrow reports |
-| `Item_Or_Service` | material or service |
+| `Item_Or_Service` | material, service, or `Unclear` when the line does not say what was bought |
 | `AI_Confidence` / `Confidence_Band` | 0–100 and High/Medium/Low |
 | `Original_Description` | the source text, unchanged |
+| `Item_Number` / `Item_Type` | the item number and how the line was raised, for Agent 3 |
 | `Detected_Language` | the language the source text was written in |
 | `Translation_Method` | which tier of the cascade produced the English |
 | `Translation_Coverage` | share of content tokens the local stack resolved |
@@ -408,6 +409,13 @@ Key columns:
 
 Business keys — supplier, category L1 to L4, business area, division, country,
 spend, dates — are carried through unchanged for the downstream agents.
+
+Numbers that describe the purchase survive enrichment: wattage, DN/PN sizes,
+quantities, and an item number the source text names, as in `item 970094`. A
+bare long digit run is treated as a document reference and dropped. A line whose
+only free text was a buyer note — Fortum's `Confirmed with site manager` — is
+reported as `Unclear` with an empty description rather than guessed from its
+category or its supplier.
 
 ---
 
