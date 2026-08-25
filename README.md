@@ -26,6 +26,7 @@ back to the source row it came from.
 ```bash
 python3 -m venv myenv && source myenv/bin/activate
 pip install --upgrade pip && pip install -r requirements.txt
+pip install -r requirements-models.txt      # optional, improves accuracy
 
 python agent1.py        # then answer the prompts, or press Enter for defaults
 python agent2.py
@@ -171,19 +172,34 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Then the language resources:
+Then the language resources, both of which are optional:
 
 ```bash
-python -m spacy download en_core_web_sm
-python -m spacy download fi_core_news_sm
-python -m spacy download sv_core_news_sm
-python -m spacy download pl_core_news_sm
-python -m spacy download de_core_news_sm
-python -m spacy download nb_core_news_sm
-python -m spacy download xx_ent_wiki_sm
-
+pip install -r requirements-models.txt
 python -m nltk.downloader punkt punkt_tab stopwords wordnet omw-1.4
 ```
+
+`requirements-models.txt` holds the two spaCy pipelines the agents load, English
+and the multilingual fallback. They are kept out of `requirements.txt` because
+spaCy publishes them on GitHub rather than PyPI, and one unreachable host in the
+main file fails the whole install. Without them each agent falls back to
+rule-based phrase extraction and logs that it has done so: some accuracy in
+reading long descriptions, no change to any column.
+
+On a corporate network that inspects TLS, `pip` reports `self-signed certificate
+in certificate chain` for anything it fetches. The proxy re-signs HTTPS with a
+root certificate Python does not ship, so point pip at a bundle that has it:
+
+```bash
+security find-certificate -a -p /Library/Keychains/System.keychain > ~/roots.pem
+cat "$(python -c 'import certifi; print(certifi.where())')" ~/roots.pem > ~/ca-bundle.pem
+pip config set global.cert ~/ca-bundle.pem
+```
+
+Export `REQUESTS_CA_BUNDLE` and `SSL_CERT_FILE` to that same file, as shell
+variables rather than `.env` entries, so the Hugging Face downloads and the
+language-model calls trust it too. `.env` is read for endpoints and keys and is
+never exported to the environment.
 
 The translation and embedding models download on first use and are cached under
 `~/.cache/huggingface` (roughly 1 GB in total). To fetch them ahead of time, or
@@ -1210,7 +1226,8 @@ catalogues covering the categories actually being purchased, and read
 ├── agent4.py                          Supplier consolidation
 ├── lexicon/
 │   └── procurement_lexicon.json       controlled procurement vocabulary
-├── requirements.txt                   Python dependencies
+├── requirements.txt                   Python dependencies, all from PyPI
+├── requirements-models.txt            optional spaCy pipelines, from GitHub
 ├── .env.example                       language-model configuration template
 ├── .gitignore
 └── README.md

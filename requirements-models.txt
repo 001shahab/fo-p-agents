@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------------------
+# Fortum AI-Powered Procurement Analysis - optional spaCy language pipelines
+#
+#   pip install -r requirements.txt              # first, the packages
+#   pip install -r requirements-models.txt       # then, these pipelines
+#
+# Requires Python 3.9 or newer, with spacy already installed.
+# ---------------------------------------------------------------------------
+#
+# Why these are in their own file
+# -------------------------------
+# spaCy pipelines are published on GitHub, not on PyPI. Listing them alongside
+# the packages meant one unreachable host failed the entire install - which is
+# what a corporate network that inspects TLS produces - for components every
+# agent treats as optional. Each agent imports spaCy defensively, and where no
+# pipeline is present falls back to rule-based phrase extraction and says so in
+# the log.
+#
+# Skipping this file costs some accuracy in pulling noun phrases out of long
+# descriptions. It stops no run and changes no column, so it is safe to skip and
+# safe to retry later on a better network.
+#
+# On a network that inspects TLS
+# ------------------------------
+# A corporate proxy re-signs HTTPS with its own root certificate, which Python
+# does not trust, and pip reports "self-signed certificate in certificate
+# chain". Point pip at a bundle that includes that root:
+#
+#   security find-certificate -a -p /Library/Keychains/System.keychain > ~/roots.pem
+#   cat "$(python -c 'import certifi; print(certifi.where())')" ~/roots.pem > ~/ca-bundle.pem
+#   pip config set global.cert ~/ca-bundle.pem
+#
+# Export REQUESTS_CA_BUNDLE and SSL_CERT_FILE to that same file, as real shell
+# variables, so the Hugging Face downloads and the language-model calls trust it
+# too. The project's .env file will not serve: it is read for endpoints and keys
+# and is never exported to the environment.
+# ---------------------------------------------------------------------------
+
+# --- English ---------------------------------------------------------------
+# Tokenisation, part-of-speech tagging and named entity recognition over the
+# standardised English descriptions. Loaded by Agents 1, 2 and 3, each of which
+# prefers this pipeline and accepts en_core_web_md in its place. This is the one
+# to install if you install only one.
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+
+# --- Multilingual fallback -------------------------------------------------
+# Entity recognition only. Agent 1 tries this last, for text that reached it
+# before translation. Agents 2 and 3 do not use it, because by the time a line
+# reaches them its description is already English.
+xx_ent_wiki_sm @ https://github.com/explosion/spacy-models/releases/download/xx_ent_wiki_sm-3.8.0/xx_ent_wiki_sm-3.8.0-py3-none-any.whl
+
+# ---------------------------------------------------------------------------
+# Not listed here on purpose
+# ---------------------------------------------------------------------------
+#
+# The Finnish, Swedish, Polish, German and Norwegian pipelines are not listed,
+# because no code path loads them: the agents read the source languages with the
+# controlled vocabulary, the Snowball stemmers and the opus-mt translation
+# models, and reach for spaCy only once the text is English. An earlier note in
+# requirements.txt recommended downloading them, which was several hundred
+# megabytes for no effect.
+#
+# The translation and sentence-embedding models are not listed either. They come
+# from the Hugging Face hub on first use, are cached under ~/.cache/huggingface,
+# and are not pip packages. To pre-load them, or to stage them for a machine
+# with no route to the hub:
+#
+#   python -c "from sentence_transformers import SentenceTransformer; \
+#              SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')"
+#   python -c "from transformers import pipeline; \
+#              [pipeline('translation', model=f'Helsinki-NLP/opus-mt-{p}') \
+#               for p in ('fi-en', 'sv-en', 'pl-en', 'de-en')]"
+# ---------------------------------------------------------------------------
