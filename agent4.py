@@ -573,6 +573,27 @@ GROUP_LABEL_COLUMN = "AI_Purchase_Group_L5"
 GROUP_ID_COLUMN = "AI_Purchase_Group_Id"
 SPEND_COLUMN = "Spend_EUR"
 
+# Which country a line belongs to, in preference order.
+#
+# Fortum settled the definition: the delivered-to country, or the company-code
+# country where no delivery address was recorded - the normal case for an
+# invoice, which says who was billed rather than where the goods went.
+#
+# Agent 1 has already applied that rule and writes the answer to Country, along
+# with the column it read it from in Country_Source. The delivery spellings are
+# listed here as well so that Agent 4 gives the same answer when it is pointed
+# straight at an extract that never went through Agent 1.
+#
+# Supplier country is deliberately not a candidate. Agent 4 compares two
+# suppliers' portfolios, so a country taken from the supplier would have
+# Same_Country comparing each supplier with itself.
+COUNTRY_COLUMNS = ("Delivered_To_Country", "Delivery_Country", "Ship_To_Country",
+                   "Country")
+
+# Names the run summary uses when reporting which column answered Country, so a
+# reader is told the source in the same words the client used.
+COUNTRY_SOURCE_COLUMN = "Country_Source"
+
 OTHER_GROUP_LABEL = "Other"
 OTHER_GROUP_ID = "G-OTHER"
 
@@ -584,6 +605,46 @@ UNIDENTIFIED_ITEM_LABEL = "Unidentified purchases"
 # Consulted when present, reported when populated, never required.
 CONTEXT_COLUMNS = ("Country", "Business_Area", "Division", "Item_Or_Service",
                    "Item_Number", "Material_Group_Name", "Source_System")
+
+
+def row_country(row: Dict[str, str]) -> str:
+    """The country a line belongs to, by Fortum's definition.
+
+    First populated candidate wins, so the fallback is decided per line: an
+    extract carrying a delivery country on its order rows and nothing on its
+    invoice rows is answered correctly on both.
+    """
+    for column in COUNTRY_COLUMNS:
+        value = normalise_text(row.get(column, ""))
+        if value:
+            return value
+    return ""
+
+
+def country_provenance(table: "InputTable") -> Dict[str, int]:
+    """How many lines took their country from which column.
+
+    Reported because Fortum asked what the country in this agent actually was.
+    A count per column answers that from the run itself rather than from the
+    documentation, and shows at a glance whether delivery addresses were present
+    at all or whether every line fell back to the company country.
+    """
+    tally: Counter = Counter()
+    for row in table.rows:
+        # Agent 1 states its own answer, and it is the authority on a table it
+        # wrote: reading its Country column again would report "Country" for
+        # every line and hide the delivery addresses it resolved.
+        stated = normalise_text(row.get(COUNTRY_SOURCE_COLUMN, ""))
+        if stated:
+            tally[stated] += 1
+            continue
+        for column in COUNTRY_COLUMNS:
+            if normalise_text(row.get(column, "")):
+                tally[column] += 1
+                break
+        else:
+            tally["(none)"] += 1
+    return dict(tally)
 
 
 @dataclass
@@ -902,7 +963,7 @@ class SupplierResolver:
             if not name and not identifier:
                 continue
             spend = parse_amount(row.get(SPEND_COLUMN, "")) or 0.0
-            country = normalise_text(row.get("Country", ""))
+            country = row_country(row)
             business_area = normalise_text(row.get("Business_Area", ""))
 
             canonical = self.normaliser.normalise(name) if name else ""
@@ -1305,7 +1366,7 @@ class PortfolioBuilder:
 
             item_key, item_label, named = self._item(row)
             spend = parse_amount(row.get(SPEND_COLUMN, "")) or 0.0
-            country = normalise_text(row.get("Country", ""))
+            country = row_country(row)
             self.space.add(item_key, item_label, named)
 
             for level in available:
@@ -2608,6 +2669,11 @@ class Agent4:
         self.run_id = stable_hash("agent4-run", self.settings.input_path.name,
                                   str(len(self.table.rows)), AGENT_VERSION)
 
+        # Recorded before anything is compared, because every country-based
+        # finding below - Same_Country, and what --same-country-only withholds -
+        # rests on this and Fortum asked to be told what it was.
+        self.statistics["country_from_column"] = country_provenance(self.table)
+
         self.resolver.ingest(self.table.rows)
         if len(self.resolver.suppliers) < 2:
             raise SystemExit(
@@ -2925,6 +2991,24 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
         print(f"    High is a partner covering at least "
               f"{format_percent(settings.high_similarity)}% of a supplier's portfolio "
               f"with at least {settings.min_addressable_spend:,.0f} EUR at stake.")
+
+    # What "country" meant on this run. Printed rather than left to the manifest
+    # because every country-based finding below depends on it, and Fortum had to
+    # ask what it was.
+    provenance = statistics.get("country_from_column") or {}
+    if provenance:
+        named = sorted(((column, count) for column, count in provenance.items()
+                        if column != "(none)"), key=lambda item: (-item[1], item[0]))
+        print("  Country read from    : "
+              + ("  ".join(f"{column} {count:,}" for column, count in named)
+                 if named else "no country on any line"))
+        missing = provenance.get("(none)", 0)
+        if missing:
+            print(f"    {missing:,} line(s) carry no country at all and are compared "
+                  f"without one.")
+        if named and all(column == "Country" for column, _ in named):
+            print("    Delivery country was not present, so this is the company-code "
+                  "country throughout.")
 
     # Fortum is still deciding whether a partner in another country counts as a
     # suggestion at all, so the size of the question is reported either way.

@@ -194,6 +194,10 @@ AGENT1_REQUIRED: Tuple[str, ...] = (
     "Match_Score", "Matched_Source_Systems", "Confidence_Factors", "Source_System",
     "Row_Type", "Is_Duplicate", "Duplicate_Of", "Source_File", "Source_Sheet",
     "Source_Row_Number", "Row_Id", "Run_Id",
+    # Which column answered Country. Carried through because Agent 4's
+    # Same_Country findings rest on it, and the wide table is where a reader
+    # checks whether a country came from a delivery address or a company code.
+    "Country", "Country_Source",
 )
 
 AGENT2_REQUIRED: Tuple[str, ...] = (

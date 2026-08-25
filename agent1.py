@@ -206,6 +206,10 @@ UNIFIED_COLUMNS: Tuple[str, ...] = (
     "Company_Code",
     "Company_Name",
     "Country",
+    # Which column answered Country on this row. Present because Fortum could not
+    # tell what the country in Agent 4 meant, and a name in a cell settles that
+    # permanently in a way a paragraph of documentation does not.
+    "Country_Source",
     "Quantity",
     "Unit",
     "Unit_Price",
@@ -1478,7 +1482,28 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "division": ("division", "divisionname"),
     "company_code": ("legalcompanynumber", "companycode", "buyercompany", "orgid", "organizationcode"),
     "company_name": ("legalcompanyname", "companyname", "organizationname"),
-    "country": ("country", "suppliercountry", "organizationcountry", "purchasingcountry"),
+    # Where the purchase was delivered, and failing that where the buying company
+    # is registered. Fortum settled this: the country is the delivered-to country,
+    # or the company-code country when there is no delivery address to read - which
+    # is the normal case for an invoice, since an invoice records who was billed
+    # and not where the goods went.
+    #
+    # Read with `first_value`, so the fallback is decided per row rather than per
+    # table: an extract that carries a delivery country on its purchase-order rows
+    # and leaves it blank on its invoice rows gets the right answer on both.
+    #
+    # Supplier country is deliberately absent. It used to sit second in this list,
+    # which meant a row with no company country was answered with the country the
+    # supplier invoices from - a different question, and the reason Agent 4 could
+    # not say what its country column meant. It must never be a fallback here:
+    # Agent 4 compares two suppliers' portfolios, so filling this from the supplier
+    # would make Same_Country compare each supplier with itself.
+    "country": ("deliverytocountry", "deliveredtocountry", "deliverycountry",
+                "shiptocountry", "destinationcountry", "receivingcountry",
+                "goodsreceiptcountry", "deliveryaddresscountry",
+                "country", "companycountry", "companycodecountry",
+                "legalcompanycountry", "organizationcountry", "organisationcountry",
+                "purchasingcountry"),
     "quantity": ("quantity", "orderqty", "polinequantity", "quantitycharged",
                  "quantitydelivered", "qty"),
     "unit": ("unit", "uom", "unitofmeasure", "orderunit"),
@@ -1783,6 +1808,19 @@ class ColumnResolver:
         for position in self.positions(logical_field):
             if position < len(row) and row[position].strip():
                 return row[position]
+        return ""
+
+    def first_header(self, row: Sequence[str], logical_field: str) -> str:
+        """Header that ``first_value`` read this row's answer from.
+
+        Reported alongside a value wherever the choice between candidates is
+        itself a business decision. Country is the case that prompted it: the
+        value alone cannot tell a reader whether it came from the delivery
+        address or from the buying company's registration.
+        """
+        for position in self.positions(logical_field):
+            if position < len(row) and row[position].strip():
+                return self.headers[position]
         return ""
 
 
@@ -4108,7 +4146,11 @@ class Agent1:
             "division": resolver.value(row, "division"),
             "company_code": resolver.value(row, "company_code"),
             "company_name": resolver.value(row, "company_name"),
-            "country": resolver.value(row, "country"),
+            # Per row, not per table: see the note on the country aliases. An
+            # extract that carries a delivery country on its order lines and
+            # leaves it blank on its invoice lines needs both answers.
+            "country": resolver.first_value(row, "country"),
+            "country_source": resolver.first_header(row, "country"),
             "quantity": resolver.value(row, "quantity"),
             "unit": resolver.value(row, "unit"),
             "unit_price": resolver.value(row, "unit_price"),
@@ -4283,6 +4325,7 @@ class Agent1:
             "Company_Code": business.get("company_code", ""),
             "Company_Name": business.get("company_name", ""),
             "Country": business.get("country", ""),
+            "Country_Source": business.get("country_source", ""),
             "Quantity": business.get("quantity", ""),
             "Unit": business.get("unit", ""),
             "Unit_Price": business.get("unit_price", ""),

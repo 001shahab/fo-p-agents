@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import hashlib
 import json
 import logging
@@ -1578,6 +1579,13 @@ class ReferenceLibrary:
         self.rejected_files: List[str] = []
         self.unreadable_files: List[str] = []
 
+        # What each catalogue actually was, file by file. Fortum's instruction is
+        # to check the catalogue is the client's latest before a run, and a name
+        # and an item count cannot answer that: two files with the same name and
+        # the same number of rows can differ. The modification date says whether
+        # the file was refreshed, and the digest says whether the contents moved.
+        self.sources: List[Dict[str, Any]] = []
+
     def load(self, *roots: Path) -> None:
         """Read every usable catalogue beneath one or more folders."""
         seen_paths: Set[Path] = set()
@@ -1631,6 +1639,7 @@ class ReferenceLibrary:
                 added = self._absorb(table)
                 if added:
                     self.files_read.append(f"{path.name} ({added} item(s))")
+                    self.sources.append(self._describe(path, added))
                 else:
                     self.skipped_files.append(path.name)
 
@@ -1640,6 +1649,35 @@ class ReferenceLibrary:
                     "%d file(s) refused, %d unreadable.",
                     len(self.items), len(self.files_read),
                     len(self.rejected_files), len(self.unreadable_files))
+        if not self.items:
+            # Not fatal - the agent still reports what is already standard and
+            # still nominates candidates - but every proposed match is now
+            # impossible, so the reason has to be unmissable.
+            LOGGER.error("No catalogue item was loaded, so no match can be "
+                         "proposed. Check --catalogues points at the client's "
+                         "item catalogue.")
+
+    @staticmethod
+    def _describe(path: Path, items: int) -> Dict[str, Any]:
+        """Identify one catalogue file well enough to tell two versions apart."""
+        try:
+            stat = path.stat()
+            modified = datetime.datetime.fromtimestamp(
+                stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+            size = stat.st_size
+        except OSError:
+            modified, size = "", 0
+        digest = ""
+        try:
+            hasher = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1 << 20), b""):
+                    hasher.update(block)
+            digest = hasher.hexdigest()[:12]
+        except OSError:
+            pass
+        return {"file": path.name, "items": items, "modified": modified,
+                "bytes": size, "sha256": digest}
 
     def _refuse(self, table: InputTable) -> str:
         """Why this table is not a catalogue, or an empty string if it is one.
@@ -2564,6 +2602,8 @@ class Agent3:
                 "model": self.settings.model.model if self.settings.model.enabled else None,
             },
             "reference_files": self.library.files_read,
+            # Enough to prove which version of the client's catalogue was used.
+            "catalogue_sources": self.library.sources,
             "skipped_files": self.library.skipped_files,
             "refused_files": self.library.rejected_files,
             "unreadable_files": self.library.unreadable_files,
@@ -2828,9 +2868,15 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     # A catalogues folder is used when one is named, and also when the standard
     # one exists, so that dropping the client's catalogues into ./catalogues is
     # all it takes to keep them apart from the purchase extracts.
+    #
+    # An explicitly named --reference is never overridden this way. Naming a
+    # reference folder is an instruction about where to read, and since a named
+    # catalogue folder becomes the whole answer, letting ./catalogues win would
+    # silently redirect the run somewhere the caller did not ask for and report a
+    # complete run against the wrong catalogue.
     if args.catalogues:
         default_catalogues: Optional[Path] = Path(args.catalogues)
-    elif (here / "catalogues").is_dir():
+    elif not args.reference and (here / "catalogues").is_dir():
         default_catalogues = here / "catalogues"
     else:
         default_catalogues = None
@@ -2964,8 +3010,24 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
     print(f"  Reference items      : {statistics.get('reference_items', 0):,} "
           f"from {statistics.get('reference_files', 0)} file(s)")
 
-    for entry in manifest["reference_files"]:
-        print(f"    {entry}")
+    # Named with its date and digest, so "is this the client's latest catalogue?"
+    # can be answered from the run output before the numbers below are trusted.
+    sources = manifest.get("catalogue_sources") or []
+    if sources:
+        for entry in sources:
+            print(f"    {entry['file']}")
+            print(f"      {entry['items']:,} item(s), modified "
+                  f"{entry['modified'] or 'unknown'}, "
+                  f"{entry['bytes']:,} bytes, sha256 {entry['sha256'] or 'unknown'}")
+    else:
+        for entry in manifest["reference_files"]:
+            print(f"    {entry}")
+
+    if not statistics.get("reference_items"):
+        print("  NO CATALOGUE WAS LOADED - no match can be proposed.")
+        print("    Point --catalogues at the folder holding the client's item")
+        print("    catalogue, and check the file is their latest.")
+
     if manifest["skipped_files"]:
         print("  Files with no recognisable item description (skipped):")
         for name in manifest["skipped_files"]:

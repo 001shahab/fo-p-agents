@@ -11,6 +11,8 @@ __pycache__/
 sources/
 results/
 feedback/
+# Item catalogues sent by the client, read by Agent 3
+catalogues/
 
 # Credentials
 .env

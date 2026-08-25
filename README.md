@@ -421,10 +421,19 @@ Key columns:
 | `Translation_Coverage` | share of content tokens the local stack resolved |
 | `Evidence_Sources` | which fields the description was built from |
 | `Match_Tier` / `Match_Score` | how the source records were linked |
+| `Country` / `Country_Source` | the country, and the column it was read from |
 | `Row_Id` | stable identifier, reproducible across runs |
 
-Business keys — supplier, category L1 to L4, business area, division, country,
-spend, dates — are carried through unchanged for the downstream agents.
+Business keys — supplier, category L1 to L4, business area, division, spend,
+dates — are carried through unchanged for the downstream agents.
+
+`Country` is the one business key that is decided rather than copied. Fortum
+settled the definition: the delivered-to country, or the company-code country
+where no delivery address was recorded, as on an invoice. The choice is made per
+line, so one extract can answer both ways, and `Country_Source` names the column
+that answered on each row. Supplier country is never used — see
+[Which country](#which-country) under Agent 4, which is where the distinction
+matters.
 
 Numbers that describe the purchase survive enrichment: wattage, DN/PN sizes,
 quantities, and an item number the source text names, as in `item 970094`. A
@@ -572,6 +581,27 @@ Let the language model adjudicate borderline matches? [y/N]:
 Fortum sends item catalogues separately from the master data, so they get an
 input of their own: put them in `./catalogues`, or name a folder with
 `--catalogues DIR`, and every file beneath it is read whatever its layout.
+Naming `--reference` instead suppresses the `./catalogues` default, so a run
+pointed somewhere explicitly is never quietly redirected.
+
+**Check the catalogue is the client's latest before you run.** A stale catalogue
+does not fail; it silently proposes fewer matches, and reports them as
+confidently as it would report the right number. Each file is therefore named
+with its date, size and digest, which is enough to tell two versions apart:
+
+```
+  Reference items      : 4,200 from 1 file(s)
+    Fortum - Item Catalogues - Master.xlsx
+      4,200 item(s), modified 2026-08-25 18:29, 193,174 bytes, sha256 3af28eb35083
+```
+
+If no catalogue is loaded at all, the run says so in place of those numbers
+rather than reporting nought matches as if that were a finding:
+
+```
+  NO CATALOGUE WAS LOADED - no match can be proposed.
+```
+
 
 What a purchase is matched against decides whether the answer means anything. A
 catalogue lists what may be bought; a purchase extract records what *was* bought,
@@ -736,6 +766,39 @@ Both rows describe the same pair. The first says all of Drive Systems' trade is
 available from Nordic Automation; the second says only half of Nordic
 Automation's is available from Drive Systems. Drive Systems is the one to
 consolidate away.
+
+### Which country
+
+Fortum asked what the country in this agent actually was, and settled the
+definition: **the delivered-to country, or the company-code country where no
+delivery address was recorded** — which is the normal case for an invoice, since
+an invoice records who was billed rather than where the goods went.
+
+The choice is made per line, not per file, so an extract carrying a delivery
+country on its order rows and nothing on its invoice rows is answered correctly
+on both. Agent 1 applies the rule and writes the answer to `Country`, along with
+the column it read it from in `Country_Source`; Agent 4 reads that. Every run
+states which columns answered, so the question does not have to be asked again:
+
+```
+  Country read from    : Country 22
+    3 line(s) carry no country at all and are compared without one.
+    Delivery country was not present, so this is the company-code country throughout.
+```
+
+**Supplier country is never used.** It used to sit second in the fallback chain,
+so any line without a company country reported the country its supplier invoices
+from. That is a different question, and a damaging one to confuse here: Agent 4
+compares two suppliers' portfolios, so a country taken from the supplier would
+have `Same_Country` comparing each supplier with itself. Three checks in the test
+harness hold this in place — that delivery wins where present, that the fallback
+is per line, and that the supplier's country is never borrowed.
+
+No current Fortum extract carries a delivery country; Basware supplies
+`Organization country` and Sievo's `Country` is the company one, so in practice
+every line is answered from the company code today. The preference is implemented
+so that a delivery country appearing in a future extract wins automatically, and
+`Country_Source` will show it without anybody having to check the code.
 
 ### Partners in another country
 
@@ -1210,9 +1273,16 @@ descriptions are weak. Check `Translation_Coverage` and `AI_Confidence` in
 **Too many or too few groups** (Agent 2) — adjust `--min-groups` and
 `--max-groups`; the threshold adapts to meet them.
 
-**No matches at all** (Agent 3) — check that the reference folder holds
-catalogues covering the categories actually being purchased, and read
-`agent3_match_calibration.csv` before lowering the threshold.
+**No matches at all** (Agent 3) — check the run summary first. If it says `NO
+CATALOGUE WAS LOADED`, the catalogue never arrived and nothing below that line
+means anything. If a catalogue was loaded, check its date and digest are the
+client's latest, and that it covers the categories actually being purchased, then
+read `agent3_match_calibration.csv` before lowering the threshold.
+
+**A run read the wrong catalogue** (Agent 3) — `./catalogues` is used by default,
+and a named `--catalogues` folder becomes the whole answer. Naming `--reference`
+suppresses the default. The summary lists every file that was read, with its
+date and digest.
 
 ---
 
@@ -1237,6 +1307,7 @@ Created at run time and excluded from version control:
 
 ```
 sources/                               client data
+catalogues/                            item catalogues from the client, read by Agent 3
 results/                               generated output
 cache/                                 language-model response cache
 lexicon/agent2_group_registry.json     stable group labels
