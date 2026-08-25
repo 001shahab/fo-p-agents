@@ -5,13 +5,32 @@ Max - wide procurement dataset builder
 
 Author  : Prof. Shahab Anbarjafari
 Purpose : Assemble one wide, analysis-ready table from the separate procurement
-          extracts, in three stages, each written to CSV and JSONL.
+          extracts, in six stages, each written to CSV and JSONL.
 
     Stage 1   Sievo transactions widened with the matching invoice lines.
     Stage 2   The result widened again with the Maximo or Basware purchase
               order line, matched on PO number plus PO line number.
     Stage 3   The free text carried on every row read and turned into
               structured columns.
+    Stage 4   Agent 1's standardised English description, language reading and
+              material-or-service call added to every row.
+    Stage 5   Agent 2's purchase group added, so every line carries the
+              category-L5 grouping it belongs to.
+    Stage 6   Agent 3's catalogue match and standard-item status added. This is
+              the complete table, and the one to hand over.
+
+Agent 4 does not appear as a stage. Its unit of analysis is a supplier within a
+comparison scope rather than a purchase line, so it is written alongside as
+`max_supplier_consolidation`, joinable on the `Supplier_Key` that stage 6 adds
+to every row. Folding it into the wide table would mean either multiplying the
+rows or inventing a per-line summary of a supplier-level finding.
+
+Each stage is a file, so a reviewer can see exactly what each step contributed
+and, if one is wrong, fall back to the one before it. Where Max's own stage 3
+and Agent 1 both name a column, the agent's reading wins because it is the one
+the client reviewed - but only where it is populated, so that an agent which
+failed to resolve a field cannot blank a value Max had already established.
+Max's own reading of every such column stays visible in the stage-3 file.
 
 The governing rule
 ------------------
@@ -52,6 +71,25 @@ strategy, and how populated each candidate key was. When a join matches nothing
 that block is the answer to why, and it is the thing to send back to whoever
 produced the extract.
 
+The agents
+----------
+Stages 4 to 6 run `agent1.py`, `agent2.py` and `agent3.py` as separate processes
+over the stage-3 file, then join what each produced back onto the transaction
+row. They are run rather than imported: each is a standalone tool with its own
+cache, its own spend guard and its own manifest that the client reads, and
+keeping them in their own process means Max can add their columns without
+becoming responsible for their internals. Nothing in an agent is changed to suit
+Max.
+
+The one place the two meet is the column names, which are listed explicitly and
+checked against what each agent actually wrote. A promised column that did not
+arrive stops the run, because a wide table quietly missing a column is worse
+than a run that failed and said which one was missing.
+
+An agent that fails costs the columns it would have added and is reported as
+having failed; the stages already on disk are unaffected and the last good one
+is named as the table to use.
+
 Language model
 --------------
 Stages 1 and 2 never use one. A join is a key operation with a right answer, and
@@ -69,6 +107,7 @@ Usage
 -----
     python max.py                 # prompts for each path in turn
     python max.py --non-interactive --sources ./sources --results ./results
+    python max.py --non-interactive --no-agents      # stop after stage 3
     python max.py --help
 """
 
@@ -82,6 +121,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import unicodedata
 import zipfile
@@ -117,7 +158,74 @@ except ImportError:
 
 
 AGENT_NAME = "Max - wide procurement dataset builder"
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.3.0"
+
+# ---------------------------------------------------------------------------
+# The agent interface
+# ---------------------------------------------------------------------------
+# Stages 4 to 6 widen the table with the output of Agents 1, 2 and 3. The column
+# names below are that interface, and are asserted against what each agent
+# actually wrote: a silently missing column would leave a hole in the Power BI
+# model that only shows up in front of the client, so a missing one stops the
+# run instead.
+#
+# Each agent's own file remains the authority on its own analysis. What Max adds
+# is the join back onto the transaction row, which the agents cannot do for
+# themselves because none of them sees the wide table.
+
+# How a row of an agent's output is traced back to the stage-3 row it came from.
+# Agent 1 records the file, sheet and row number it read each line from, so
+# feeding it the stage-3 file makes this a faithful pointer into that file. It is
+# used rather than Max_Row_Id because Agent 1 emits its own canonical column set
+# and does not carry unknown columns through - and the agents are not being
+# changed to suit Max.
+AGENT_ROW_KEY = "Source_Row_Number"
+
+# Offset between a stage-3 data row and the row number Agent 1 reports for it:
+# Agent 1 counts the header as row 1, so its first data row is 2.
+AGENT_ROW_OFFSET = 2
+
+AGENT1_REQUIRED: Tuple[str, ...] = (
+    "Enriched_Purchase_Description", "Enriched_Description_Short", "Item_Or_Service",
+    "AI_Confidence", "Confidence_Band", "Original_Description",
+    "Original_Description_Fields", "Detected_Language", "Language_Confidence",
+    "Translated_Description", "Translation_Method", "Translation_Coverage",
+    "Unresolved_Tokens", "Evidence_Sources", "Evidence_Field_Count", "Match_Tier",
+    "Match_Score", "Matched_Source_Systems", "Confidence_Factors", "Source_System",
+    "Row_Type", "Is_Duplicate", "Duplicate_Of", "Source_File", "Source_Sheet",
+    "Source_Row_Number", "Row_Id", "Run_Id",
+)
+
+AGENT2_REQUIRED: Tuple[str, ...] = (
+    "AI_Purchase_Group_L5", "AI_Purchase_Group_Id", "AI_Purchase_Group_Confidence",
+    "AI_Purchase_Group_Band", "AI_Purchase_Group_Size", "AI_Purchase_Group_Category",
+    "AI_Purchase_Group_Cohesion", "AI_Purchase_Group_Naming",
+    "AI_Purchase_Group_Is_New", "Agent2_Run_Id",
+)
+
+AGENT3_REQUIRED: Tuple[str, ...] = (
+    "Standard_item", "Potential_Standard_Match", "Match_Source_Column",
+    "Matched_Item_ID", "Matched_Item_Description", "Matched_Item_Supplier",
+    "Matched_Item_Source", "Matched_Item_Unit_Price", "Similarity_Score",
+    "Match_Band", "Match_Method", "Match_Rationale", "Type_Compatible",
+    "Specification_Agreement", "Price_Difference_Percent", "Alternative_Matches",
+    "No_Match_Reason", "Agent3_Run_Id",
+)
+
+# Columns produced by both Max's own stage 3 and by Agent 1. The agent's reading
+# wins, because it is the one the client reviewed and the one the downstream
+# agents were built on - but only when it is populated, so that a value Max
+# already established cannot be blanked by an agent that failed to resolve it.
+# Item_Or_Service is the reason this rule exists: Agent 1 decides it with the
+# head-word rule and never leaves it blank, while Max's stage 3 guesses.
+AGENT_PRECEDENCE_NOTE = ("the agent value wins where it is populated; "
+                         "Max's own reading remains in the stage-3 file")
+
+# Supplier identity as Agent 4 resolves it. Added to the wide row so that the
+# supplier-consolidation companion file can be joined to it: without this the
+# only link would be the raw supplier name, which is the very thing Agent 4
+# exists to normalise away.
+SUPPLIER_KEY_COLUMN = "Supplier_Key"
 
 BANNER = f"""
 ===============================================================================
@@ -199,6 +307,17 @@ class Settings:
     # A row whose deterministic interpretation resolves less than this share of
     # its content words is a candidate for the model tier.
     interpretation_floor: float = 0.55
+
+    # Run Agents 1 to 4 over the stage-3 file and widen the table with their
+    # columns. On by default: the enriched description, the purchase group and the
+    # standard-item match are the analysis the client asked for, and a wide table
+    # without them is only half the deliverable.
+    run_agents: bool = True
+
+    # Ceiling on a single agent, in seconds. Generous because Agent 1 on a full
+    # extract with the model tier on is measured in hours, but present so that an
+    # agent waiting forever on a prompt or a network call cannot hang the build.
+    agent_timeout: int = 21600
 
     use_llm: bool = False
     write_jsonl: bool = True
@@ -2976,6 +3095,426 @@ TEXT_SOURCE_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
 )
 
 
+# ===========================================================================
+# Stages 4 to 6: the agents
+# ===========================================================================
+
+def read_csv_rows(path: Path) -> Iterator[Dict[str, str]]:
+    """Stream a stage file back off disk, one row at a time.
+
+    Streaming rather than loading: the stages are written to be read by the next
+    stage, and a million-row wide table does not want to be in memory twice.
+    """
+    with path.open("r", encoding=CSV_ENCODING, newline="") as handle:
+        for record in csv.DictReader(handle):
+            yield {key: (value or "") for key, value in record.items() if key is not None}
+
+
+@dataclass
+class AgentRun:
+    """What one agent produced, and whether it can be merged."""
+
+    name: str
+    script: str
+    output: Path
+    introduced: Tuple[str, ...] = ()
+    ok: bool = False
+    reason: str = ""
+    rows: int = 0
+
+
+class AgentPipeline:
+    """Runs Agents 1 to 4 over the stage-3 file and widens it with their columns.
+
+    The agents are run as separate processes rather than imported. Each is a
+    standalone script carrying its own copy of the vocabulary loader, its own
+    response cache and its own spend guard, and each writes its own manifest that
+    the client reads. Keeping them in their own process is what lets Max add their
+    columns without taking on responsibility for their internals, and means a
+    change inside an agent cannot break the builder except at the one place the
+    two meet - the column names asserted above.
+
+    The governing rule of the earlier stages continues to apply: a stage widens
+    the table and never lengthens it. Agents 1 and 3 annotate a row at a time and
+    Agent 2 only appends, so a row count that changes here is a defect and stops
+    the run rather than being reported as a result.
+
+    Agent 4 is the exception and is not merged at all. Its unit of analysis is a
+    supplier within a comparison scope, not a purchase line, so there is no
+    honest one-to-one mapping onto a transaction row. It is written alongside as a
+    companion file, joinable on the supplier key that this class adds to the wide
+    row.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.here = Path(__file__).resolve().parent
+        self.work = settings.results_dir / "agents"
+        self.outputs: List[str] = []
+        self.statistics: Dict[str, Any] = {}
+        self.runs: List[AgentRun] = []
+        self.supplier_keys: Dict[str, str] = {}
+
+    # -- running the agents --------------------------------------------------
+
+    def _common_arguments(self, results: Path) -> List[str]:
+        """Arguments every agent takes, so one Max run configures all four."""
+        arguments = ["--non-interactive",
+                     "--results", str(results),
+                     "--lexicon", str(self.settings.lexicon_path),
+                     "--cache", str(self.settings.cache_dir)]
+        if not self.settings.write_jsonl:
+            arguments.append("--no-jsonl")
+        if self.settings.model.enabled:
+            arguments.append("--use-llm")
+            if self.settings.model.spend_limit:
+                arguments += ["--llm-spend-limit", f"{self.settings.model.spend_limit:.2f}"]
+        return arguments
+
+    def _invoke(self, run: AgentRun, arguments: Sequence[str]) -> AgentRun:
+        """Run one agent and report what happened, without raising."""
+        script = self.here / run.script
+        if not script.is_file():
+            run.reason = f"{run.script} is not in {self.here}"
+            LOGGER.error("Cannot run %s: %s.", run.name, run.reason)
+            return run
+
+        command = [sys.executable, str(script), *arguments]
+        LOGGER.info("%s: %s", run.name, " ".join(arguments[:6]))
+        try:
+            outcome = subprocess.run(command, cwd=str(self.here), text=True,
+                                     capture_output=True,
+                                     timeout=self.settings.agent_timeout)
+        except subprocess.TimeoutExpired:
+            run.reason = f"did not finish within {self.settings.agent_timeout}s"
+            LOGGER.error("%s timed out.", run.name)
+            return run
+
+        if outcome.returncode != 0:
+            # The agent's own last words are far more useful than the exit code.
+            tail = [line for line in (outcome.stderr or "").splitlines() if line.strip()]
+            run.reason = (tail[-1].strip() if tail else f"exit code {outcome.returncode}")
+            LOGGER.error("%s failed: %s", run.name, run.reason)
+            return run
+
+        if not run.output.is_file():
+            run.reason = f"finished but wrote no {run.output.name}"
+            LOGGER.error("%s %s", run.name, run.reason)
+            return run
+
+        run.ok = True
+        return run
+
+    def _catalogue_arguments(self) -> List[str]:
+        """Where Agent 3 should look for item catalogues.
+
+        A dedicated catalogue folder is preferred when one exists. Failing that
+        the source folder is offered, which is safe because Agent 3 refuses a
+        file that carries purchase-transaction columns - and the source folder is
+        full of them.
+        """
+        catalogues = self.here / "catalogues"
+        if catalogues.is_dir():
+            return ["--catalogues", str(catalogues)]
+        return ["--reference", str(self.settings.source_dir)]
+
+    def run_agents(self, stage3_csv: Path) -> None:
+        """Run all four agents over the stage-3 master file."""
+        self.work.mkdir(parents=True, exist_ok=True)
+        common = self._common_arguments(self.work)
+
+        agent1 = self._invoke(
+            AgentRun("Agent 1 - purchase descriptions", "agent1.py",
+                     self.work / "agent1_unified_lines.csv", AGENT1_REQUIRED),
+            [*common, "--input", str(stage3_csv)])
+        self.runs.append(agent1)
+        if not agent1.ok:
+            return
+
+        agent2 = self._invoke(
+            AgentRun("Agent 2 - purchase groups", "agent2.py",
+                     self.work / "agent2_purchase_groups.csv", AGENT2_REQUIRED),
+            [*common, "--input", str(agent1.output),
+             "--registry", str(self.here / "lexicon" / "agent2_group_registry.json")])
+        self.runs.append(agent2)
+        if not agent2.ok:
+            return
+
+        agent3 = self._invoke(
+            AgentRun("Agent 3 - standard items", "agent3.py",
+                     self.work / "agent3_standardisation.csv", AGENT3_REQUIRED),
+            [*common, "--input", str(agent2.output), *self._catalogue_arguments()])
+        self.runs.append(agent3)
+
+        # Agent 4 stops with a message when the input holds fewer than two
+        # suppliers, which is a legitimate answer on a small extract rather than
+        # a failure of the build. Its output is a companion file, so the wide
+        # table is complete whether or not it ran.
+        agent4 = self._invoke(
+            AgentRun("Agent 4 - supplier consolidation", "agent4.py",
+                     self.work / "agent4_supplier_consolidation.csv"),
+            [*common, "--input", str(agent2.output),
+             "--registry", str(self.here / "lexicon" / "agent4_supplier_registry.json")])
+        self.runs.append(agent4)
+
+    # -- merging -------------------------------------------------------------
+
+    def _index(self, run: AgentRun) -> Optional[Dict[int, Dict[str, str]]]:
+        """Read one agent's output, keyed by the stage-3 row it describes.
+
+        Only the columns that agent introduces are kept. The rest of its table
+        either repeats what an earlier agent already merged or restates a
+        business key the wide row carries under the client's own header, and
+        holding all of it for every row would cost memory for nothing.
+        """
+        with run.output.open("r", encoding=CSV_ENCODING, newline="") as handle:
+            reader = csv.DictReader(handle)
+            headers = [name for name in (reader.fieldnames or []) if name]
+            missing = [name for name in run.introduced if name not in headers]
+            if AGENT_ROW_KEY not in headers:
+                run.ok = False
+                run.reason = (f"{run.output.name} has no {AGENT_ROW_KEY} column, so its "
+                              f"rows cannot be traced back to a transaction")
+                LOGGER.error("%s: %s", run.name, run.reason)
+                return None
+            if missing:
+                # Stopping is the right answer. These names are the deliverable,
+                # and a wide table quietly missing a promised column is worse
+                # than a run that failed and said which one.
+                run.ok = False
+                run.reason = (f"{run.output.name} is missing promised column(s): "
+                              f"{', '.join(missing)}")
+                LOGGER.error("%s: %s", run.name, run.reason)
+                return None
+
+            wanted = tuple(run.introduced)
+            indexed: Dict[int, Dict[str, str]] = {}
+            duplicates = 0
+            for record in reader:
+                raw = (record.get(AGENT_ROW_KEY) or "").strip()
+                try:
+                    position = int(raw) - AGENT_ROW_OFFSET
+                except ValueError:
+                    continue
+                if position in indexed:
+                    duplicates += 1
+                    continue
+                indexed[position] = {name: (record.get(name) or "") for name in wanted}
+            run.rows = len(indexed)
+
+        if duplicates:
+            run.ok = False
+            run.reason = (f"{duplicates} row(s) of {run.output.name} point at a stage-3 "
+                          f"row already claimed by another")
+            LOGGER.error("%s: %s", run.name, run.reason)
+            return None
+        return indexed
+
+    def merge(self, base_csv: Path, base_columns: Sequence[str], run: AgentRun,
+              stage_name: str, extra: Optional[Dict[str, Dict[str, str]]] = None,
+              extra_columns: Sequence[str] = ()) -> Optional[Tuple[Path, List[str]]]:
+        """Widen one table with one agent's columns, writing CSV and JSONL.
+
+        Where a column name is produced by both sides the agent's value is taken,
+        but only when it is populated: an agent that could not resolve a field
+        must not blank a value Max had already established.
+        """
+        indexed = self._index(run)
+        if indexed is None:
+            return None
+
+        added = [name for name in run.introduced if name not in base_columns]
+        added += [name for name in extra_columns if name not in base_columns
+                  and name not in added]
+        overwritten = [name for name in run.introduced if name in base_columns]
+        columns = list(base_columns) + added
+
+        results = self.settings.results_dir
+        csv_path = results / f"{stage_name}.csv"
+        jsonl_path = results / f"{stage_name}.jsonl"
+
+        rows_in = rows_out = matched = 0
+        handles: List[Any] = []
+        try:
+            handle = csv_path.open("w", encoding=CSV_ENCODING, newline="")
+            handles.append(handle)
+            writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+
+            lines = None
+            if self.settings.write_jsonl:
+                lines = jsonl_path.open("w", encoding="utf-8")
+                handles.append(lines)
+
+            for position, row in enumerate(read_csv_rows(base_csv)):
+                rows_in += 1
+                block = indexed.get(position)
+                output = dict(row)
+                if block is not None:
+                    matched += 1
+                    for name, value in block.items():
+                        # An empty answer from the agent leaves whatever was
+                        # already there; see AGENT_PRECEDENCE_NOTE.
+                        if value != "" or name not in output:
+                            output[name] = value
+                else:
+                    for name in added:
+                        output.setdefault(name, "")
+                if extra is not None:
+                    output.update(extra.get(position, {}))
+                for name in extra_columns:
+                    output.setdefault(name, "")
+
+                writer.writerow(output)
+                if lines is not None:
+                    lines.write(json.dumps(output, ensure_ascii=False) + "\n")
+                rows_out += 1
+        finally:
+            for opened in handles:
+                opened.close()
+
+        if rows_in != rows_out:
+            LOGGER.error("%s changed the row count: %d in, %d out.",
+                         stage_name, rows_in, rows_out)
+            run.ok = False
+            run.reason = f"row count changed during the merge ({rows_in} -> {rows_out})"
+            return None
+
+        self.statistics[f"{stage_name}_rows"] = rows_out
+        self.statistics[f"{stage_name}_annotated"] = matched
+        if overwritten:
+            self.statistics[f"{stage_name}_overridden_columns"] = sorted(overwritten)
+        self.outputs.append(csv_path.name)
+        if self.settings.write_jsonl:
+            self.outputs.append(jsonl_path.name)
+
+        LOGGER.info("%s: %d row(s), %d annotated by %s, %d column(s) added.",
+                    stage_name, rows_out, matched, run.name, len(added))
+        if matched != rows_out:
+            LOGGER.warning("%s: %d row(s) received no values from %s.",
+                           stage_name, rows_out - matched, run.name)
+        return csv_path, columns
+
+    # -- Agent 4 -------------------------------------------------------------
+
+    def _read_supplier_keys(self) -> Dict[str, str]:
+        """Map every supplier spelling and id Agent 4 saw onto its resolved key."""
+        master = self.work / "agent4_supplier_master.csv"
+        if not master.is_file():
+            return {}
+        keys: Dict[str, str] = {}
+        with master.open("r", encoding=CSV_ENCODING, newline="") as handle:
+            for record in csv.DictReader(handle):
+                key = (record.get("Supplier_Key") or "").strip()
+                if not key:
+                    continue
+                spellings = [record.get("Canonical_Supplier_Name") or ""]
+                spellings += (record.get("Raw_Name_Variants") or "").split(";")
+                spellings += (record.get("Supplier_Ids") or "").split(";")
+                for spelling in spellings:
+                    token = lookup_key(spelling)
+                    if token:
+                        keys.setdefault(token, key)
+        return keys
+
+    def supplier_key_block(self, base_csv: Path) -> Dict[int, Dict[str, str]]:
+        """The resolved supplier key for each row, ready to merge.
+
+        Matched on the supplier name or id already on the row, using the same
+        resolution Agent 4 published, so the wide table and the consolidation
+        file cannot disagree about which rows belong to which company.
+        """
+        self.supplier_keys = self._read_supplier_keys()
+        if not self.supplier_keys:
+            return {}
+
+        block: Dict[int, Dict[str, str]] = {}
+        resolved = 0
+        for position, row in enumerate(read_csv_rows(base_csv)):
+            key = ""
+            for column in ("Supplier_Name", "Supplier", "ERP supplier name",
+                           "Supplier_Id", "ERP supplier number"):
+                token = lookup_key(row.get(column, ""))
+                if token and token in self.supplier_keys:
+                    key = self.supplier_keys[token]
+                    break
+            block[position] = {SUPPLIER_KEY_COLUMN: key}
+            if key:
+                resolved += 1
+        self.statistics["supplier_keys_resolved"] = resolved
+        return block
+
+    def copy_consolidation(self) -> None:
+        """Publish Agent 4's analysis beside the wide table.
+
+        Copied rather than merged: one row here is a supplier within a comparison
+        scope, and folding that onto a purchase line would either multiply the
+        rows or invent a summary nobody asked for. Joined to the wide table on
+        the supplier key plus the scope.
+        """
+        results = self.settings.results_dir
+        for source_name, target_name in (
+                ("agent4_supplier_consolidation.csv", "max_supplier_consolidation.csv"),
+                ("agent4_supplier_consolidation.jsonl", "max_supplier_consolidation.jsonl"),
+                ("agent4_supplier_pairs.csv", "max_supplier_pairs.csv"),
+                ("agent4_supplier_master.csv", "max_supplier_master.csv")):
+            source = self.work / source_name
+            if not source.is_file():
+                continue
+            shutil.copyfile(source, results / target_name)
+            self.outputs.append(target_name)
+
+    # -- entry point ---------------------------------------------------------
+
+    def build(self, stage3_csv: Path,
+              stage3_columns: Sequence[str]) -> Tuple[Optional[Path], List[str]]:
+        """Run the agents and write stages 4, 5 and 6. Returns the last stage."""
+        self.run_agents(stage3_csv)
+        by_script = {run.script: run for run in self.runs}
+
+        current_csv: Optional[Path] = None
+        current_columns = list(stage3_columns)
+        base_csv = stage3_csv
+
+        plan = (("agent1.py", "max_stage4_enriched"),
+                ("agent2.py", "max_stage5_grouped"),
+                ("agent3.py", "max_stage6_standardised"))
+
+        for script, stage_name in plan:
+            run = by_script.get(script)
+            if run is None or not run.ok:
+                break
+            # The supplier key rides along with the last merge, so that the
+            # column exists on the table a reader will actually open.
+            extra: Optional[Dict[str, Dict[str, str]]] = None
+            extra_columns: Sequence[str] = ()
+            if script == "agent3.py" and by_script.get("agent4.py", AgentRun("", "", Path())).ok:
+                extra = self.supplier_key_block(base_csv)
+                extra_columns = (SUPPLIER_KEY_COLUMN,)
+
+            merged = self.merge(base_csv, current_columns, run, stage_name,
+                                extra=extra, extra_columns=extra_columns)
+            if merged is None:
+                break
+            base_csv, current_columns = merged
+            current_csv = base_csv
+
+        if by_script.get("agent4.py", AgentRun("", "", Path())).ok:
+            self.copy_consolidation()
+
+        self.statistics["agents"] = {
+            run.name: ("ok" if run.ok else (run.reason or "not run"))
+            for run in self.runs
+        }
+        return current_csv, current_columns
+
+    def missing_columns(self, columns: Sequence[str]) -> List[str]:
+        """Promised columns that did not reach the final table."""
+        promised = list(AGENT1_REQUIRED) + list(AGENT2_REQUIRED) + list(AGENT3_REQUIRED)
+        present = set(columns)
+        return [name for name in promised if name not in present]
+
+
 class Builder:
     """Runs the three stages and writes their outputs."""
 
@@ -2999,6 +3538,13 @@ class Builder:
         self.outputs: List[str] = []
         self.statistics: Dict[str, Any] = {}
         self.diagnostics: Dict[str, Any] = {}
+
+        # Stage 3's header, kept so that the agent stages know what the table
+        # already carries and can tell an added column from an overridden one.
+        self.stage3_columns: List[str] = []
+        self.pipeline: Optional[AgentPipeline] = None
+        self.final_csv: Optional[Path] = None
+        self.final_columns: List[str] = []
 
         # Purchase-order extracts that were read but cannot be joined. Held
         # separately because the joiner discards them, and the diagnostics file
@@ -3173,6 +3719,7 @@ class Builder:
         stage3_csv = results / "max_stage3_interpreted.csv"
         stage3_jsonl = results / "max_stage3_interpreted.jsonl"
         columns = stage2_columns + Interpretation.columns()
+        self.stage3_columns = list(columns)
 
         distinct: Counter = Counter()
         for row in self._read_rows(stage2_csv):
@@ -3275,7 +3822,36 @@ class Builder:
         self.outputs.append(stage3_csv.name)
         if self.settings.write_jsonl:
             self.outputs.append(stage3_jsonl.name)
+        self.final_csv = stage3_csv
+        self.final_columns = list(columns)
         return stage3_csv
+
+    # -- stages 4 to 6 ------------------------------------------------------
+
+    def enrich(self, stage3_csv: Path) -> Optional[Path]:
+        """Run the agents and widen the table with what they found.
+
+        Nothing here can invalidate stages 1 to 3: those files are already on
+        disk and are what they were. An agent that fails costs the columns it
+        would have added and is reported as having failed, and the stage before it
+        remains the table to use.
+        """
+        self.pipeline = AgentPipeline(self.settings)
+        final_csv, final_columns = self.pipeline.build(stage3_csv, self.stage3_columns)
+
+        self.outputs += self.pipeline.outputs
+        self.statistics["agent_stages"] = self.pipeline.statistics
+
+        if final_csv is not None:
+            self.final_csv = final_csv
+            self.final_columns = final_columns
+
+        missing = self.pipeline.missing_columns(self.final_columns)
+        if missing:
+            self.statistics["columns_missing"] = missing
+            LOGGER.error("%d promised column(s) did not reach the final table: %s",
+                         len(missing), ", ".join(missing))
+        return final_csv
 
     def _apply(self, reading: Interpretation, sources: str,
                answer: Optional[Dict[str, str]]) -> Dict[str, str]:
@@ -3328,9 +3904,7 @@ class Builder:
 
     @staticmethod
     def _read_rows(path: Path) -> Iterator[Dict[str, str]]:
-        with path.open("r", encoding=CSV_ENCODING, newline="") as handle:
-            for record in csv.DictReader(handle):
-                yield {key: (value or "") for key, value in record.items() if key is not None}
+        return read_csv_rows(path)
 
     @staticmethod
     def _gather_text(row: Dict[str, str]) -> Tuple[str, str, str]:
@@ -3413,12 +3987,16 @@ class Builder:
             "settings": {
                 "native_po_columns": self.settings.native_po_columns,
                 "interpretation_floor": self.settings.interpretation_floor,
+                "run_agents": self.settings.run_agents,
                 "use_llm": self.settings.model.enabled or bool(self.settings.use_llm),
                 "model": self.settings.model.model if self.settings.model.enabled else "",
             },
             "statistics": self.statistics,
             "diagnostics": diagnostics,
             "outputs": sorted(set(self.outputs)),
+            "final_table": self.final_csv.name if self.final_csv else "",
+            "final_columns": len(self.final_columns),
+            "column_precedence": AGENT_PRECEDENCE_NOTE,
         }
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
@@ -3524,7 +4102,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  python max.py --non-interactive --sources ./sources --results ./results\n"
             "      Run unattended with the local reader only.\n\n"
             "  python max.py --non-interactive --use-llm --llm-spend-limit 10\n"
-            "      Add the model tier for free text the rules cannot read.\n"
+            "      Add the model tier for free text the rules cannot read.\n\n"
+            "  python max.py --non-interactive --no-agents\n"
+            "      Stop at stage 3, leaving the agents to be run separately.\n"
         ),
     )
 
@@ -3539,6 +4119,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="omit the raw Maximo and Basware columns, keeping the "
                              "harmonised PO block only")
     output.add_argument("--no-jsonl", action="store_true", help="skip the JSONL exports")
+
+    agents = parser.add_argument_group("agents")
+    agents.add_argument("--no-agents", action="store_true",
+                        help="stop after stage 3 instead of running Agents 1 to 4 "
+                             "and widening the table with their columns")
+    agents.add_argument("--agent-timeout", metavar="SECONDS", type=int, default=None,
+                        help="abandon an agent that has not finished in this long "
+                             "(default 21600)")
 
     tiers = parser.add_argument_group("processing tiers")
     tiers.add_argument("--use-llm", action="store_true",
@@ -3615,6 +4203,7 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     default_cache = Path(args.cache) if args.cache else here / "cache"
 
     native = not args.no_native_po_columns
+    with_agents = not args.no_agents
     use_llm = args.use_llm
     spend_limit = (args.llm_spend_limit if args.llm_spend_limit is not None
                    else _env_float(env.get("LLM_SPEND_LIMIT"), DEFAULT_SPEND_LIMIT))
@@ -3630,6 +4219,8 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         print()
         native = ask_yes_no(
             "Carry the raw Maximo and Basware columns into the wide table?", native)
+        with_agents = ask_yes_no(
+            "Run Agents 1 to 4 and add their columns to the wide table?", with_agents)
         use_llm = ask_yes_no(
             "Let the language model read free text the rules cannot?", use_llm)
         if use_llm:
@@ -3648,6 +4239,9 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         cache_dir=default_cache.expanduser().resolve(),
         native_po_columns=native,
         interpretation_floor=args.interpretation_floor,
+        run_agents=with_agents,
+        agent_timeout=(args.agent_timeout if args.agent_timeout is not None
+                       else Settings.agent_timeout),
         use_llm=use_llm,
         write_jsonl=not args.no_jsonl,
         verbose=args.verbose,
@@ -3740,6 +4334,39 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
     if statistics.get("texts_read_by_model"):
         print(f"    Read by the model  : {statistics['texts_read_by_model']:,}")
 
+    stages = statistics.get("agent_stages") or {}
+    if stages:
+        print()
+        print("  Stages 4 to 6  the agents onto the wide table")
+        for label, stage in (("4  descriptions ", "max_stage4_enriched"),
+                             ("5  purchase group", "max_stage5_grouped"),
+                             ("6  standard item ", "max_stage6_standardised")):
+            count = stages.get(f"{stage}_rows")
+            if count is None:
+                print(f"    {label}  : not written")
+                continue
+            print(f"    {label}  : {_share(stages.get(f'{stage}_annotated', 0), count)}")
+        if stages.get("supplier_keys_resolved") is not None:
+            print(f"    Supplier key       : "
+                  f"{_share(stages['supplier_keys_resolved'], rows)}")
+        for name, state in sorted((stages.get("agents") or {}).items()):
+            if state != "ok":
+                print(f"    {name}: {state}")
+
+    missing = statistics.get("columns_missing") or []
+    if missing:
+        print()
+        print(f"  Columns promised but missing ({len(missing)})")
+        for name in missing[:12]:
+            print(f"    {name}")
+        if len(missing) > 12:
+            print(f"    ... and {len(missing) - 12} more")
+
+    if manifest.get("final_table"):
+        print()
+        print(f"  Table to use         : {manifest['final_table']}")
+        print(f"  Columns              : {manifest.get('final_columns', 0):,}")
+
     advice = manifest.get("diagnostics", {}).get("advice") or []
     if advice:
         print()
@@ -3795,7 +4422,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         builder.measure_keys()
         stage2_csv, _, stage2_columns = builder.build_wide()
-        builder.interpret(stage2_csv, stage2_columns)
+        stage3_csv = builder.interpret(stage2_csv, stage2_columns)
+        if settings.run_agents:
+            builder.enrich(stage3_csv)
         manifest = builder.write_manifest()
     finally:
         builder.close()
@@ -3811,7 +4440,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_summary(manifest, settings)
         return 1
 
+    # The same rule again, once per agent stage. A stage that lost or gained a
+    # row is caught inside the merge, which then stops the chain; this reports it.
+    stages = builder.statistics.get("agent_stages", {})
+    ragged = sorted(name for name, value in stages.items()
+                    if name.endswith("_rows") and value != rows_out)
+    if ragged:
+        LOGGER.error("An agent stage does not have %d rows: %s.",
+                     rows_out, ", ".join(ragged))
+        print_summary(manifest, settings)
+        return 1
+
     print_summary(manifest, settings)
+    if builder.statistics.get("columns_missing"):
+        return 1
+    if settings.run_agents and any(
+            not run.ok for run in (builder.pipeline.runs if builder.pipeline else [])):
+        return 1
     return 0
 
 
