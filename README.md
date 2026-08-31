@@ -10,12 +10,18 @@ consolidation opportunities.
 | --- | --- | --- | --- |
 | `agent1.py` | What was actually bought? | the source extracts | `agent1_unified_lines.csv` |
 | `agent2.py` | What kind of purchase is this? | Agent 1 | `agent2_purchase_groups.csv` |
-| `agent3.py` | Could this have been a standard item? | Agent 2 + catalogues | `agent3_standardisation.csv` |
+| `agent3.py` | Could this have been a standard item? | Agent 2 + the client's item catalogue | `agent3_standardisation.csv` |
 | `agent4.py` | Who else could supply this? | Agent 2 | `agent4_supplier_consolidation.csv` |
 
 They form a chain. Each one appends columns to the table the previous one
 produced, so no analysis has to be recomputed and every result can be traced
 back to the source row it came from.
+
+Two runners drive that chain end to end so it does not have to be driven by
+hand. `all_agents.py` returns the input table with every agent column added to
+it, one row out for each row in; `max.py` builds the wide table from the raw
+extracts first and then runs the same four agents over it. Both are described
+under [running all four in one command](#running-all-four-in-one-command).
 
 **Author and developer:** Prof. Shahab Anbarjafari
 
@@ -28,6 +34,12 @@ python3 -m venv myenv && source myenv/bin/activate
 pip install --upgrade pip && pip install -r requirements.txt
 pip install -r requirements-models.txt      # optional, improves accuracy
 
+python all_agents.py --from-sources    # all four agents, raw extracts to one table
+```
+
+Or drive the four agents by hand, in order:
+
+```bash
 python agent1.py        # then answer the prompts, or press Enter for defaults
 python agent2.py
 python agent3.py
@@ -47,6 +59,7 @@ optional, and every agent runs to completion without one.
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Running the agents](#running-the-agents)
+- [Running all four in one command](#running-all-four-in-one-command)
 - [Agent 1 — Improved purchase description](#agent-1--improved-purchase-description)
 - [Agent 2 — AI purchase group, Category L5](#agent-2--ai-purchase-group-category-l5)
 - [Agent 3 — Material and service standardisation](#agent-3--material-and-service-standardisation)
@@ -345,6 +358,155 @@ Language model usage
 
 ---
 
+## Running all four in one command
+
+Running the agents by hand means four commands, four sets of paths, and a merge
+afterwards to get the four analyses into one table. Two runners do that instead.
+
+| Runner | Gives you | Use it when |
+| --- | --- | --- |
+| `all_agents.py` | the input table with every agent column added, one row out per row in | you want the agent columns beside the data you already have |
+| `max.py` | the wide table built from the raw extracts, with the same agent columns on the end | you want the joined dataset built as well |
+
+Both run the same four agents in the same dependency order, reuse work already on
+disk, and can be interrupted and resumed. They differ in one respect worth
+knowing: `all_agents.py` runs Agents 3 and 4 at the same time, since both read
+Agent 2 and neither reads the other, so Agent 4 finishes inside the fifteen
+minutes Agent 3 spends on the catalogue. Max runs them one after the other.
+`--no-parallel` turns that off for a log that reads in order.
+
+### all_agents.py
+
+```bash
+python all_agents.py --from-sources     # start from the raw extracts
+python all_agents.py --input mytable.csv  # widen a table you already have
+python all_agents.py                    # reuse Max's stage-3 table if it is there
+```
+
+Where the input comes from is decided in that order of preference: a file named
+with `--input`, then the raw extracts if `--from-sources` or `--sources` says so,
+then `max_stage3_interpreted.csv` if a previous Max run left one in the results
+folder. The run states which of the three it took and never silently substitutes
+one for another.
+
+**Every input row is written exactly once.** Rows are matched back by
+`Source_Row_Number`, not by position or by description, so a row an agent could
+not annotate comes out with those columns empty rather than dropped. The count is
+reconciled at the end, and rows that came back short are named in
+`all_agents_row_audit.csv` — a file that only appears when there is something in
+it.
+
+Output:
+
+| File | Contents |
+| --- | --- |
+| `all_agents_dataset.csv` | the input table plus every agent column |
+| `all_agents_dataset.jsonl` | the same rows, nested |
+| `all_agents_run_manifest.json` | input taken, catalogue used, per-agent status, columns added, spend |
+| `all_agents_row_audit.csv` | rows an agent could not annotate, when there are any |
+| `all_agents/` | each agent's own output and log, kept as it was written |
+
+Where an agent's column name already exists in the input, the agent's version is
+prefixed and the input keeps both its name and its value. Six columns collide on
+Fortum's data — `Country`, `Division`, `Item_Or_Service`, `PO_Number`,
+`PO_Line_Number` and `Quantity` — so Agent 1's reading of each arrives as
+`Agent1_Country` and so on, beside the original. Nothing is overwritten, and the
+run lists every rename it made along with what each agent contributed.
+
+Rows are also cross-checked rather than trusted: where an agent republished a
+business key that was already on the row, the two values are compared. The run
+reports how many were checked and how many disagreed, which on the sample is
+`confirmed on 88 business-key value(s), 0 disagreement(s)`.
+
+One thing worth knowing about the merge: a later agent in the chain re-emits some
+of the earlier columns, and occasionally re-emits them empty. Taking the last
+agent's table at face value therefore loses values an earlier agent had already
+established. `AI_Confidence` is the one this happens to on Fortum's data — Agent 1
+fills 18 of the 25 sample rows, and Agent 3 republishes the column blank. Those
+cells are read back from the agent that produced them rather than left empty, and
+the run says so:
+
+```
+  Put back after the chain dropped them (1)
+    AI_Confidence: 18 value(s)
+    A later agent republished the column and left it empty. The value an
+    earlier agent produced was read from its own output instead.
+```
+
+### max.py
+
+```bash
+python max.py --non-interactive --sources ./sources --results ./results
+python max.py --no-agents      # stop at stage 3, the joined table only
+```
+
+Six stages: Sievo and the invoices are joined, the purchase-order lines are
+brought in, the result is interpreted into harmonised columns, and then Agents 1,
+2 and 3 widen it in turn. The headline file is
+`max_stage6_standardised.csv`; every stage before it is kept, so a stage can be
+inspected without rerunning the ones before.
+
+Agent 4 does not fit that shape — it answers per supplier and scope, not per
+purchase line — so rather than being folded into the row it is written alongside
+as `max_supplier_consolidation.csv`, `max_supplier_pairs.csv` and
+`max_supplier_master.csv`. `Supplier_Key` appears on the wide table too, resolved
+exactly as Agent 4 resolved it, so the two cannot disagree about which rows belong
+to which company and the consolidation findings can be joined back onto the lines.
+
+`max.py` refuses to finish quietly if a promised column is missing. It names the
+agent that failed, why, and what to do about it, instead of listing lost column
+names and leaving the cause to be guessed at.
+
+### Reuse, interruption and resuming
+
+An agent whose output was built from the same input, by the same script, with the
+same settings is not run again; it is reused, and the run says so. Force the work
+with `--force` (`--force-agents` on Max), or discard everything including the
+joined table with `--no-reuse`.
+
+Interrupting with Ctrl-C stops the running agents, records how far the run got,
+and removes the half-written file of the stage that was in progress. The next run
+finds that record and offers to carry on from there or start again:
+
+```
+12:39:00  WARNING A previous run in this results folder did not finish.
+12:39:00  WARNING   Finished and reusable : stages 1 and 2, stage 3
+12:39:00  WARNING   Stopped during        : the agents
+Carry on from there rather than starting again [Y/n]:
+```
+
+Answered for you when the run is unattended: it carries on, and says so.
+`--restart` on Max, or `--force` on `all_agents.py`, starts from the beginning
+instead.
+
+A long agent is not killed for being slow. What is watched is silence: an agent
+that has printed nothing for two hours is treated as hung, which is
+`--agent-silence-timeout`. An absolute ceiling is available as `--agent-timeout`
+but is off by default, because the earlier fixed six-hour limit killed Agent 1
+mid-run on the full extract and cost the whole chain.
+
+### Model spend across the four
+
+Each agent tracks its own tokens; the runner adds them up and reports the total,
+separating what this run spent from what the reused results had already cost, so
+a cheap-looking rerun is not mistaken for a cheap analysis:
+
+```
+  Language model
+    Agent 1    $    0.03  19 request(s), 7,659 in / 1,904 out (reused, spent on an earlier run)
+    Agent 2    $    0.00  0 request(s), 0 in / 0 out (reused, spent on an earlier run)
+    Agent 3    $    0.00  1 request(s), 272 in / 186 out (reused, spent on an earlier run)
+    Agent 4    $    0.00  0 request(s), 0 in / 0 out (reused, spent on an earlier run)
+    this run   $    0.00  0 request(s), 0 answer(s) served from cache
+    recorded   $    0.03  including the reused agents' earlier spend
+    Estimated from the published rates, an upper bound rather than an invoice.
+```
+
+The per-agent spend alert still applies to each agent individually, so one agent
+cannot quietly spend the whole budget.
+
+---
+
 ## Agent 1 — Improved purchase description
 
 Makes free-text purchases understandable. It reads every extract in the source
@@ -579,21 +741,39 @@ Let the language model adjudicate borderline matches? [y/N]:
 ### Catalogues, and only catalogues
 
 Fortum sends item catalogues separately from the master data, so they get an
-input of their own: put them in `./catalogues`, or name a folder with
-`--catalogues DIR`, and every file beneath it is read whatever its layout.
-Naming `--reference` instead suppresses the `./catalogues` default, so a run
-pointed somewhere explicitly is never quietly redirected.
+input of their own. The client's current master is
+
+```
+sources/Fortum-ItemCatalogues-Master.xlsx      845,428 items, 36 MB
+```
+
+which is what the two runners look for by name, and what Agent 3 reads when
+neither `--reference` nor `--catalogues` names something else. Run Agent 3 on its
+own and it still accepts a file or a folder either way, reading every file
+beneath it whatever its layout; `--reference` suppresses the `./catalogues`
+default so a run pointed somewhere explicitly is never quietly redirected.
 
 **Check the catalogue is the client's latest before you run.** A stale catalogue
 does not fail; it silently proposes fewer matches, and reports them as
-confidently as it would report the right number. Each file is therefore named
-with its date, size and digest, which is enough to tell two versions apart:
+confidently as it would report the right number. This is not hypothetical: an
+earlier 4,200-item extract of the same catalogue is still on disk under the same
+name, and reading it instead of the 845,428-item master costs 99.5% of the items
+a purchase could have matched — with nothing in the output to say so.
+
+The runners therefore prefer the master, and name what they took along with what
+they passed over:
 
 ```
-  Reference items      : 4,200 from 1 file(s)
-    Fortum - Item Catalogues - Master.xlsx
-      4,200 item(s), modified 2026-08-25 18:29, 193,174 bytes, sha256 3af28eb35083
+  Catalogue Agent 3 matched against
+    the client's catalogue master, found in the source folder
+    Fortum-ItemCatalogues-Master.xlsx: 845,428 item(s), modified 2026-08-31 12:15, sha256 d0941c52fc59
+    0 line(s) matched a catalogue item, 0 were already standard purchases
+    best candidate scored 0.630, acceptance threshold 0.65
+    not used: Fortum - Item Catalogues - Master.xlsx in the catalogues folder, 193,174 bytes
 ```
+
+Every file is named with its date, size and digest, which is enough to tell two
+versions apart at a glance.
 
 If no catalogue is loaded at all, the run says so in place of those numbers
 rather than reporting nought matches as if that were a finding:
@@ -686,6 +866,14 @@ and `--minimum-threshold 0.50`. Every run writes
 `agent3_match_calibration.csv`, giving the number and share of lines that would
 be accepted at every cut-off from 0.20 to 1.00. Set the thresholds from that
 file rather than from the defaults.
+
+The sample extract is worth reading as a warning about how to read a nil result.
+Against the full 845,428-item master it returns no matches at all — but its best
+candidate scored 0.630 against an accept threshold of 0.65. That is a threshold
+question, not an absence of matches, and the run says so instead of reporting
+nought as a finding. Where the accept threshold should sit is a decision for
+Fortum to take against the calibration file on a full extract, not from a
+twenty-five row sample.
 
 ### Output
 
@@ -972,6 +1160,11 @@ The workbook is explicit that a procurement expert confirms whether the
 purchases and suppliers a model flags are genuinely comparable. The output is
 built for that step rather than to replace it.
 
+Which file to open depends on how the agents were run: each agent's own headline
+file if they were run by hand, `all_agents_dataset.csv` after `all_agents.py`, or
+`max_stage6_standardised.csv` after Max. The advice below applies to all three,
+since the columns are the same.
+
 **Start with the bands, not the scores.** Both Agent 3 and Agent 4 sort their
 headline file so that the rows worth reading are at the top — primary scope
 first, strongest opportunity first.
@@ -1098,6 +1291,21 @@ The cost of Agents 1 and 3 is set by the number of *distinct descriptions*
 rather than the number of lines, so it depends far more on how repetitive the
 data is than on how large it is. Agent 2's clustering is the most expensive step
 in the chain and is the one to time first on real data.
+
+**Agent 3 has a fixed cost that does not depend on the purchase data at all.**
+Every item in the catalogue has to be embedded before anything can be matched
+against it, and the client's master holds 845,428 of them. Measured on a laptop
+over two runs of the same 25-line sample:
+
+| Catalogue items | Purchase lines | Agent 3 wall clock | Agents 1, 2 and 4 together |
+| --- | --- | --- | --- |
+| 845,428 | 25 | 15–18 min | 15 s |
+
+Almost all of that is the catalogue rather than the twenty-five lines, so a run of
+a million lines pays the same quarter of an hour once. It is why the runners stream
+the agents' logs live rather than waiting in silence, why `all_agents.py` runs
+Agent 4 alongside Agent 3 instead of after it, and why a slow agent is never
+killed for being slow.
 
 Installing `rapidfuzz`, `scikit-learn` and `numpy` improves all of these
 substantially and costs nothing at run time.
@@ -1282,7 +1490,33 @@ read `agent3_match_calibration.csv` before lowering the threshold.
 **A run read the wrong catalogue** (Agent 3) — `./catalogues` is used by default,
 and a named `--catalogues` folder becomes the whole answer. Naming `--reference`
 suppresses the default. The summary lists every file that was read, with its
-date and digest.
+date and digest, and the runners additionally list under `not used` any older
+copy they passed over. If that line names the file you expected, the copy you
+meant to use is the smaller one.
+
+**`n promised column(s) did not reach the final table`** (Max) — an agent failed
+or was abandoned, so its columns were never produced. The message names which
+agent and why; the usual cause is an agent killed by `--agent-timeout`. Leave
+that off and let it finish. Nothing is lost by rerunning: the agents that did
+complete are reused.
+
+**A runner appears to have hung** (Agent 3) — Agent 3 embeds all 845,428
+catalogue items before it matches anything, which takes a quarter of an hour and
+prints nothing while it works. The runner prints a heartbeat so that silence can
+be told apart from a stall:
+
+```
+  [Agent 3] 21:39:53  INFO    Embedding 845428 reference item(s) ...
+  [Agent 3] still working, 14m 13s elapsed, quiet for 60s
+```
+
+An agent that has genuinely said nothing for two hours is treated as hung and
+stopped.
+
+**A rerun finished suspiciously fast** — the agents were reused rather than run,
+because their inputs and settings were unchanged. The summary marks each one
+`reused` and the spend report separates `this run` from `recorded`. Pass
+`--force` to make them run again regardless.
 
 ---
 
@@ -1294,6 +1528,8 @@ date and digest.
 ├── agent2.py                          AI purchase group (Category L5)
 ├── agent3.py                          Material and service standardisation
 ├── agent4.py                          Supplier consolidation
+├── all_agents.py                      runs all four, returns the input table widened
+├── max.py                             builds the wide table, then runs all four
 ├── lexicon/
 │   └── procurement_lexicon.json       controlled procurement vocabulary
 ├── requirements.txt                   Python dependencies, all from PyPI
@@ -1306,12 +1542,15 @@ date and digest.
 Created at run time and excluded from version control:
 
 ```
-sources/                               client data
-catalogues/                            item catalogues from the client, read by Agent 3
+sources/                               client data, including the item catalogue master
+catalogues/                            an alternative place to keep catalogues for Agent 3
 results/                               generated output
+results/all_agents/                    each agent's own output and log from a runner
 cache/                                 language-model response cache
 lexicon/agent2_group_registry.json     stable group labels
 lexicon/agent4_supplier_registry.json  stable supplier keys and merge overrides
+results/.run_journal.json              how far an interrupted all_agents.py run got
+results/.max_run_journal.json          the same, for max.py
 .env                                   credentials
 ```
 
@@ -1323,11 +1562,20 @@ Client data and generated output are never committed.
 
 Proof of concept. The four "must have" agents from the technical planning
 workbook are complete, run end to end, and have been exercised against the
-sample extracts and against synthetic data at volume. The thresholds and bands
-are documented defaults intended to be revised once they have been read against
-real output, and the vocabulary is expected to grow as the data is worked.
+sample extracts and against synthetic data at volume. Client review of the four
+agents found no major changes needed; the two points it did raise — which country
+Agent 4 compares on, and keeping Agent 3's catalogue current — are settled above
+under [which country](#which-country) and
+[catalogues, and only catalogues](#catalogues-and-only-catalogues).
 
-All four agents were designed, written and tested by
+Both runners have been run against the client's full 845,428-item catalogue
+master, and the resume path has been exercised by interrupting a run and carrying
+it on. The thresholds and bands remain documented defaults intended to be revised
+once they have been read against real output at volume — Agent 3's accept
+threshold in particular, which the sample extract sits just below — and the
+vocabulary is expected to grow as the data is worked.
+
+All four agents and both runners were designed, written and tested by
 **Prof. Shahab Anbarjafari**, who is the sole author and contributor to this
 repository.
 
