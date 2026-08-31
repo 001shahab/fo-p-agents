@@ -103,18 +103,36 @@ under the same spend guard as the other agents: a limit in dollars is agreed up
 front, reaching it pauses the run to ask, and declining finishes the work on the
 local stack.
 
+Being stopped part way through
+-----------------------------
+A run that is interrupted keeps what it finished. Each stage is recorded once its
+files are written and closed, together with their size and modification time, and
+running the same command again carries those stages over and starts at the one
+that did not finish. This matters because the work is not evenly spread: stage 3
+reads every distinct string in the extract and the agents after it run for hours,
+so a build stopped near the end has usually earned nearly all of it.
+
+Only a stage that finished is ever carried over. A part-written table is not
+recorded, is deleted when the run resumes, and cannot be mistaken for a result. If
+the extracts, the vocabulary or the settings that shape these stages have changed
+since, the record no longer applies and the run says which of them changed and
+starts from stage 1. `--restart` does that on demand.
+
 Usage
 -----
     python max.py                 # prompts for each path in turn
     python max.py --non-interactive --sources ./sources --results ./results
     python max.py --non-interactive --no-agents      # stop after stage 3
+    python max.py --non-interactive --restart        # ignore an interrupted run
     python max.py --help
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
+import datetime
 import hashlib
 import io
 import json
@@ -236,6 +254,28 @@ SUPPLIER_KEY_COLUMN = "Supplier_Key"
 # How the client's item catalogue master is named, wherever it has been put.
 CATALOGUE_MASTER_GLOB = "*Item*Catalogue*Master*.xls*"
 
+# The resumable stages, in the order they run.
+STAGE_ORDER: Tuple[str, ...] = ("wide", "interpret", "agents")
+
+# How each stage is named when a run reports what it kept or where it stopped.
+STAGE_LABELS: Dict[str, str] = {
+    "wide": "stages 1 and 2",
+    "interpret": "stage 3",
+    "agents": "the agents",
+}
+
+# What a stage leaves half-written if it is interrupted. Deleted when a run
+# carries on, so that a truncated table cannot be mistaken for a result. Stages
+# recorded as finished are never in here.
+PARTIAL_OUTPUTS: Dict[str, Tuple[str, ...]] = {
+    "wide": ("max_stage1_sievo_invoice.csv", "max_stage1_sievo_invoice.jsonl",
+             "max_stage2_with_po.csv", "max_stage2_with_po.jsonl"),
+    "interpret": ("max_stage3_interpreted.csv", "max_stage3_interpreted.jsonl"),
+    "agents": ("max_stage4_enriched.csv", "max_stage4_enriched.jsonl",
+               "max_stage5_grouped.csv", "max_stage5_grouped.jsonl",
+               "max_stage6_standardised.csv", "max_stage6_standardised.jsonl"),
+}
+
 # Seconds of quiet from an agent before the build reports that it is still alive.
 # Agent 1 translates and embeds in long silent passes, so a build with nothing to
 # say for an hour is normal - and indistinguishable from a hung one to whoever is
@@ -356,6 +396,11 @@ class Settings:
 
     # Rerun every agent even where a result from the same input is already there.
     force_agents: bool = False
+
+    # Carry on from where an interrupted run stopped, rather than repeating the
+    # stages it finished. On by default, because repeating them is never what was
+    # wanted and the record is only used when it still matches the inputs.
+    resume: bool = True
 
     use_llm: bool = False
     write_jsonl: bool = True
@@ -3148,6 +3193,22 @@ def read_csv_rows(path: Path) -> Iterator[Dict[str, str]]:
             yield {key: (value or "") for key, value in record.items() if key is not None}
 
 
+def _header_of(path: Path) -> List[str]:
+    """Column names of a CSV, or an empty list if it cannot be read."""
+    try:
+        with path.open("r", encoding=CSV_ENCODING, newline="") as handle:
+            for row in csv.reader(handle):
+                return [name.strip() for name in row]
+    except OSError:
+        return []
+    return []
+
+
+def _now() -> str:
+    """A timestamp a reader can compare against a file's modification time."""
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _duration(seconds: float) -> str:
     """A duration in the units a reader thinks in."""
     if seconds < 90:
@@ -3222,6 +3283,10 @@ class AgentPipeline:
         self.statistics: Dict[str, Any] = {}
         self.runs: List[AgentRun] = []
         self.supplier_keys: Dict[str, str] = {}
+
+        # Agents currently running, so an interrupt can end them rather than
+        # leaving one working on behalf of a run that has stopped.
+        self._running: List[subprocess.Popen] = []
 
     # -- running the agents --------------------------------------------------
 
@@ -3363,6 +3428,24 @@ class AgentPipeline:
     def _say(self, run: AgentRun, message: str) -> None:
         print(f"  [{run.tag or run.name}] {message}", flush=True)
 
+    def stop_running_agents(self) -> None:
+        """End any agent still running, so Ctrl-C does not leave one behind.
+
+        A child started with Popen keeps going after the parent stops waiting for
+        it, and an abandoned Agent 3 would carry on embedding a catalogue for a run
+        that no longer exists - burning the machine and, worse, writing its output
+        after the interrupted run had already decided it had none.
+        """
+        for process in list(self._running):
+            if process.poll() is None:
+                process.terminate()
+        for process in list(self._running):
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        self._running.clear()
+
     def _stream(self, run: AgentRun,
                 arguments: Sequence[str]) -> Tuple[Any, List[str]]:
         """Run one agent, forwarding its own logging as it happens.
@@ -3405,6 +3488,8 @@ class AgentPipeline:
         except OSError as error:
             run.seconds = time.time() - started
             return 1, [str(error)]
+
+        self._running.append(process)
 
         def pump() -> None:
             assert process.stdout is not None
@@ -3450,6 +3535,8 @@ class AgentPipeline:
             process.kill()
             process.wait()
         reader.join(timeout=10)
+        if process in self._running:
+            self._running.remove(process)
         run.seconds = time.time() - started
         return verdict, tail
 
@@ -3842,6 +3929,212 @@ class AgentPipeline:
         LOGGER.error("Rerun the same command to carry on from %s.", blocked.name)
 
 
+class RunJournal:
+    """What a run has finished, so a later run can carry on from there.
+
+    Stage 3 reads every distinct string in the extract and the agents after it run
+    for hours, so a build stopped part way through has usually earned most of what
+    it was going to. Starting again from stage 1 throws that away, and on a full
+    extract that is most of a day.
+
+    A stage is recorded only once its files are closed, together with their size
+    and modification time. That is what separates a finished stage from an
+    interrupted one: a half-written CSV is never in here, and one that has been
+    touched since no longer matches and is rebuilt. The recorded statistics are
+    kept too, because the summary and the row-count check at the end of the run
+    need what a skipped stage would have measured.
+    """
+
+    NAME = ".max_run_journal.json"
+    VERSION = "1"
+
+    def __init__(self, settings: "Settings") -> None:
+        self.settings = settings
+        self.path = settings.results_dir / self.NAME
+        self.payload: Dict[str, Any] = {}
+
+    # -- deciding whether the record still applies ---------------------------
+
+    def fingerprint(self) -> Dict[str, Any]:
+        """What must be unchanged for finished stages to still be valid.
+
+        The extracts are compared by size and modification time rather than by
+        content: reading every byte of the source folder to decide whether reading
+        it can be skipped would defeat the point, and a changed file is what needs
+        detecting, not a changed byte.
+        """
+        extracts = []
+        if self.settings.source_dir.is_dir():
+            for path in sorted(self.settings.source_dir.rglob("*")):
+                if (path.is_file() and not path.name.startswith((".", "~$"))
+                        and path.suffix.lower() in {".csv", ".xlsx", ".xls"}):
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+                    extracts.append({"file": str(path.relative_to(self.settings.source_dir)),
+                                     "bytes": stat.st_size,
+                                     "modified": int(stat.st_mtime)})
+        return {
+            "extracts": extracts,
+            "lexicon": _digest(self.settings.lexicon_path),
+            # Only the settings that change what stages 1 to 3 write. The agent
+            # settings are absent on purpose: they cannot alter these stages, and
+            # including them would rebuild the table whenever an agent flag moved.
+            "settings": {
+                "native_po_columns": self.settings.native_po_columns,
+                "interpretation_floor": self.settings.interpretation_floor,
+                "min_text_length": self.settings.min_text_length,
+                "write_jsonl": self.settings.write_jsonl,
+                "model": (self.settings.model.model
+                          if self.settings.model.enabled else ""),
+            },
+        }
+
+    def load(self) -> Optional[str]:
+        """Read the record, returning why it cannot be used, or None if it can."""
+        if not self.path.is_file():
+            return "no previous run"
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "the record of the previous run is unreadable"
+        if payload.get("version") != self.VERSION:
+            return "the record was written by a different version of Max"
+        if payload.get("state") == "complete":
+            return "the previous run finished"
+        if payload.get("fingerprint") != self.fingerprint():
+            return self._what_changed(payload.get("fingerprint") or {})
+        self.payload = payload
+        return None
+
+    def _what_changed(self, before: Dict[str, Any]) -> str:
+        """Name the change that invalidates the record, rather than just its fact."""
+        now = self.fingerprint()
+        if before.get("settings") != now["settings"]:
+            moved = [name for name, value in now["settings"].items()
+                     if (before.get("settings") or {}).get(name) != value]
+            return f"the run's settings changed ({', '.join(moved) or 'unknown'})"
+        if before.get("lexicon") != now["lexicon"]:
+            return "the controlled vocabulary changed"
+
+        was = {entry["file"]: entry for entry in before.get("extracts") or []}
+        is_ = {entry["file"]: entry for entry in now["extracts"]}
+        added = sorted(set(is_) - set(was))
+        removed = sorted(set(was) - set(is_))
+        changed = sorted(name for name in set(was) & set(is_) if was[name] != is_[name])
+        parts = []
+        if added:
+            parts.append(f"{len(added)} extract(s) added ({', '.join(added[:2])})")
+        if removed:
+            parts.append(f"{len(removed)} removed ({', '.join(removed[:2])})")
+        if changed:
+            parts.append(f"{len(changed)} changed ({', '.join(changed[:2])})")
+        return "the source extracts changed: " + ("; ".join(parts) or "unknown")
+
+    # -- what the previous run got through -----------------------------------
+
+    def finished(self, stage: str) -> Optional[Dict[str, Any]]:
+        """A stage's record, if it completed and its files are still as written."""
+        record = ((self.payload.get("stages") or {}).get(stage) or {})
+        if not record.get("done"):
+            return None
+        for described in record.get("files") or []:
+            path = self.settings.results_dir / described["file"]
+            try:
+                stat = path.stat()
+            except OSError:
+                LOGGER.info("%s cannot be reused: %s is gone.", stage, described["file"])
+                return None
+            if (stat.st_size != described.get("bytes")
+                    or int(stat.st_mtime) != described.get("modified")):
+                LOGGER.info("%s cannot be reused: %s has changed since it was written.",
+                            stage, described["file"])
+                return None
+        return record
+
+    def interrupted_at(self) -> str:
+        return str(self.payload.get("running") or "")
+
+    def done_stages(self) -> List[str]:
+        """Finished stages in the order they run, not the order they were stored."""
+        done = {name for name, record in (self.payload.get("stages") or {}).items()
+                if record.get("done")}
+        return [name for name in STAGE_ORDER if name in done]
+
+    # -- recording -----------------------------------------------------------
+
+    def begin(self, run_id: str) -> None:
+        stages = self.payload.get("stages") or {}
+        self.payload = {
+            "version": self.VERSION,
+            "run_id": run_id,
+            "started": self.payload.get("started") or _now(),
+            "fingerprint": self.fingerprint(),
+            "state": "running",
+            "running": "",
+            "stages": stages,
+        }
+        self._save()
+
+    def starting(self, stage: str) -> None:
+        self.payload["running"] = stage
+        self._save()
+
+    def completed(self, stage: str, outputs: Sequence[str],
+                  statistics: Dict[str, Any], diagnostics: Dict[str, Any],
+                  extra: Optional[Dict[str, Any]] = None) -> None:
+        """Record a stage whose files are written and closed."""
+        described = []
+        for name in outputs:
+            path = self.settings.results_dir / name
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            described.append({"file": name, "bytes": stat.st_size,
+                              "modified": int(stat.st_mtime)})
+        self.payload.setdefault("stages", {})[stage] = {
+            "done": True,
+            "at": _now(),
+            "files": described,
+            "statistics": copy.deepcopy(statistics),
+            "diagnostics": copy.deepcopy(diagnostics),
+            **(extra or {}),
+        }
+        self.payload["running"] = ""
+        self._save()
+
+    def stopped(self, stage: str) -> None:
+        self.payload["state"] = "interrupted"
+        self.payload["running"] = stage
+        self.payload["stopped_at"] = _now()
+        self._save()
+
+    def complete(self) -> None:
+        self.payload["state"] = "complete"
+        self.payload["running"] = ""
+        self.payload["finished_at"] = _now()
+        self._save()
+
+    def discard(self) -> None:
+        self.payload = {}
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+    def _save(self) -> None:
+        try:
+            self.settings.results_dir.mkdir(parents=True, exist_ok=True)
+            self.payload["updated"] = _now()
+            self.path.write_text(
+                json.dumps(self.payload, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8")
+        except OSError as error:
+            LOGGER.debug("Could not record run progress: %s", error)
+
+
 class Builder:
     """Runs the three stages and writes their outputs."""
 
@@ -3878,6 +4171,10 @@ class Builder:
         # is precisely where someone needs to see that a delivered file was
         # unusable.
         self.unusable_po_systems: List[str] = []
+
+        # Stages taken from an interrupted run rather than run again. Reported, so
+        # that a table nobody watched being built still says where it came from.
+        self.carried_over: List[str] = []
 
     # -- setup --------------------------------------------------------------
 
@@ -4155,6 +4452,66 @@ class Builder:
 
     # -- stages 4 to 6 ------------------------------------------------------
 
+    # -- stages 1 to 3, run or carried over ----------------------------------
+
+    def wide_stage(self, journal: RunJournal) -> Tuple[Path, Path, List[str]]:
+        """Stages 1 and 2, or what a previous run already wrote for them."""
+        results = self.settings.results_dir
+        stage1_csv = results / "max_stage1_sievo_invoice.csv"
+        stage2_csv = results / "max_stage2_with_po.csv"
+
+        record = journal.finished("wide") if self.settings.resume else None
+        if record:
+            columns = _header_of(stage2_csv)
+            if columns:
+                self._carry_over(record, "Stages 1 and 2")
+                self.carried_over.append("stages 1 and 2 (invoice and PO joins)")
+                return stage2_csv, stage1_csv, columns
+            LOGGER.info("Stages 1 and 2 cannot be reused: %s has no header.",
+                        stage2_csv.name)
+
+        journal.starting("wide")
+        stage2_csv, stage1_csv, columns = self.build_wide()
+        journal.completed("wide", self.outputs, self.statistics, self.diagnostics)
+        return stage2_csv, stage1_csv, columns
+
+    def interpret_stage(self, journal: RunJournal, stage2_csv: Path,
+                        stage2_columns: List[str]) -> Path:
+        """Stage 3, or what a previous run already wrote for it."""
+        stage3_csv = self.settings.results_dir / "max_stage3_interpreted.csv"
+
+        record = journal.finished("interpret") if self.settings.resume else None
+        if record:
+            columns = _header_of(stage3_csv)
+            if columns:
+                self._carry_over(record, "Stage 3")
+                self.stage3_columns = columns
+                self.final_csv = stage3_csv
+                self.final_columns = list(columns)
+                self.carried_over.append("stage 3 (free text read into columns)")
+                return stage3_csv
+            LOGGER.info("Stage 3 cannot be reused: %s has no header.", stage3_csv.name)
+
+        journal.starting("interpret")
+        stage3_csv = self.interpret(stage2_csv, stage2_columns)
+        journal.completed("interpret", self.outputs, self.statistics, self.diagnostics)
+        return stage3_csv
+
+    def _carry_over(self, record: Dict[str, Any], label: str) -> None:
+        """Adopt a finished stage's measurements as if it had just run.
+
+        The summary and the row-count check at the end of the run read these, so a
+        stage that is skipped has to hand back what it measured or the run reports
+        a table of no rows and then calls that a failure.
+        """
+        self.statistics.update(record.get("statistics") or {})
+        self.diagnostics.update(record.get("diagnostics") or {})
+        for described in record.get("files") or []:
+            if described["file"] not in self.outputs:
+                self.outputs.append(described["file"])
+        LOGGER.info("%s already done on %s; carrying it over.",
+                    label, record.get("at") or "an earlier run")
+
     def enrich(self, stage3_csv: Path) -> Optional[Path]:
         """Run the agents and widen the table with what they found.
 
@@ -4323,6 +4680,7 @@ class Builder:
             "final_table": self.final_csv.name if self.final_csv else "",
             "final_columns": len(self.final_columns),
             "column_precedence": AGENT_PRECEDENCE_NOTE,
+            "carried_over": list(self.carried_over),
         }
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
@@ -4430,7 +4788,11 @@ def build_parser() -> argparse.ArgumentParser:
             "  python max.py --non-interactive --use-llm --llm-spend-limit 10\n"
             "      Add the model tier for free text the rules cannot read.\n\n"
             "  python max.py --non-interactive --no-agents\n"
-            "      Stop at stage 3, leaving the agents to be run separately.\n"
+            "      Stop at stage 3, leaving the agents to be run separately.\n\n"
+            "  python max.py --non-interactive --results ./results\n"
+            "      After a run was stopped, carry on from the stage it reached.\n\n"
+            "  python max.py --non-interactive --restart\n"
+            "      Ignore what an interrupted run finished and rebuild from stage 1.\n"
         ),
     )
 
@@ -4460,6 +4822,11 @@ def build_parser() -> argparse.ArgumentParser:
     agents.add_argument("--force-agents", action="store_true",
                         help="rerun every agent instead of reusing a result already "
                              "built from the same input")
+
+    resuming = parser.add_argument_group("interrupted runs")
+    resuming.add_argument("--restart", action="store_true",
+                          help="start from stage 1, discarding the stages an "
+                               "interrupted run had already finished")
 
     tiers = parser.add_argument_group("processing tiers")
     tiers.add_argument("--use-llm", action="store_true",
@@ -4577,7 +4944,8 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         agent_silence_timeout=(args.agent_silence_timeout
                                if args.agent_silence_timeout is not None
                                else Settings.agent_silence_timeout),
-        force_agents=args.force_agents,
+        force_agents=args.force_agents or args.restart,
+        resume=not args.restart,
         use_llm=use_llm,
         write_jsonl=not args.no_jsonl,
         verbose=args.verbose,
@@ -4698,6 +5066,14 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
         if len(missing) > 12:
             print(f"    ... and {len(missing) - 12} more")
 
+    carried = manifest.get("carried_over") or []
+    if carried:
+        print()
+        print("  Carried over from an interrupted run")
+        for name in carried:
+            print(f"    {name}")
+        print("    Rerun with --restart to rebuild these from stage 1.")
+
     if manifest.get("final_table"):
         print()
         print(f"  Table to use         : {manifest['final_table']}")
@@ -4721,6 +5097,88 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
 
     print_token_usage(statistics, settings)
     print()
+
+
+def decide_resume(journal: RunJournal, settings: Settings) -> None:
+    """Work out whether the previous run's finished stages can be carried over.
+
+    Asked before anything is read, so that a run which is going to start again
+    says so at the top rather than after the first stage has been repeated.
+    """
+    if not settings.resume:
+        journal.discard()
+        return
+
+    obstacle = journal.load()
+    if obstacle:
+        if obstacle not in {"no previous run", "the previous run finished"}:
+            LOGGER.info("Starting from stage 1: %s.", obstacle)
+        journal.discard()
+        return
+
+    done = journal.done_stages()
+    if not done:
+        return
+
+    finished = ", ".join(STAGE_LABELS.get(name, name) for name in done)
+    stopped = journal.interrupted_at()
+
+    print()
+    LOGGER.warning("A previous run in this results folder did not finish.")
+    LOGGER.warning("  Finished and reusable : %s", finished)
+    if stopped:
+        LOGGER.warning("  Stopped during        : %s",
+                       STAGE_LABELS.get(stopped, stopped))
+
+    if settings.interactive:
+        if not ask_yes_no("Carry on from there rather than starting again", True):
+            LOGGER.info("Starting again from stage 1.")
+            journal.discard()
+            return
+    else:
+        LOGGER.info("Carrying on from there. Use --restart to start again.")
+
+    # The stage that was in flight when the run stopped left a part-written file
+    # behind. It is not recorded as finished so it would never be reused, but it
+    # is deleted anyway so that nobody opens it believing it to be a result.
+    if stopped:
+        for name in PARTIAL_OUTPUTS.get(stopped, ()):
+            path = settings.results_dir / name
+            if path.exists():
+                try:
+                    path.unlink()
+                    LOGGER.info("Removed the part-written %s.", name)
+                except OSError as error:
+                    LOGGER.warning("Could not remove the part-written %s: %s",
+                                   name, error)
+
+
+def report_interruption(builder: Builder, journal: RunJournal,
+                        settings: Settings) -> None:
+    """Say what was kept and how to carry on, after Ctrl-C."""
+    stage = journal.interrupted_at() or "the current stage"
+
+    if builder.pipeline is not None:
+        builder.pipeline.stop_running_agents()
+
+    journal.stopped(journal.interrupted_at())
+
+    done = journal.done_stages()
+    print("\n")
+    LOGGER.warning("Stopped during %s.", STAGE_LABELS.get(stage, stage))
+    if done:
+        LOGGER.warning("Kept, and carried over next time: %s.",
+                       ", ".join(STAGE_LABELS.get(name, name) for name in done))
+    else:
+        LOGGER.warning("No stage had finished, so there is nothing to carry over.")
+
+    if builder.pipeline is not None:
+        finished = [run.name for run in builder.pipeline.runs if run.ok]
+        if finished:
+            LOGGER.warning("Agents already done: %s.", ", ".join(finished))
+
+    LOGGER.warning("Run the same command again to carry on, or add --restart to "
+                   "start from stage 1.")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -4748,6 +5206,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             LOGGER.info("No spend alert set; the model tier will run unmetered.")
 
+    journal = RunJournal(settings)
+    decide_resume(journal, settings)
+
     builder = Builder(settings)
     try:
         builder.load()
@@ -4755,15 +5216,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"\n{error}\n")
         return 2
 
+    journal.begin(builder.run_id or _now())
     try:
         builder.measure_keys()
-        stage2_csv, _, stage2_columns = builder.build_wide()
-        stage3_csv = builder.interpret(stage2_csv, stage2_columns)
+        stage2_csv, _, stage2_columns = builder.wide_stage(journal)
+        stage3_csv = builder.interpret_stage(journal, stage2_csv, stage2_columns)
         if settings.run_agents:
+            journal.starting("agents")
             builder.enrich(stage3_csv)
+            journal.completed("agents", [], {}, {})
         manifest = builder.write_manifest()
+    except KeyboardInterrupt:
+        report_interruption(builder, journal, settings)
+        builder.close()
+        return 130
     finally:
         builder.close()
+
+    journal.complete()
 
     rows_in = builder.statistics.get("rows_in", 0)
     rows_out = builder.statistics.get("rows_out", 0)
