@@ -124,6 +124,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import unicodedata
 import zipfile
 from collections import Counter, defaultdict
@@ -231,6 +233,15 @@ AGENT_PRECEDENCE_NOTE = ("the agent value wins where it is populated; "
 # exists to normalise away.
 SUPPLIER_KEY_COLUMN = "Supplier_Key"
 
+# How the client's item catalogue master is named, wherever it has been put.
+CATALOGUE_MASTER_GLOB = "*Item*Catalogue*Master*.xls*"
+
+# Seconds of quiet from an agent before the build reports that it is still alive.
+# Agent 1 translates and embeds in long silent passes, so a build with nothing to
+# say for an hour is normal - and indistinguishable from a hung one to whoever is
+# watching, who then stops it.
+HEARTBEAT_SECONDS = 120
+
 BANNER = f"""
 ===============================================================================
  Fortum AI-Powered Procurement Analysis
@@ -318,10 +329,33 @@ class Settings:
     # without them is only half the deliverable.
     run_agents: bool = True
 
-    # Ceiling on a single agent, in seconds. Generous because Agent 1 on a full
-    # extract with the model tier on is measured in hours, but present so that an
-    # agent waiting forever on a prompt or a network call cannot hang the build.
-    agent_timeout: int = 21600
+    # How long an agent may go without saying anything before it is treated as
+    # hung, in seconds. Not a ceiling on how long it may run.
+    #
+    # This replaces an absolute six-hour limit that did real damage: Agent 1 on the
+    # client's full extract was killed at exactly six hours, having worked the
+    # whole time and written nothing, which cost that work and every column Agents
+    # 2 and 3 would have added afterwards. An absolute limit cannot tell slow
+    # progress from a hang, so it eventually kills the run it was meant to protect.
+    # Silence can tell them apart: an agent still logging is working however long
+    # it takes, and one that has gone quiet is stuck on a prompt or a network call.
+    #
+    # Two hours, which is deliberately far more than any real pass needs. Agent 3
+    # embeds the whole catalogue in one call that prints nothing until it finishes,
+    # measured here at 876s of silence for 845,000 items, and that grows with the
+    # catalogue and shrinks with the machine. A limit close to the measurement
+    # would kill a working agent on a slower laptop, which is the very fault being
+    # fixed. Detection speed costs nothing anyway: a genuine hang waits for ever,
+    # so catching it late still saves the build, and the heartbeat below is what
+    # tells the operator meanwhile that the agent is alive.
+    agent_silence_timeout: int = 7200
+
+    # Absolute ceiling, off unless asked for. Available for an unattended run that
+    # must finish by a certain time, and best left alone otherwise.
+    agent_timeout: Optional[int] = None
+
+    # Rerun every agent even where a result from the same input is already there.
+    force_agents: bool = False
 
     use_llm: bool = False
     write_jsonl: bool = True
@@ -3114,6 +3148,29 @@ def read_csv_rows(path: Path) -> Iterator[Dict[str, str]]:
             yield {key: (value or "") for key, value in record.items() if key is not None}
 
 
+def _duration(seconds: float) -> str:
+    """A duration in the units a reader thinks in."""
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    minutes, rest = divmod(int(seconds), 60)
+    if minutes < 90:
+        return f"{minutes}m {rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def _digest(path: Path) -> str:
+    """Content digest of a file, or an empty string if it cannot be read."""
+    hasher = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                hasher.update(block)
+    except OSError:
+        return ""
+    return hasher.hexdigest()[:16]
+
+
 @dataclass
 class AgentRun:
     """What one agent produced, and whether it can be merged."""
@@ -3125,6 +3182,13 @@ class AgentRun:
     ok: bool = False
     reason: str = ""
     rows: int = 0
+
+    # Short tag prefixing this agent's log lines as they are forwarded.
+    tag: str = ""
+
+    reused: bool = False
+    seconds: float = 0.0
+    log: Optional[Path] = None
 
 
 class AgentPipeline:
@@ -3175,51 +3239,271 @@ class AgentPipeline:
                 arguments += ["--llm-spend-limit", f"{self.settings.model.spend_limit:.2f}"]
         return arguments
 
-    def _invoke(self, run: AgentRun, arguments: Sequence[str]) -> AgentRun:
-        """Run one agent and report what happened, without raising."""
+    def _invoke(self, run: AgentRun, arguments: Sequence[str],
+                input_csv: Optional[Path] = None) -> AgentRun:
+        """Reuse or run one agent, reporting what happened without raising."""
         script = self.here / run.script
         if not script.is_file():
             run.reason = f"{run.script} is not in {self.here}"
             LOGGER.error("Cannot run %s: %s.", run.name, run.reason)
             return run
 
-        command = [sys.executable, str(script), *arguments]
-        LOGGER.info("%s: %s", run.name, " ".join(arguments[:6]))
-        try:
-            outcome = subprocess.run(command, cwd=str(self.here), text=True,
-                                     capture_output=True,
-                                     timeout=self.settings.agent_timeout)
-        except subprocess.TimeoutExpired:
-            run.reason = f"did not finish within {self.settings.agent_timeout}s"
-            LOGGER.error("%s timed out.", run.name)
+        if input_csv is not None:
+            cached = self._reusable(run, input_csv, arguments)
+            if cached:
+                run.ok = True
+                run.reused = True
+                run.reason = "already produced from this input by this script"
+                self._say(run, f"reusing {run.output.name} - {run.reason}")
+                return run
+
+        returncode, tail = self._stream(run, arguments)
+
+        if returncode is None:
+            run.reason = (f"said nothing for {self.settings.agent_silence_timeout}s "
+                          f"and was treated as hung")
+            self._say(run, f"NOT RESPONDING - {run.reason}")
+            return run
+        if returncode == "over":
+            run.reason = f"ran past the {self.settings.agent_timeout}s ceiling"
+            self._say(run, f"STOPPED - {run.reason}")
             return run
 
-        if outcome.returncode != 0:
+        if returncode != 0:
             # The agent's own last words are far more useful than the exit code.
-            tail = [line for line in (outcome.stderr or "").splitlines() if line.strip()]
-            run.reason = (tail[-1].strip() if tail else f"exit code {outcome.returncode}")
-            LOGGER.error("%s failed: %s", run.name, run.reason)
+            run.reason = tail[-1] if tail else f"exit code {returncode}"
+            self._say(run, f"FAILED: {run.reason}")
             return run
 
         if not run.output.is_file():
             run.reason = f"finished but wrote no {run.output.name}"
-            LOGGER.error("%s %s", run.name, run.reason)
+            self._say(run, run.reason)
             return run
 
         run.ok = True
+        self._record(run, input_csv, arguments)
+        self._say(run, f"done in {_duration(run.seconds)}")
         return run
+
+    # -- not doing the same work twice ---------------------------------------
+
+    def _fingerprint(self, run: AgentRun, input_csv: Path,
+                     arguments: Sequence[str]) -> Dict[str, Any]:
+        """What a result on disk has to match before it is worth reusing.
+
+        The input's contents, the agent script's contents, and the settings that
+        change what the agent does. Digesting the script rather than reading its
+        version means editing an agent invalidates its old output whether or not
+        anyone remembered to bump the number.
+        """
+        settings = sorted(argument for argument in arguments
+                          if argument.startswith("--")
+                          and argument not in {"--results", "--lexicon", "--cache",
+                                               "--input", "--registry",
+                                               "--catalogues", "--reference",
+                                               "--non-interactive", "--no-jsonl"})
+        # Paths differ harmlessly between machines, so what a path points at is
+        # digested rather than the path itself. Agent 3's catalogue is the case
+        # that matters: Fortum extend the master as they go, and matches found
+        # against last month's copy are not answers to the question being asked.
+        reference = ""
+        for flag in ("--catalogues", "--reference"):
+            if flag in arguments:
+                target = Path(arguments[list(arguments).index(flag) + 1])
+                if target.is_file():
+                    reference = _digest(target)
+                break
+        return {"input": _digest(input_csv),
+                "script": _digest(self.here / run.script),
+                "lexicon": _digest(self.settings.lexicon_path),
+                "reference": reference,
+                "settings": settings}
+
+    def _stamp(self, run: AgentRun) -> Path:
+        return self.work / f".{Path(run.script).stem}.reuse.json"
+
+    def _reusable(self, run: AgentRun, input_csv: Path,
+                  arguments: Sequence[str]) -> bool:
+        """Whether this agent's result is already on disk and still valid.
+
+        Reuse matters most for the agent that costs the most. Agent 1 on the
+        client's full extract runs for hours, and without this a build interrupted
+        anywhere after it - by a failure further down the chain, or by the operator
+        - pays for those hours again to reach the same file.
+        """
+        if self.settings.force_agents or not run.output.is_file():
+            return False
+        stamp = self._stamp(run)
+        if not stamp.is_file():
+            return False
+        try:
+            recorded = json.loads(stamp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return recorded.get("fingerprint") == self._fingerprint(run, input_csv,
+                                                               arguments)
+
+    def _record(self, run: AgentRun, input_csv: Optional[Path],
+                arguments: Sequence[str]) -> None:
+        """Note what this result was made from, so it can be reused."""
+        if input_csv is None:
+            return
+        try:
+            self._stamp(run).write_text(json.dumps({
+                "fingerprint": self._fingerprint(run, input_csv, arguments),
+                "output": run.output.name,
+                "seconds": round(run.seconds, 1),
+            }, indent=2), encoding="utf-8")
+        except OSError as error:
+            LOGGER.debug("Could not record what %s was made from: %s",
+                         run.output.name, error)
+
+    # -- watching an agent work ---------------------------------------------
+
+    def _say(self, run: AgentRun, message: str) -> None:
+        print(f"  [{run.tag or run.name}] {message}", flush=True)
+
+    def _stream(self, run: AgentRun,
+                arguments: Sequence[str]) -> Tuple[Any, List[str]]:
+        """Run one agent, forwarding its own logging as it happens.
+
+        The output used to be captured and thrown away unless the agent failed, and
+        then only its last line of standard error was kept. On the client's full
+        extract that meant six hours during which the build said nothing at all,
+        followed by a timeout whose message could not say what the agent had been
+        doing or how far it had got.
+
+        Now every line is forwarded with the agent's name in front of it and kept
+        in a log file, and the time of the last line is what the watchdog judges.
+        Returns the exit code, or None where the agent went quiet for too long, or
+        the string ``"over"`` where it passed an absolute ceiling that was asked for.
+        """
+        self.work.mkdir(parents=True, exist_ok=True)
+        run.log = self.work / f"{Path(run.script).stem}.log"
+        command = [sys.executable, str(self.here / run.script), *arguments]
+
+        self._say(run, "starting")
+        LOGGER.info("%s: %s", run.name, " ".join(arguments[:6]))
+
+        started = time.time()
+        tail: List[str] = []
+
+        # When the agent last said something, and when the build last said the
+        # agent was alive. Two clocks, not one: a heartbeat is the build talking
+        # about the agent, so counting it as the agent talking would keep the
+        # silence below the limit for ever and the watchdog would never fire.
+        last_line = [started]
+        last_beat = started
+
+        try:
+            process = subprocess.Popen(
+                command, cwd=str(self.here), text=True, bufsize=1,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                # Without this a Python child writing to a pipe holds its output
+                # until it exits, and a live log is not live.
+                env={**os.environ, "PYTHONUNBUFFERED": "1"})
+        except OSError as error:
+            run.seconds = time.time() - started
+            return 1, [str(error)]
+
+        def pump() -> None:
+            assert process.stdout is not None
+            with run.log.open("w", encoding="utf-8") as log:
+                for line in process.stdout:
+                    text = line.rstrip("\n")
+                    last_line[0] = time.time()
+                    log.write(line)
+                    if text.strip():
+                        tail.append(text.strip())
+                        del tail[:-40]
+                        print(f"  [{run.tag or run.name}] {text}", flush=True)
+
+        reader = threading.Thread(target=pump, name=f"{run.tag}-log", daemon=True)
+        reader.start()
+
+        verdict: Any = None
+        while True:
+            try:
+                verdict = process.wait(timeout=5)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+
+            elapsed = time.time() - started
+            quiet = time.time() - last_line[0]
+
+            if self.settings.agent_timeout and elapsed > self.settings.agent_timeout:
+                verdict = "over"
+                break
+            if quiet > self.settings.agent_silence_timeout:
+                verdict = None
+                break
+            # A heartbeat while the agent is quiet but not yet suspect. Agent 1
+            # embeds and translates in long silent passes, and a build that prints
+            # nothing for an hour gets killed by whoever is watching it.
+            if quiet >= HEARTBEAT_SECONDS and time.time() - last_beat >= HEARTBEAT_SECONDS:
+                last_beat = time.time()
+                self._say(run, f"still working, {_duration(elapsed)} elapsed, "
+                               f"quiet for {_duration(quiet)}")
+
+        if verdict is None or verdict == "over":
+            process.kill()
+            process.wait()
+        reader.join(timeout=10)
+        run.seconds = time.time() - started
+        return verdict, tail
 
     def _catalogue_arguments(self) -> List[str]:
         """Where Agent 3 should look for item catalogues.
 
-        A dedicated catalogue folder is preferred when one exists. Failing that
-        the source folder is offered, which is safe because Agent 3 refuses a
-        file that carries purchase-transaction columns - and the source folder is
-        full of them.
+        The client's catalogue master is named for what it is, so it is looked for
+        by name and the newest, largest copy wins wherever it sits.
+
+        This used to hand over the ./catalogues folder whenever that folder
+        existed, without looking inside it. That silently preferred a 4,200-item
+        copy left in ./catalogues to the 846,000-item master the client had since
+        sent into the source folder, and Agent 3 duly matched nothing against it -
+        a run that looks complete and reports far less than it should. Fortum send
+        the master as a full replacement rather than as a delta, so a smaller file
+        of the same name is an older copy of the same thing and never an addition
+        to it.
         """
+        found: List[Tuple[Path, str]] = []
+        for folder, label in ((self.settings.source_dir, "source folder"),
+                              (self.here / "catalogues", "catalogues folder")):
+            if not folder or not folder.is_dir():
+                continue
+            for path in sorted(folder.glob(CATALOGUE_MASTER_GLOB)):
+                if path.is_file() and not path.name.startswith((".", "~$")):
+                    found.append((path, label))
+
+        if found:
+            found.sort(key=lambda entry: (-entry[0].stat().st_size, entry[0].name))
+            chosen, label = found[0]
+            LOGGER.info("Agent 3 catalogue: %s from the %s (%s bytes).",
+                        chosen.name, label, f"{chosen.stat().st_size:,}")
+            for other, where in found[1:]:
+                if other.stat().st_size * 4 < chosen.stat().st_size:
+                    LOGGER.warning(
+                        "%s in the %s is far smaller than the master being used "
+                        "(%s against %s bytes) and looks like an older copy. It has "
+                        "not been read; delete it to avoid doubt.",
+                        other.name, where, f"{other.stat().st_size:,}",
+                        f"{chosen.stat().st_size:,}")
+            return ["--catalogues", str(chosen)]
+
         catalogues = self.here / "catalogues"
         if catalogues.is_dir():
+            LOGGER.warning("No file named like the client's catalogue master was "
+                           "found, so every catalogue in %s is read instead.",
+                           catalogues)
             return ["--catalogues", str(catalogues)]
+
+        # Safe as a last resort because Agent 3 refuses any file carrying
+        # purchase-transaction columns, and the source folder is full of them.
+        LOGGER.warning("No item catalogue was found. Agent 3 will read %s and "
+                       "refuse the purchase extracts in it, leaving it little to "
+                       "match against.", self.settings.source_dir)
         return ["--reference", str(self.settings.source_dir)]
 
     def run_agents(self, stage3_csv: Path) -> None:
@@ -3229,25 +3513,30 @@ class AgentPipeline:
 
         agent1 = self._invoke(
             AgentRun("Agent 1 - purchase descriptions", "agent1.py",
-                     self.work / "agent1_unified_lines.csv", AGENT1_REQUIRED),
-            [*common, "--input", str(stage3_csv)])
+                     self.work / "agent1_unified_lines.csv", AGENT1_REQUIRED,
+                     tag="Agent 1"),
+            [*common, "--input", str(stage3_csv)], stage3_csv)
         self.runs.append(agent1)
         if not agent1.ok:
             return
 
         agent2 = self._invoke(
             AgentRun("Agent 2 - purchase groups", "agent2.py",
-                     self.work / "agent2_purchase_groups.csv", AGENT2_REQUIRED),
+                     self.work / "agent2_purchase_groups.csv", AGENT2_REQUIRED,
+                     tag="Agent 2"),
             [*common, "--input", str(agent1.output),
-             "--registry", str(self.here / "lexicon" / "agent2_group_registry.json")])
+             "--registry", str(self.here / "lexicon" / "agent2_group_registry.json")],
+            agent1.output)
         self.runs.append(agent2)
         if not agent2.ok:
             return
 
         agent3 = self._invoke(
             AgentRun("Agent 3 - standard items", "agent3.py",
-                     self.work / "agent3_standardisation.csv", AGENT3_REQUIRED),
-            [*common, "--input", str(agent2.output), *self._catalogue_arguments()])
+                     self.work / "agent3_standardisation.csv", AGENT3_REQUIRED,
+                     tag="Agent 3"),
+            [*common, "--input", str(agent2.output), *self._catalogue_arguments()],
+            agent2.output)
         self.runs.append(agent3)
 
         # Agent 4 stops with a message when the input holds fewer than two
@@ -3256,9 +3545,11 @@ class AgentPipeline:
         # table is complete whether or not it ran.
         agent4 = self._invoke(
             AgentRun("Agent 4 - supplier consolidation", "agent4.py",
-                     self.work / "agent4_supplier_consolidation.csv"),
+                     self.work / "agent4_supplier_consolidation.csv",
+                     tag="Agent 4"),
             [*common, "--input", str(agent2.output),
-             "--registry", str(self.here / "lexicon" / "agent4_supplier_registry.json")])
+             "--registry", str(self.here / "lexicon" / "agent4_supplier_registry.json")],
+            agent2.output)
         self.runs.append(agent4)
 
     # -- merging -------------------------------------------------------------
@@ -3517,6 +3808,38 @@ class AgentPipeline:
         promised = list(AGENT1_REQUIRED) + list(AGENT2_REQUIRED) + list(AGENT3_REQUIRED)
         present = set(columns)
         return [name for name in promised if name not in present]
+
+    def explain_missing(self, missing: Sequence[str]) -> None:
+        """Say why columns are absent and what to do, not just which ones.
+
+        A bare list of fifty-six names describes the damage without naming the
+        cause. The agents run in a chain, so one agent stopping accounts for its
+        own columns and for every column the agents after it would have added, and
+        the first agent to stop is the only thing worth acting on.
+        """
+        blocked = next((run for run in self.runs if not run.ok and run.reason), None)
+        LOGGER.error("%d promised column(s) are missing from the final table.",
+                     len(missing))
+
+        if blocked is None:
+            LOGGER.error("The agents were not run, so none of their columns exist. "
+                         "Run without --no-agents to add them.")
+            return
+
+        after = [run.name for run in self.runs
+                 if run.ok is False and run is not blocked]
+        LOGGER.error("Cause: %s %s.", blocked.name, blocked.reason)
+        if after:
+            LOGGER.error("The agents after it did not run, so their columns are "
+                         "missing too: %s.", ", ".join(after))
+        if blocked.log and blocked.log.is_file():
+            LOGGER.error("Its full log: %s", blocked.log)
+
+        finished = [run for run in self.runs if run.ok]
+        if finished:
+            LOGGER.error("Kept, and reused rather than recomputed on the next run: "
+                         "%s.", ", ".join(run.name for run in finished))
+        LOGGER.error("Rerun the same command to carry on from %s.", blocked.name)
 
 
 class Builder:
@@ -3853,8 +4176,7 @@ class Builder:
         missing = self.pipeline.missing_columns(self.final_columns)
         if missing:
             self.statistics["columns_missing"] = missing
-            LOGGER.error("%d promised column(s) did not reach the final table: %s",
-                         len(missing), ", ".join(missing))
+            self.pipeline.explain_missing(missing)
         return final_csv
 
     def _apply(self, reading: Interpretation, sources: str,
@@ -4129,8 +4451,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="stop after stage 3 instead of running Agents 1 to 4 "
                              "and widening the table with their columns")
     agents.add_argument("--agent-timeout", metavar="SECONDS", type=int, default=None,
-                        help="abandon an agent that has not finished in this long "
-                             "(default 21600)")
+                        help="abandon an agent still running after this long "
+                             "(off by default, so a slow agent is left to finish)")
+    agents.add_argument("--agent-silence-timeout", metavar="SECONDS", type=int,
+                        default=None,
+                        help="treat an agent that has said nothing for this long as "
+                             f"hung (default {Settings.agent_silence_timeout})")
+    agents.add_argument("--force-agents", action="store_true",
+                        help="rerun every agent instead of reusing a result already "
+                             "built from the same input")
 
     tiers = parser.add_argument_group("processing tiers")
     tiers.add_argument("--use-llm", action="store_true",
@@ -4244,8 +4573,11 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         native_po_columns=native,
         interpretation_floor=args.interpretation_floor,
         run_agents=with_agents,
-        agent_timeout=(args.agent_timeout if args.agent_timeout is not None
-                       else Settings.agent_timeout),
+        agent_timeout=args.agent_timeout,
+        agent_silence_timeout=(args.agent_silence_timeout
+                               if args.agent_silence_timeout is not None
+                               else Settings.agent_silence_timeout),
+        force_agents=args.force_agents,
         use_llm=use_llm,
         write_jsonl=not args.no_jsonl,
         verbose=args.verbose,
