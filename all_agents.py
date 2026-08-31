@@ -118,13 +118,31 @@ inside a comparison scope, not a purchase line, so those columns describe the
 line's supplier rather than the line, and the prefix is there so that a reader
 sorting on ``Agent4_Similarity_Percent`` can see they are sorting suppliers.
 
+Where the table comes from
+--------------------------
+
+Three ways in, and what the caller asks for decides between them rather than
+whatever is lying in the results folder.
+
+Starting from raw data is the complete job: the extracts are joined and
+interpreted first, by Max with its own agent stages declined, and the four agents
+then run over the result. Reusing a table that has already been built skips that
+work, which is worth skipping - it costs the joins and, with the model on, a call
+per line - but only when the table still describes the extracts on disk.
+
+    python3 all_agents.py --from-sources      # raw extracts, all the way through
+    python3 all_agents.py --sources DIR       # the same, naming the folder
+    python3 all_agents.py --input FILE        # a table that already exists
+    python3 all_agents.py                     # prompts, then reuses what it can
+
 Usage
 -----
 
     python3 all_agents.py                     # prompts, then reuses what it can
     python3 all_agents.py --non-interactive   # same, unattended
     python3 all_agents.py --no-llm            # local stack only, no model spend
-    python3 all_agents.py --force             # ignore every cached result
+    python3 all_agents.py --force             # rerun the agents, keep the table
+    python3 all_agents.py --no-reuse          # rebuild everything from the extracts
 
 Author: Prof. Shahab Anbarjafari
 """
@@ -288,6 +306,12 @@ class Settings:
     reuse: bool = True
     force: bool = False
 
+    # Start from the raw extracts: join and interpret them first, then run the
+    # agents over the result. Set by --from-sources, and implied by naming a
+    # --sources folder, because asking for a source folder and then reading a
+    # table built from somewhere else is not what anyone means by it.
+    from_sources: bool = False
+
     # On by default. The point of the run is the agents' AI output, and three of
     # the four fall back to their local stack silently when it is off - which
     # reads as a complete run that simply found less.
@@ -409,6 +433,82 @@ def stream_rows(path: Path) -> Iterator[List[str]]:
 def count_rows(path: Path) -> int:
     """Data rows in a CSV file."""
     return sum(1 for _ in stream_rows(path))
+
+
+def restore_dropped_values(header: Sequence[str], rows: List[List[str]],
+                           earlier: Sequence[Path]) -> Dict[str, int]:
+    """Put back values the agent chain carried a header for but not the data.
+
+    Each agent reads the one before it and republishes its columns, so the last
+    file in the chain is normally the whole line-level answer. Normally, not
+    always: Agent 3 republishes Agent 1's ``AI_Confidence`` header and writes
+    nothing under it, so a merge reading only Agent 3's file publishes an empty
+    ``AI_Confidence`` for every row - a column the client asked for, present,
+    named correctly and blank, which is worse than absent because it looks
+    answered.
+
+    Only cells that are empty in the last file are considered, and only columns
+    that some row is actually missing, so a value the last agent did write is
+    never second-guessed. Earlier files are read nearest-first and streamed, and
+    just the cells being restored are held, so this costs a pass over each file
+    and not another copy of the table.
+
+    Returns the number of cells restored per column, for the run to report.
+    """
+    empty_at = [position for position, _ in enumerate(header)
+                if any(not (row[position].strip() if position < len(row) else "")
+                       for row in rows)]
+    if not empty_at or not earlier:
+        return {}
+
+    try:
+        key_at = list(header).index(ROW_NUMBER_COLUMN)
+    except ValueError:
+        # Without the row number there is no safe way to say which row of an
+        # earlier file describes which row of this one, and guessing by position
+        # is how values end up on the wrong line.
+        return {}
+
+    row_by_key = {}
+    for index, row in enumerate(rows):
+        if key_at < len(row):
+            row_by_key.setdefault(row[key_at].strip(), index)
+
+    restored: Dict[str, int] = {}
+    for path in earlier:
+        wanted = [position for position in empty_at
+                  if any(not (rows[index][position].strip()
+                              if position < len(rows[index]) else "")
+                         for index in row_by_key.values())]
+        if not wanted:
+            break
+        source_header = read_header(path)
+        if ROW_NUMBER_COLUMN not in source_header:
+            continue
+        source_key_at = source_header.index(ROW_NUMBER_COLUMN)
+        lookup = {header[position]: position for position in wanted}
+        source_at = {name: source_header.index(name)
+                     for name in lookup if name in source_header}
+        if not source_at:
+            continue
+
+        for source_row in stream_rows(path):
+            if source_key_at >= len(source_row):
+                continue
+            index = row_by_key.get(source_row[source_key_at].strip())
+            if index is None:
+                continue
+            target = rows[index]
+            if len(target) < len(header):
+                target.extend([""] * (len(header) - len(target)))
+            for name, at in source_at.items():
+                if at >= len(source_row):
+                    continue
+                value = source_row[at].strip()
+                if value and not target[lookup[name]].strip():
+                    target[lookup[name]] = source_row[at]
+                    restored[name] = restored.get(name, 0) + 1
+    return restored
 
 
 def ask(question: str, default: str) -> str:
@@ -673,13 +773,20 @@ class InputChoice:
 
 
 class InputResolver:
-    """Finds the purchase table, preferring one that already exists.
+    """Finds the purchase table the agents will read.
 
-    Max's stage 3 is the wide, interpreted table: the source extracts joined and
-    read. Rebuilding it costs the joins and, where the model is enabled, a call
-    per line, so an existing one is used as it stands. It is only rebuilt when
-    there is none, when the caller says not to reuse, or when the caller names a
-    different file outright.
+    There are three ways in, and the caller's stated intent decides between them
+    rather than what happens to be lying in the results folder.
+
+    A file named with --input is read as it stands. A source folder asked for with
+    --from-sources, or named with --sources, is joined and interpreted first so the
+    run starts from the raw extracts. Otherwise an existing table is reused, since
+    building one costs the joins and, with the model on, a call per line.
+
+    The middle case used to be unreachable while any stage file sat in the results
+    folder: --sources was accepted and then ignored, so pointing the script at a
+    fresh extract quietly produced a run over the old one. A silently substituted
+    input is the worst kind of wrong answer, because the output looks complete.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -689,6 +796,8 @@ class InputResolver:
     def resolve(self) -> InputChoice:
         if self.settings.input_path:
             return self._named(self.settings.input_path)
+        if self.settings.from_sources:
+            return self._rebuild()
         if self.settings.reuse and not self.settings.force:
             existing = self._existing()
             if existing:
@@ -803,8 +912,22 @@ class InputResolver:
                 f"one cannot be built.\nPoint --input at a CSV file instead.")
         if not self.settings.source_dir.is_dir():
             raise SystemExit(
-                f"No purchase table to read and the source folder does not exist: "
-                f"{self.settings.source_dir}")
+                f"Cannot start from the raw extracts because the source folder does "
+                f"not exist:\n  {self.settings.source_dir}\n"
+                f"Name the right folder with --sources, or point --input at a "
+                f"purchase table that already exists.")
+
+        extracts = [path for path in sorted(self.settings.source_dir.rglob("*"))
+                    if path.is_file() and not path.name.startswith((".", "~$"))
+                    and path.suffix.lower() in {".csv", ".xlsx", ".xls"}]
+        if not extracts:
+            raise SystemExit(
+                f"The source folder holds no CSV or Excel extract to read:\n"
+                f"  {self.settings.source_dir}\n"
+                f"Max needs the transaction, invoice and purchase-order extracts "
+                f"there before the agents have anything to run over.")
+        LOGGER.info("Starting from the raw extracts in %s (%d file(s)).",
+                    self.settings.source_dir, len(extracts))
 
         arguments = [sys.executable, str(script), "--non-interactive", "--no-agents",
                      "--sources", str(self.settings.source_dir),
@@ -1384,12 +1507,27 @@ class AgentChain:
     def last_line_output(self) -> Optional[AgentStep]:
         """The furthest step down the line-level chain that succeeded.
 
-        The chain is cumulative, so this one file holds every line-level column
-        produced by every agent that got that far. Where Agent 3 failed, Agent
-        2's output is still the complete answer for Agents 1 and 2.
+        The chain carries every line-level column forward, so this one file holds
+        all their names. It does not always hold all their values - see
+        ``earlier_line_outputs`` - so it is the starting point for the merge
+        rather than the whole of it. Where Agent 3 failed, Agent 2's output is
+        still the complete answer for Agents 1 and 2.
         """
         succeeded = [step for step in self.line_steps() if step.ok and step.output_path]
         return succeeded[-1] if succeeded else None
+
+    def earlier_line_outputs(self) -> List[AgentStep]:
+        """The line-level outputs before the last one, nearest first.
+
+        Needed because the chain preserves column names more faithfully than it
+        preserves values. Agent 3 republishes Agent 1's ``AI_Confidence`` header
+        and leaves the column empty, so a merge that reads only the last file
+        publishes an empty ``AI_Confidence`` for every row while Agent 1's own
+        output has it on most of them. Reading the earlier files lets a value the
+        chain dropped be put back.
+        """
+        succeeded = [step for step in self.line_steps() if step.ok and step.output_path]
+        return list(reversed(succeeded[:-1]))
 
     def agent4_step(self) -> Optional[AgentStep]:
         for step in self.steps:
@@ -2142,6 +2280,10 @@ class Runner:
         self.catalogue: Dict[str, Any] = {}
         self.spend: Dict[str, Any] = {}
 
+        # Column -> cells put back after a later agent blanked what an earlier one
+        # produced. Reported rather than done quietly, because it is a repair.
+        self.restored: Dict[str, int] = {}
+
     def _resume_or_restart(self, input_path: Path) -> None:
         """Deal with a run that was interrupted, before anything reuses its work.
 
@@ -2260,6 +2402,18 @@ class Runner:
                 f"Check {self.settings.work_dir} for its log.")
 
         line_header, line_rows = read_rows(last.output_path)
+
+        # The chain does not always carry a value as far as it carries the header
+        # it belongs under, so anything an earlier agent filled and a later one
+        # blanked is put back before the merge reads it.
+        self.restored = restore_dropped_values(
+            line_header, line_rows,
+            [step.output_path for step in self.chain.earlier_line_outputs()
+             if step.output_path])
+        for column, count in sorted(self.restored.items()):
+            LOGGER.info("Restored %d %s value(s) that the agent chain dropped "
+                        "after they were produced.", count, column)
+
         ledger = RowLedger(self.input.path, input_header, self.input.rows)
         self.placement = ledger.place(line_header, line_rows)
         self.verification = ledger.verify(line_header, self.placement)
@@ -2472,6 +2626,7 @@ class Runner:
             "columns_by_agent": {name: columns
                                  for name, columns in sorted(self.plan.by_agent.items())},
             "columns_renamed_to_protect_the_input": dict(sorted(self.plan.renamed.items())),
+            "values_restored_after_the_chain_dropped_them": dict(sorted(self.restored.items())),
             "row_match": {
                 "key": ROW_NUMBER_COLUMN,
                 "checked_against": [
@@ -2612,6 +2767,14 @@ def print_summary(runner: Runner, settings: Settings) -> None:
             print(f"    {original} -> {renamed}")
         print("    The input's own column keeps its name and its value.")
 
+    if runner.restored:
+        print(f"\n  Put back after the chain dropped them ({len(runner.restored)})")
+        for column, count in sorted(runner.restored.items()):
+            print(f"    {column}: {count:,} value(s)")
+        print("    A later agent republished the column and left it empty. The "
+              "value an\n    earlier agent produced was read from its own output "
+              "instead.")
+
     if runner.warnings:
         print("\n  Worth reading")
         for note in runner.warnings:
@@ -2644,10 +2807,10 @@ def build_parser() -> argparse.ArgumentParser:
     paths = parser.add_argument_group("paths")
     paths.add_argument("--input", metavar="FILE",
                       help="purchase table to widen (default: Max's stage-3 file "
-                           "in the results folder, or build one)")
+                           "in the results folder, or build one from the extracts)")
     paths.add_argument("--sources", metavar="DIR",
-                      help="folder holding the source extracts, used only when "
-                           "there is no table to reuse")
+                      help="folder holding the raw source extracts; naming it means "
+                           "starting from them rather than from a table already built")
     paths.add_argument("--results", metavar="DIR", help="folder to write results into")
     paths.add_argument("--catalogues", metavar="PATH",
                       help="the client's item catalogue for Agent 3, a file or a "
@@ -2656,6 +2819,9 @@ def build_parser() -> argparse.ArgumentParser:
     paths.add_argument("--cache", metavar="DIR", help="folder for the model response cache")
 
     reuse = parser.add_argument_group("reuse")
+    reuse.add_argument("--from-sources", action="store_true",
+                       help="start from the raw extracts: join and interpret them, "
+                            "then run the agents over the result (implied by --sources)")
     reuse.add_argument("--no-reuse", action="store_true",
                        help="ignore results already on disk and rebuild everything, "
                             "including Max's stage-3 file")
@@ -2733,6 +2899,18 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
 
     reuse = not args.no_reuse
 
+    # Naming a source folder is taken as asking for it to be read. The two flags
+    # are separate so that the default folder can be used without naming it.
+    from_sources = bool(args.from_sources or args.sources)
+    if from_sources and input_path:
+        raise SystemExit(
+            "--input names a table to read and --sources/--from-sources asks for one "
+            "to be built from the extracts. Choose one:\n"
+            "  --input FILE      run the agents over that table\n"
+            "  --from-sources    build the table from the extracts first")
+    if args.no_reuse:
+        from_sources = True
+
     # On unless declined. --use-llm is kept so that the command lines already in
     # use keep working, and because saying it out loud is harmless.
     use_llm = not args.no_llm
@@ -2743,10 +2921,13 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         results_dir = Path(ask("Results folder", str(results_dir)))
         existing = next((results_dir / name for name in MAX_STAGE_FILES
                          if (results_dir / name).is_file()), None)
-        if existing and reuse:
-            print(f"\n  Found {existing.name} in the results folder.")
-            reuse = ask_yes_no("Use it as the input rather than rebuilding it", True)
-        if not existing or not reuse:
+        if existing and not from_sources:
+            print(f"\n  Found {existing.name} in the results folder, "
+                  f"holding {count_rows(existing):,} row(s).")
+            reuse = ask_yes_no("Use it as the input rather than starting from the "
+                               "raw extracts", True)
+            from_sources = not reuse
+        if from_sources or not existing:
             source_dir = Path(ask("Source extracts folder", str(source_dir)))
         print()
         use_llm = ask_yes_no("Let the agents call the language model where they ask to",
@@ -2762,6 +2943,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         catalogue_dir=catalogue_dir.expanduser().resolve() if catalogue_dir else None,
         reuse=reuse,
         force=args.force,
+        from_sources=from_sources,
         use_llm=use_llm,
         llm_spend_limit=spend_limit,
         agent_timeout=args.agent_timeout,
