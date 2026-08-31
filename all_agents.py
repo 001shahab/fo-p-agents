@@ -59,6 +59,20 @@ reruns the matching rather than reusing answers found against the old one.
 ``--force`` reruns everything regardless, and ``--no-reuse`` also declines to
 reuse Max's stage-3 file and rebuilds it from the source extracts.
 
+Being interrupted
+-----------------
+
+A run that stops - Ctrl-C, a closed laptop, a dead machine - can be continued by
+running the same command again. The agents that had finished are reused and the
+rest run, which matters because Agent 3 alone takes many minutes.
+
+Progress is journalled as it happens, and the journal's absence is what marks a
+run as finished, so the next run knows it is resuming and says so. The output of
+the agent that was in flight is deleted rather than reused: reuse asks whether a
+result matches its input, and a truncated result can still answer yes. An
+interactive run offers the choice between continuing and starting again; an
+unattended one continues, since that is the answer that does not repeat work.
+
 The catalogue, and the model
 ---------------------------
 
@@ -81,7 +95,7 @@ Watching it work
 
 Each agent's own logging is forwarded as it happens, tagged with the agent it
 came from, and kept in a log file in the working folder. Agent 3 embeds the whole
-catalogue before it matches anything, which on the client's master is twenty
+catalogue before it matches anything, which on the client's master is many
 minutes during which it says nothing, so a heartbeat reports that it is still
 alive rather than letting a healthy run look hung.
 
@@ -200,6 +214,17 @@ AGENT4_PREFIX = "Agent4_"
 SUPPLIER_KEY_COLUMN = "Supplier_Key"
 AGENT4_MASTER_NAME = "agent4_supplier_master.csv"
 AGENT4_CONSOLIDATION_NAME = "agent4_supplier_consolidation.csv"
+
+# What each agent leaves in the working folder, so a run interrupted part way
+# through one can throw away the file it may not have finished writing. Keyed by
+# the tag the run journal records. The provenance stamp goes with it: without the
+# stamp the output cannot be reused, which is the point.
+AGENT_ARTEFACTS: Dict[str, Tuple[str, ...]] = {
+    "Agent 1": ("agent1_unified_lines.csv", ".agent1.reuse.json"),
+    "Agent 2": ("agent2_purchase_groups.csv", ".agent2.reuse.json"),
+    "Agent 3": ("agent3_standardisation.csv", ".agent3.reuse.json"),
+    "Agent 4": (AGENT4_CONSOLIDATION_NAME, ".agent4.reuse.json"),
+}
 AGENT4_MANIFEST_NAME = "agent4_run_manifest.json"
 
 # Columns of Agent 4's output that identify which supplier and scope a row is
@@ -240,7 +265,7 @@ CATALOGUE_MASTER_GLOB = "*Item*Catalogue*Master*.xls*"
 CATALOGUE_ITEMS_EXPECTED = 10_000
 
 # Seconds of silence from an agent before the run says it is still alive. Agent 3
-# embeds the whole catalogue in one call that prints nothing for twenty minutes,
+# embeds the whole catalogue in one call that prints nothing for many minutes,
 # and a pipeline that looks hung gets killed by whoever is watching it.
 HEARTBEAT_SECONDS = 60
 
@@ -274,6 +299,10 @@ class Settings:
     # Agents 3 and 4 both read Agent 2's output and neither reads the other's, so
     # they are the only pair in the chain that can overlap.
     parallel: bool = True
+
+    # False under --non-interactive, where nothing may block waiting for an answer
+    # and an interrupted run is resumed without asking.
+    interactive: bool = True
 
     @property
     def work_dir(self) -> Path:
@@ -428,6 +457,101 @@ def unique_name(name: str, taken: Iterable[str]) -> str:
         if candidate not in used:
             return candidate
     raise RuntimeError(f"cannot find a free column name for {name}")
+
+
+# ---------------------------------------------------------------------------
+# Surviving an interruption
+# ---------------------------------------------------------------------------
+
+class RunJournal:
+    """A note of what a run has finished, so an interrupted one can be resumed.
+
+    The agents already leave reusable results behind: each one stamps its output
+    with what it was made from, and a later run reuses anything a rerun would
+    reproduce. That machinery is what does the resuming. What was missing was
+    knowing that a resume is what is wanted.
+
+    Two things go wrong without this. An interrupted run left no sign it had been
+    interrupted, so the next run looked like an ordinary one and said nothing
+    about the many minutes of work it was about to reuse - or about the agent
+    that had been half way through writing its output when the power went. And a
+    part-written file is the more dangerous of the two, because reuse tests
+    whether a result matches its input, and a truncated result can still be
+    internally consistent.
+
+    So the step that was in flight is recorded, and its output is deleted before
+    anything is allowed to reuse it.
+    """
+
+    NAME = ".run_journal.json"
+
+    def __init__(self, work_dir: Path) -> None:
+        self.path = work_dir / self.NAME
+        self.state: Dict[str, Any] = {}
+
+    # -- reading what a previous run left ------------------------------------
+
+    def previous(self) -> Dict[str, Any]:
+        """The state of a run that did not finish, or nothing."""
+        if not self.path.is_file():
+            return {}
+        try:
+            state = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    @staticmethod
+    def finished_steps(state: Dict[str, Any]) -> List[str]:
+        return [name for name, status in (state.get("steps") or {}).items()
+                if status == "done"]
+
+    @staticmethod
+    def unfinished_steps(state: Dict[str, Any]) -> List[str]:
+        """Every step that did not finish cleanly, however it ended.
+
+        Failed counts as unfinished here. An agent that was killed part way
+        through may be recorded either way - the thread running it can get as far
+        as noting the failure before the interruption is dealt with - and in both
+        cases whatever it wrote is not to be trusted.
+        """
+        return [name for name, status in (state.get("steps") or {}).items()
+                if status != "done"]
+
+    # -- recording this one --------------------------------------------------
+
+    def start(self, input_path: Path, input_digest: str, use_llm: bool) -> None:
+        self.state = {
+            "started": datetime.datetime.now().isoformat(timespec="seconds"),
+            "input": input_path.name,
+            "input_digest": input_digest,
+            "use_llm": use_llm,
+            "steps": {},
+        }
+        self._save()
+
+    def began(self, name: str) -> None:
+        self.state.setdefault("steps", {})[name] = "running"
+        self._save()
+
+    def finished(self, name: str, ok: bool) -> None:
+        self.state.setdefault("steps", {})[name] = "done" if ok else "failed"
+        self._save()
+
+    def clear(self) -> None:
+        """Remove the journal, which is what marks the run as having finished."""
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+    def _save(self) -> None:
+        self.state["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
+        except OSError as error:
+            LOGGER.debug("Could not record run progress: %s", error)
 
 
 # ---------------------------------------------------------------------------
@@ -797,10 +921,39 @@ class AgentChain:
 
         self.catalogue: CatalogueChoice = CatalogueChoice()
 
+        self.journal = RunJournal(settings.work_dir)
+
         # One lock around printing. Two agents run at once and their logs are
         # interleaved on purpose, but a line from one must not land inside a line
         # from the other.
         self._console = threading.Lock()
+
+        # The agents running right now, so an interrupt can stop them rather than
+        # leaving them to finish writing into a run that has been abandoned.
+        self._live: Dict[str, subprocess.Popen] = {}
+        self._live_lock = threading.Lock()
+
+    def stop_live_agents(self) -> List[str]:
+        """Ask any running agent to stop, and say which ones were asked."""
+        with self._live_lock:
+            running = list(self._live.items())
+        stopped = []
+        for tag, process in running:
+            if process.poll() is None:
+                stopped.append(tag)
+                try:
+                    process.terminate()
+                except OSError:
+                    continue
+        for _, process in running:
+            try:
+                process.wait(timeout=10)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+        return stopped
 
     # -- arguments -----------------------------------------------------------
 
@@ -976,12 +1129,18 @@ class AgentChain:
             self._describe_output(step)
             self._say(step, f"reusing {cached.name}, {step.rows:,} row(s) - "
                             f"this input has already been through it")
+            self.journal.finished(step.tag or step.name, True)
             return step
+
+        # Recorded before the agent starts, so an interruption leaves a note of
+        # which agent was in flight and whose output may be part-written.
+        self.journal.began(step.tag or step.name)
 
         returncode, tail = self._run_process(step, arguments)
         if returncode is None:
             step.reason = f"did not finish within {self.settings.agent_timeout}s"
             self._say(step, f"TIMED OUT after {human_seconds(step.seconds)}")
+            self.journal.finished(step.tag or step.name, False)
             return step
 
         if returncode != 0:
@@ -990,12 +1149,14 @@ class AgentChain:
             self._say(step, f"FAILED: {step.reason}")
             if step.log_path:
                 self._say(step, f"its full output is in {step.log_path.name}")
+            self.journal.finished(step.tag or step.name, False)
             return step
 
         produced = self.settings.work_dir / step.output_name
         if not produced.is_file():
             step.reason = f"finished but wrote no {step.output_name}"
             self._say(step, step.reason)
+            self.journal.finished(step.tag or step.name, False)
             return step
 
         step.output_path = produced
@@ -1014,6 +1175,7 @@ class AgentChain:
         except OSError as error:
             LOGGER.debug("Could not record what %s was made from: %s",
                          step.output_name, error)
+        self.journal.finished(step.tag or step.name, True)
         return step
 
     # -- watching an agent work ---------------------------------------------
@@ -1029,8 +1191,8 @@ class AgentChain:
 
         The agent's output is forwarded line by line rather than captured and
         thrown away. Two reasons. Agent 3 embeds the whole catalogue before it
-        matches anything, which is twenty minutes of silence on the client's
-        master, and a pipeline that prints nothing for twenty minutes gets killed
+        matches anything, which is many minutes of silence on the client's
+        master, and a pipeline that prints nothing for that long gets killed
         by whoever is watching it. And the agents report what they loaded - how
         many catalogue items, how much the model cost - which is the information
         needed to tell a run that found nothing from a run that read nothing.
@@ -1062,6 +1224,9 @@ class AgentChain:
             step.seconds = time.time() - started
             return 1, [str(error)]
 
+        with self._live_lock:
+            self._live[step.tag] = process
+
         def pump() -> None:
             assert process.stdout is not None
             with step.log_path.open("w", encoding="utf-8") as log:
@@ -1091,13 +1256,17 @@ class AgentChain:
         pulse.start()
 
         try:
-            process.wait(timeout=self.settings.agent_timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            reader.join(timeout=5)
-            step.seconds = time.time() - started
-            return None, tail
+            try:
+                process.wait(timeout=self.settings.agent_timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                reader.join(timeout=5)
+                step.seconds = time.time() - started
+                return None, tail
+        finally:
+            with self._live_lock:
+                self._live.pop(step.tag, None)
 
         reader.join(timeout=10)
         step.seconds = time.time() - started
@@ -1130,6 +1299,7 @@ class AgentChain:
         """Run the four agents over the purchase table, in order."""
         self.settings.work_dir.mkdir(parents=True, exist_ok=True)
         self.origin_name = input_path.name
+        self.journal.start(input_path, digest_of(input_path), self.settings.use_llm)
         common = self._common_arguments()
         lexicon_dir = self.here / "lexicon"
 
@@ -1173,23 +1343,35 @@ class AgentChain:
                             "--registry",
                             str(lexicon_dir / "agent4_supplier_registry.json")]
 
+        # Registered before they run, not after. An interruption reports what was
+        # kept from the steps recorded here, and a step appended only on completion
+        # is invisible to that report - so an Agent 4 that had finished before the
+        # Ctrl-C went unmentioned while being reused by the next run regardless.
+        # A step that has not run yet carries no columns and no output, which every
+        # reader of this list already has to handle.
+        self.steps.extend([agent3, agent4])
+
         pending = [(agent3, agent3_arguments), (agent4, agent4_arguments)]
         if self.settings.parallel:
             print(f"\n  Agents 3 and 4 run together from {agent2.output_path.name}. "
                   f"Their logs are interleaved and tagged.\n", flush=True)
             workers = [threading.Thread(target=self._invoke,
                                         args=(step, arguments, agent2.output_path),
-                                        name=step.tag)
+                                        name=step.tag, daemon=True)
                        for step, arguments in pending]
             for worker in workers:
                 worker.start()
-            for worker in workers:
-                worker.join()
+            # Waited for in slices rather than with a bare join. A join with no
+            # timeout blocks the main thread in a lock it cannot be woken from, so
+            # Ctrl-C during the many minutes Agent 3 spends embedding was
+            # noticed only once Agent 3 had finished - which is to say, not at all.
+            while any(worker.is_alive() for worker in workers):
+                for worker in workers:
+                    worker.join(timeout=0.2)
         else:
             for step, arguments in pending:
                 self._invoke(step, arguments, agent2.output_path)
 
-        self.steps.extend([agent3, agent4])
         return self.steps
 
     # -- what came out of it -------------------------------------------------
@@ -1960,6 +2142,81 @@ class Runner:
         self.catalogue: Dict[str, Any] = {}
         self.spend: Dict[str, Any] = {}
 
+    def _resume_or_restart(self, input_path: Path) -> None:
+        """Deal with a run that was interrupted, before anything reuses its work.
+
+        Resuming is the default because the work already done is expensive -
+        many minutes of it on the client's catalogue - and because the reuse rules
+        make it safe: an agent's result is reused only where a rerun would
+        reproduce it. What is not safe is the output of the agent that was in
+        flight, which may have been half written when the run stopped, so that one
+        is deleted rather than trusted.
+        """
+        journal = RunJournal(self.settings.work_dir)
+        state = journal.previous()
+        if not state:
+            return
+
+        finished = journal.finished_steps(state)
+        unfinished = journal.unfinished_steps(state)
+        when = state.get("updated") or state.get("started") or "an earlier run"
+
+        print()
+        print("  A previous run did not finish.")
+        print(f"    Started              : {state.get('started', 'unknown')}")
+        print(f"    Last progress        : {when}")
+        print(f"    Input                : {state.get('input', 'unknown')}")
+        if finished:
+            print(f"    Finished             : {', '.join(sorted(finished))}")
+        if unfinished:
+            print(f"    Interrupted part way : {', '.join(sorted(unfinished))}")
+
+        # A different input makes the question moot: none of the old results match
+        # it, so every agent would rerun whatever is chosen here.
+        if state.get("input_digest") and state["input_digest"] != digest_of(input_path):
+            print("    The input has changed since then, so none of that work can be "
+                  "reused and every agent runs again.")
+            journal.clear()
+            self.warnings.append(
+                "A previous run was interrupted, but the input has changed since, so "
+                "nothing from it could be reused.")
+            return
+
+        resume = True
+        if self.settings.interactive:
+            print()
+            resume = ask_yes_no("Continue from where it stopped rather than starting "
+                                "again", True)
+        else:
+            print("    Continuing from where it stopped. Use --force to start again.")
+
+        if not resume:
+            self.settings.force = True
+            print("    Starting again. Every agent will run from the beginning.")
+            journal.clear()
+            return
+
+        # The interrupted agent's output cannot be trusted, whether or not it looks
+        # complete, so it goes. Everything else stands or falls on the reuse rules.
+        for name in unfinished:
+            for artefact in AGENT_ARTEFACTS.get(name, ()):
+                partial = self.settings.work_dir / artefact
+                if partial.is_file():
+                    try:
+                        partial.unlink()
+                        if not artefact.startswith("."):
+                            print(f"    Discarded {artefact}, which {name} may not "
+                                  f"have finished writing.")
+                    except OSError as error:
+                        LOGGER.warning("Could not remove the part-written %s (%s). "
+                                       "Delete it by hand before trusting this run.",
+                                       artefact, error)
+        if finished:
+            self.warnings.append(
+                f"This run resumed an interrupted one from {when}, reusing "
+                f"{len(finished)} agent result(s) rather than recomputing them.")
+        print()
+
     def run(self) -> int:
         started = time.time()
 
@@ -1974,6 +2231,8 @@ class Runner:
                     f"{self.input.rows:,}", self.input.origin)
         self.input_header = read_header(self.input.path)
         input_header = self.input_header
+
+        self._resume_or_restart(self.input.path)
 
         self.chain = AgentChain(self.settings)
         print(f"\n  Model tier           : "
@@ -2037,6 +2296,11 @@ class Runner:
         self._check_row_count()
         self.statistics = self._collect(time.time() - started)
         self._write_manifest()
+
+        # Last, and only here. The journal's absence is what says the run finished,
+        # so it is removed once the dataset is written and has passed its checks -
+        # not when the agents stop, and never on a path that raises.
+        self.chain.journal.clear()
         return 0
 
     # -- the two hard checks -------------------------------------------------
@@ -2412,7 +2676,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="alert each agent when its estimated spend reaches this")
     tiers.add_argument("--agent-timeout", metavar="SECONDS", type=int, default=None,
                        help="give up on an agent that runs longer than this; Agent 3 "
-                            "needs half an hour on the client's full catalogue")
+                            "needs many minutes on the client's full catalogue")
 
     speed = parser.add_argument_group("scheduling")
     speed.add_argument("--no-parallel", action="store_true",
@@ -2503,6 +2767,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         agent_timeout=args.agent_timeout,
         write_jsonl=not args.no_jsonl,
         parallel=not args.no_parallel,
+        interactive=not args.non_interactive,
     )
 
 
@@ -2521,14 +2786,66 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     settings.work_dir.mkdir(parents=True, exist_ok=True)
 
     runner = Runner(settings)
-    code = runner.run()
+    try:
+        code = runner.run()
+    except KeyboardInterrupt:
+        report_interruption(runner, settings)
+        return 130
     print_summary(runner, settings)
     return code
+
+
+def report_interruption(runner: "Runner", settings: Settings) -> None:
+    """Stop the agents, then say what survived and how to carry on.
+
+    The old message said nothing had been written, which was wrong in the way that
+    matters: the dataset had not been written, but the agents' own results had, and
+    those are the expensive part. Someone told the run was wasted starts it again
+    from the beginning and pays for those minutes twice.
+    """
+    print(flush=True)
+    stopped = runner.chain.stop_live_agents() if runner.chain else []
+    if stopped:
+        print(f"  Stopped {', '.join(stopped)} part way through.")
+
+    done = [step for step in (runner.chain.steps if runner.chain else []) if step.ok]
+    print("\n" + "=" * 79)
+    print("  Interrupted")
+    print("=" * 79)
+    if done:
+        print("  Finished, and reused rather than recomputed next time:")
+        for step in done:
+            print(f"    {step.name:<38} {step.rows:,} row(s)"
+                  + (f"  {human_seconds(step.seconds)}" if step.seconds >= 1 else ""))
+    else:
+        print("  No agent had finished, so there is nothing to carry over.")
+
+    if stopped:
+        print(f"\n  {', '.join(stopped)} did not finish. Whatever it had written is "
+              f"discarded on the next run rather than reused, because a part-written "
+              f"result can still look complete.")
+
+    print(f"\n  {OUTPUT_CSV} was not written by this run, so anything of that name in "
+          f"{settings.results_dir} is from an earlier one.")
+    print("\n  Run the same command again to carry on from here: the agents above are "
+          "reused")
+    print("  and only the rest run"
+          + (", after it asks you to confirm."
+             if settings.interactive else " - it will not ask."))
+    print("  Add --force instead to start again from the beginning.")
+
+    spend = runner.chain.spend() if runner.chain else {}
+    if spend.get("this_run_usd"):
+        print(f"\n  Model spend before the interruption: "
+              f"${spend['this_run_usd']:,.2f}. Reusing the finished agents does not "
+              f"spend it again.")
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\nInterrupted. Nothing has been written to the results folder.")
+        # Reached only if the interruption arrives outside Runner.run, which is
+        # where the interesting version of this message is written.
+        print("\nInterrupted before the agents started. Nothing has changed.")
         sys.exit(130)
