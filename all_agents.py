@@ -53,8 +53,42 @@ the same input by the same version of the same script. The check is a digest of
 both files, so a reused result is one that a rerun would reproduce, and editing an
 agent invalidates its cached output without anyone having to remember to say so.
 
+Agent 3's key includes the catalogue files, so a newer catalogue from the client
+reruns the matching rather than reusing answers found against the old one.
+
 ``--force`` reruns everything regardless, and ``--no-reuse`` also declines to
 reuse Max's stage-3 file and rebuilds it from the source extracts.
+
+The catalogue, and the model
+---------------------------
+
+Agent 3 is pointed at the client's catalogue master by name, preferring the file
+in the source folder. That is a correction, not a preference. A run that read a
+193 KB copy of the catalogue from ``./catalogues``, while the 36 MB master the
+client had just sent went unread, reported "no comparable standard item found" on
+every line and looked entirely healthy doing it - so the file that was read, the
+number of items in it and its digest are now all printed, and a catalogue that
+loads suspiciously few items is called out.
+
+The language model is on unless ``--no-llm`` says otherwise. The point of the run
+is the agents' AI output, and three of the four fall back to their local stack
+without complaint when the model is off, which reads as a complete run that
+happened to find less. What it cost is totalled per agent at the end, separating
+what this run spent from what the reused agents spent when they were produced.
+
+Watching it work
+----------------
+
+Each agent's own logging is forwarded as it happens, tagged with the agent it
+came from, and kept in a log file in the working folder. Agent 3 embeds the whole
+catalogue before it matches anything, which on the client's master is twenty
+minutes during which it says nothing, so a heartbeat reports that it is still
+alive rather than letting a healthy run look hung.
+
+Agents 3 and 4 run at the same time. Both read Agent 2's output and neither reads
+the other's. Agents 1 and 2 cannot join them - Agent 2 reads what Agent 1 writes,
+and both later agents read what Agent 2 writes - so the first half of the chain is
+a queue however much anyone would prefer otherwise.
 
 Columns
 -------
@@ -75,7 +109,7 @@ Usage
 
     python3 all_agents.py                     # prompts, then reuses what it can
     python3 all_agents.py --non-interactive   # same, unattended
-    python3 all_agents.py --use-llm           # allow the model where an agent asks
+    python3 all_agents.py --no-llm            # local stack only, no model spend
     python3 all_agents.py --force             # ignore every cached result
 
 Author: Prof. Shahab Anbarjafari
@@ -93,6 +127,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -189,6 +224,26 @@ OUTPUT_MANIFEST = "all_agents_run_manifest.json"
 # dataset, which nobody reads and which hides the case where three rows failed.
 AUDIT_ROW_LIMIT = 5000
 
+# How the client's item catalogue master is named. Both spellings they have sent
+# are matched, spaced and unspaced, because the file has arrived as both
+# "Fortum - Item Catalogues - Master.xlsx" and "Fortum-ItemCatalogues-Master.xlsx".
+#
+# Agent 3 is pointed at this file rather than at a folder. Naming the file is the
+# difference between matching against the client's catalogue and matching against
+# whatever else happens to sit beside it, and it was an old 4,200-row copy of
+# this same file being picked up from ./catalogues - in place of the 846,000-row
+# master - that had Agent 3 reporting no match on every line.
+CATALOGUE_MASTER_GLOB = "*Item*Catalogue*Master*.xls*"
+
+# Below this, a file called a catalogue master is more likely to be an extract or
+# an old copy than the client's current catalogue, and is worth saying so about.
+CATALOGUE_ITEMS_EXPECTED = 10_000
+
+# Seconds of silence from an agent before the run says it is still alive. Agent 3
+# embeds the whole catalogue in one call that prints nothing for twenty minutes,
+# and a pipeline that looks hung gets killed by whoever is watching it.
+HEARTBEAT_SECONDS = 60
+
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -208,10 +263,17 @@ class Settings:
     reuse: bool = True
     force: bool = False
 
-    use_llm: bool = False
+    # On by default. The point of the run is the agents' AI output, and three of
+    # the four fall back to their local stack silently when it is off - which
+    # reads as a complete run that simply found less.
+    use_llm: bool = True
     llm_spend_limit: Optional[float] = None
     agent_timeout: Optional[int] = None
     write_jsonl: bool = True
+
+    # Agents 3 and 4 both read Agent 2's output and neither reads the other's, so
+    # they are the only pair in the chain that can overlap.
+    parallel: bool = True
 
     @property
     def work_dir(self) -> Path:
@@ -341,6 +403,17 @@ def ask_yes_no(question: str, default: bool) -> bool:
     return answer.startswith("y")
 
 
+def human_seconds(seconds: float) -> str:
+    """A duration in the units a reader thinks in."""
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    minutes, rest = divmod(int(seconds), 60)
+    if minutes < 90:
+        return f"{minutes}m {rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
 def unique_name(name: str, taken: Iterable[str]) -> str:
     """A column name that is not in use, by suffixing a number if it is.
 
@@ -355,6 +428,109 @@ def unique_name(name: str, taken: Iterable[str]) -> str:
         if candidate not in used:
             return candidate
     raise RuntimeError(f"cannot find a free column name for {name}")
+
+
+# ---------------------------------------------------------------------------
+# Deciding which catalogue Agent 3 matches against
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CatalogueChoice:
+    """The catalogue Agent 3 will read, and every candidate that was not chosen.
+
+    The alternatives are carried rather than discarded because the failure this
+    class exists to prevent is a silent one. Agent 3 reported "no comparable
+    standard item found" on every line of a run that looked entirely healthy, and
+    the reason was that it had loaded a 193 KB copy of the catalogue from
+    ./catalogues while the 36 MB master the client had just sent sat unread in the
+    source folder. Nothing in that run said which file had been used.
+    """
+
+    arguments: List[str] = field(default_factory=list)
+    path: Optional[Path] = None
+    origin: str = ""
+    alternatives: List[Dict[str, Any]] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    def describe(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"origin": self.origin,
+                                   "not_used": self.alternatives}
+        if self.path:
+            payload.update(describe_file(self.path))
+        return payload
+
+
+def choose_catalogue(here: Path, source_dir: Path,
+                     named: Optional[Path]) -> CatalogueChoice:
+    """Decide which item catalogue Agent 3 matches against, and say so.
+
+    A file is named rather than a folder wherever one can be found. Agent 3 takes
+    either, and handing it a folder means it reads everything in there that could
+    pass for a price list - which in the source folder is a question with a
+    different answer every time the client sends new data.
+    """
+    choice = CatalogueChoice()
+
+    if named:
+        choice.path = named if named.is_file() else None
+        choice.origin = f"named on the command line: {named}"
+        choice.arguments = ["--catalogues", str(named)]
+        if not named.exists():
+            choice.warnings.append(
+                f"The catalogue path given does not exist: {named}. Agent 3 will "
+                f"report that it loaded no catalogue.")
+        return choice
+
+    # Every file in either place that is named like the client's master, largest
+    # first. Size stands in for item count here because counting means opening a
+    # 36 MB workbook, and the run is about to do that anyway.
+    candidates: List[Tuple[Path, str]] = []
+    for folder, label in ((source_dir, "source folder"), (here / "catalogues",
+                                                          "catalogues folder")):
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.glob(CATALOGUE_MASTER_GLOB)):
+            if path.is_file() and not path.name.startswith((".", "~$")):
+                candidates.append((path, label))
+
+    if candidates:
+        # The source folder wins over ./catalogues, and within a folder the larger
+        # file wins. Fortum send the master as a full replacement rather than as a
+        # delta, so a smaller file of the same name is an older copy of it.
+        candidates.sort(key=lambda entry: (entry[1] != "source folder",
+                                           -entry[0].stat().st_size,
+                                           entry[0].name))
+        chosen, label = candidates[0]
+        choice.path = chosen
+        choice.origin = f"the client's catalogue master, found in the {label}"
+        choice.arguments = ["--catalogues", str(chosen)]
+        choice.alternatives = [
+            {**describe_file(path), "location": other}
+            for path, other in candidates[1:]]
+        for path, other in candidates[1:]:
+            if path.stat().st_size * 4 < chosen.stat().st_size:
+                choice.warnings.append(
+                    f"{path.name} in the {other} is much smaller than the master "
+                    f"being used ({path.stat().st_size:,} against "
+                    f"{chosen.stat().st_size:,} bytes) and looks like an older "
+                    f"copy. It has not been read. Delete it to avoid doubt.")
+        return choice
+
+    catalogues = here / "catalogues"
+    if catalogues.is_dir():
+        choice.origin = f"every catalogue in {catalogues}"
+        choice.arguments = ["--catalogues", str(catalogues)]
+        choice.warnings.append(
+            f"No file named like the client's catalogue master was found in "
+            f"{source_dir}, so the whole {catalogues.name} folder is read instead.")
+        return choice
+
+    choice.origin = f"the source folder, {source_dir}"
+    choice.arguments = ["--reference", str(source_dir)]
+    choice.warnings.append(
+        f"No item catalogue was found. Agent 3 will read {source_dir} and refuse "
+        f"the purchase extracts in it, which leaves it nothing to match against.")
+    return choice
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +632,11 @@ class InputResolver:
                     continue
                 if source.suffix.lower() not in {".csv", ".xlsx", ".xls", ".txt"}:
                     continue
+                # The item catalogue lives in the source folder too, and a new one
+                # arriving there says nothing about whether the transaction table
+                # is complete. It is Agent 3's input, not Max's.
+                if source.match(CATALOGUE_MASTER_GLOB):
+                    continue
                 try:
                     if source.stat().st_mtime > built:
                         newer.append(source.name)
@@ -555,21 +736,33 @@ class AgentStep:
     # row by row; false for Agent 4, whose output cannot.
     unstamped_reuse: bool = False
 
+    # Short tag used to prefix this agent's log lines when several are running.
+    tag: str = ""
+
     # Filled in as the step is decided and carried out.
     input_path: Optional[Path] = None
     output_path: Optional[Path] = None
+    log_path: Optional[Path] = None
     ok: bool = False
     reused: bool = False
     reason: str = ""
     seconds: float = 0.0
     rows: int = 0
     columns: List[str] = field(default_factory=list)
+    usage: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def status(self) -> str:
         if self.reused:
             return "reused"
         return "ran" if self.ok else "failed"
+
+    @property
+    def spend(self) -> float:
+        try:
+            return float(self.usage.get("estimated_cost_usd") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
 
 class AgentChain:
@@ -602,6 +795,13 @@ class AgentChain:
         # is what a line-level output names - not the file the agent read.
         self.origin_name = ""
 
+        self.catalogue: CatalogueChoice = CatalogueChoice()
+
+        # One lock around printing. Two agents run at once and their logs are
+        # interleaved on purpose, but a line from one must not land inside a line
+        # from the other.
+        self._console = threading.Lock()
+
     # -- arguments -----------------------------------------------------------
 
     def _common_arguments(self) -> List[str]:
@@ -620,18 +820,19 @@ class AgentChain:
         return arguments
 
     def _catalogue_arguments(self) -> List[str]:
-        """Where Agent 3 should look for the client's item catalogues.
-
-        A dedicated catalogue folder is preferred. Failing that the source folder
-        is offered, which is safe because Agent 3 refuses any file carrying
-        purchase-transaction columns, and the source folder is full of them.
-        """
-        if self.settings.catalogue_dir and self.settings.catalogue_dir.is_dir():
-            return ["--catalogues", str(self.settings.catalogue_dir)]
-        catalogues = self.here / "catalogues"
-        if catalogues.is_dir():
-            return ["--catalogues", str(catalogues)]
-        return ["--reference", str(self.settings.source_dir)]
+        """Where Agent 3 should look for the client's item catalogue."""
+        if not self.catalogue.arguments:
+            self.catalogue = choose_catalogue(self.here, self.settings.source_dir,
+                                              self.settings.catalogue_dir)
+            LOGGER.info("Agent 3 catalogue: %s", self.catalogue.origin)
+            if self.catalogue.path:
+                described = describe_file(self.catalogue.path)
+                LOGGER.info("  %s, %s bytes, modified %s",
+                            described["file"], f"{described['bytes']:,}",
+                            described["modified"] or "unknown")
+            for note in self.catalogue.warnings:
+                LOGGER.warning(note)
+        return list(self.catalogue.arguments)
 
     # -- reuse ---------------------------------------------------------------
 
@@ -772,42 +973,37 @@ class AgentChain:
             step.ok = True
             step.reused = True
             step.reason = f"already produced from this input, in {cached.parent.name}"
-            LOGGER.info("%s: reusing %s.", step.name, cached.name)
             self._describe_output(step)
+            self._say(step, f"reusing {cached.name}, {step.rows:,} row(s) - "
+                            f"this input has already been through it")
             return step
 
-        command = [sys.executable, str(script), *arguments]
-        LOGGER.info("%s: running over %s.", step.name, input_path.name)
-        started = time.time()
-        try:
-            outcome = subprocess.run(command, cwd=str(self.here), text=True,
-                                     capture_output=True,
-                                     timeout=self.settings.agent_timeout)
-        except subprocess.TimeoutExpired:
-            step.seconds = time.time() - started
+        returncode, tail = self._run_process(step, arguments)
+        if returncode is None:
             step.reason = f"did not finish within {self.settings.agent_timeout}s"
-            LOGGER.error("%s timed out.", step.name)
+            self._say(step, f"TIMED OUT after {human_seconds(step.seconds)}")
             return step
-        step.seconds = time.time() - started
 
-        if outcome.returncode != 0:
+        if returncode != 0:
             # The agent's own last words are more useful than the exit code.
-            tail = [line for line in (outcome.stderr or "").splitlines() if line.strip()]
-            step.reason = tail[-1].strip() if tail else f"exit code {outcome.returncode}"
-            LOGGER.error("%s failed: %s", step.name, step.reason)
-            self._save_log(step, outcome)
+            step.reason = tail[-1] if tail else f"exit code {returncode}"
+            self._say(step, f"FAILED: {step.reason}")
+            if step.log_path:
+                self._say(step, f"its full output is in {step.log_path.name}")
             return step
 
         produced = self.settings.work_dir / step.output_name
         if not produced.is_file():
             step.reason = f"finished but wrote no {step.output_name}"
-            LOGGER.error("%s %s", step.name, step.reason)
-            self._save_log(step, outcome)
+            self._say(step, step.reason)
             return step
 
         step.output_path = produced
         step.ok = True
         self._describe_output(step)
+        self._say(step, f"done in {human_seconds(step.seconds)}, "
+                        f"{step.rows:,} row(s)"
+                        + (f", model spend ${step.spend:,.2f}" if step.spend else ""))
         try:
             self._stamp_path(step).write_text(
                 json.dumps({"fingerprint": want,
@@ -820,21 +1016,113 @@ class AgentChain:
                          step.output_name, error)
         return step
 
-    def _save_log(self, step: AgentStep, outcome: subprocess.CompletedProcess) -> None:
-        """Keep a failed agent's output, because the reason is usually in it."""
-        log = self.settings.work_dir / f"{Path(step.script).stem}_failed.log"
+    # -- watching an agent work ---------------------------------------------
+
+    def _say(self, step: AgentStep, message: str) -> None:
+        """One line about an agent, tagged so parallel logs stay readable."""
+        with self._console:
+            print(f"  [{step.tag}] {message}", flush=True)
+
+    def _run_process(self, step: AgentStep,
+                     arguments: Sequence[str]) -> Tuple[Optional[int], List[str]]:
+        """Run one agent, showing its own logging as it happens.
+
+        The agent's output is forwarded line by line rather than captured and
+        thrown away. Two reasons. Agent 3 embeds the whole catalogue before it
+        matches anything, which is twenty minutes of silence on the client's
+        master, and a pipeline that prints nothing for twenty minutes gets killed
+        by whoever is watching it. And the agents report what they loaded - how
+        many catalogue items, how much the model cost - which is the information
+        needed to tell a run that found nothing from a run that read nothing.
+
+        Every line is also written to a log file, kept whether the agent
+        succeeded or not, so a run left overnight can still be read afterwards.
+        """
+        script = self.here / step.script
+        command = [sys.executable, str(script), *arguments]
+        step.log_path = self.settings.work_dir / f"{Path(step.script).stem}.log"
+
+        if step.input_path:
+            self._say(step, f"starting, reading {step.input_path.name}")
+        else:
+            self._say(step, "starting")
+
+        started = time.time()
+        tail: List[str] = []
+        last_output = [started]
+
         try:
-            log.write_text((outcome.stdout or "") + "\n" + (outcome.stderr or ""),
-                           encoding="utf-8")
-            LOGGER.error("  %s wrote its output to %s", step.name, log.name)
-        except OSError:
-            pass
+            process = subprocess.Popen(
+                command, cwd=str(self.here), text=True, bufsize=1,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                # Unbuffered child logging, or a Python process writing to a pipe
+                # holds its output until it exits and the live log is not live.
+                env={**os.environ, "PYTHONUNBUFFERED": "1"})
+        except OSError as error:
+            step.seconds = time.time() - started
+            return 1, [str(error)]
+
+        def pump() -> None:
+            assert process.stdout is not None
+            with step.log_path.open("w", encoding="utf-8") as log:
+                for line in process.stdout:
+                    text = line.rstrip("\n")
+                    last_output[0] = time.time()
+                    log.write(line)
+                    if text.strip():
+                        tail.append(text.strip())
+                        del tail[:-40]
+                    with self._console:
+                        print(f"  [{step.tag}] {text}", flush=True)
+
+        def heartbeat() -> None:
+            """Say the agent is alive while it is quiet."""
+            while process.poll() is None:
+                time.sleep(2)
+                quiet = time.time() - last_output[0]
+                if quiet >= HEARTBEAT_SECONDS and process.poll() is None:
+                    self._say(step, f"still working, {human_seconds(time.time() - started)} "
+                                    f"elapsed, quiet for {human_seconds(quiet)}")
+                    last_output[0] = time.time()
+
+        reader = threading.Thread(target=pump, name=f"{step.tag}-log", daemon=True)
+        pulse = threading.Thread(target=heartbeat, name=f"{step.tag}-pulse", daemon=True)
+        reader.start()
+        pulse.start()
+
+        try:
+            process.wait(timeout=self.settings.agent_timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            reader.join(timeout=5)
+            step.seconds = time.time() - started
+            return None, tail
+
+        reader.join(timeout=10)
+        step.seconds = time.time() - started
+        return process.returncode, tail
 
     def _describe_output(self, step: AgentStep) -> None:
         if not step.output_path:
             return
         step.columns = read_header(step.output_path)
         step.rows = count_rows(step.output_path)
+        step.usage = self._read_usage(step)
+
+    def _read_usage(self, step: AgentStep) -> Dict[str, Any]:
+        """What the agent's own manifest says the model cost it."""
+        if not step.output_path:
+            return {}
+        manifest = step.output_path.parent / f"{Path(step.script).stem}_run_manifest.json"
+        if not manifest.is_file():
+            return {}
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        usage = (payload.get("statistics") or {}).get("token_usage") or {}
+        return usage if isinstance(usage, dict) else {}
 
     # -- the chain -----------------------------------------------------------
 
@@ -846,14 +1134,16 @@ class AgentChain:
         lexicon_dir = self.here / "lexicon"
 
         agent1 = AgentStep("Agent 1 - purchase descriptions", "agent1.py",
-                           "agent1_unified_lines.csv", unstamped_reuse=True)
+                           "agent1_unified_lines.csv", tag="Agent 1",
+                           unstamped_reuse=True)
         self._invoke(agent1, [*common, "--input", str(input_path)], input_path)
         self.steps.append(agent1)
         if not agent1.ok or not agent1.output_path:
             return self.steps
 
         agent2 = AgentStep("Agent 2 - purchase groups", "agent2.py",
-                           "agent2_purchase_groups.csv", unstamped_reuse=True)
+                           "agent2_purchase_groups.csv", tag="Agent 2",
+                           unstamped_reuse=True)
         self._invoke(agent2,
                      [*common, "--input", str(agent1.output_path),
                       "--registry", str(lexicon_dir / "agent2_group_registry.json")],
@@ -862,25 +1152,44 @@ class AgentChain:
         if not agent2.ok or not agent2.output_path:
             return self.steps
 
+        # Agents 3 and 4 both read Agent 2's output and neither reads the other's,
+        # so they are run together. Agents 1 and 2 cannot join them: Agent 2 reads
+        # what Agent 1 writes, and Agent 3 and 4 read what Agent 2 writes, so the
+        # first half of the chain is a queue whatever anyone would prefer.
+        #
+        # This is also where the time is. Agent 3 embeds the client's whole
+        # catalogue before it matches a single line, so on the current master it
+        # runs for far longer than Agent 4, and overlapping them costs nothing and
+        # saves all of Agent 4.
         agent3 = AgentStep("Agent 3 - standard items", "agent3.py",
-                           "agent3_standardisation.csv", unstamped_reuse=True,
-                           cache_salt=self._catalogue_salt())
-        self._invoke(agent3,
-                     [*common, "--input", str(agent2.output_path),
-                      *self._catalogue_arguments()],
-                     agent2.output_path)
-        self.steps.append(agent3)
+                           "agent3_standardisation.csv", tag="Agent 3",
+                           unstamped_reuse=True, cache_salt=self._catalogue_salt())
+        agent3_arguments = [*common, "--input", str(agent2.output_path),
+                            *self._catalogue_arguments()]
 
-        # Agent 4 reads Agent 2's output, not Agent 3's: it groups suppliers by
-        # purchase group and has no use for the standardisation columns. Running
-        # it from Agent 2 also means a failure in Agent 3 costs only Agent 3.
         agent4 = AgentStep("Agent 4 - supplier consolidation", "agent4.py",
-                           AGENT4_CONSOLIDATION_NAME)
-        self._invoke(agent4,
-                     [*common, "--input", str(agent2.output_path),
-                      "--registry", str(lexicon_dir / "agent4_supplier_registry.json")],
-                     agent2.output_path)
-        self.steps.append(agent4)
+                           AGENT4_CONSOLIDATION_NAME, tag="Agent 4")
+        agent4_arguments = [*common, "--input", str(agent2.output_path),
+                            "--registry",
+                            str(lexicon_dir / "agent4_supplier_registry.json")]
+
+        pending = [(agent3, agent3_arguments), (agent4, agent4_arguments)]
+        if self.settings.parallel:
+            print(f"\n  Agents 3 and 4 run together from {agent2.output_path.name}. "
+                  f"Their logs are interleaved and tagged.\n", flush=True)
+            workers = [threading.Thread(target=self._invoke,
+                                        args=(step, arguments, agent2.output_path),
+                                        name=step.tag)
+                       for step, arguments in pending]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+        else:
+            for step, arguments in pending:
+                self._invoke(step, arguments, agent2.output_path)
+
+        self.steps.extend([agent3, agent4])
         return self.steps
 
     # -- what came out of it -------------------------------------------------
@@ -905,6 +1214,143 @@ class AgentChain:
             if step.script == "agent4.py":
                 return step
         return None
+
+    def step_for(self, script: str) -> Optional[AgentStep]:
+        for step in self.steps:
+            if step.script == script:
+                return step
+        return None
+
+    def catalogue_facts(self) -> Dict[str, Any]:
+        """What Agent 3 actually loaded, taken from its own manifest.
+
+        Asked and reported because a catalogue that failed to load does not look
+        like a failure from the outside. Agent 3 finishes, annotates every row and
+        says "no comparable standard item found" on each one, which is the same
+        output it produces when the catalogue is fine and the purchases genuinely
+        are not in it. The item count is what separates those two runs.
+        """
+        step = self.step_for("agent3.py")
+        if not step or not step.output_path:
+            return {}
+        manifest = step.output_path.parent / "agent3_run_manifest.json"
+        if not manifest.is_file():
+            return {}
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        statistics = payload.get("statistics") or {}
+        percentiles = statistics.get("score_percentiles") or {}
+        thresholds = (payload.get("configuration") or {}).get("thresholds") or {}
+        return {
+            "items": statistics.get("reference_items") or 0,
+            "rows_with_match": statistics.get("rows_with_match") or 0,
+            "rows_already_standard": statistics.get("rows_already_standard") or 0,
+            "adjudicated_by_model": statistics.get("matches_adjudicated") or 0,
+            "best_score": percentiles.get("max"),
+            "accept_threshold": thresholds.get("medium_accept"),
+            "sources": payload.get("catalogue_sources") or [],
+            "refused": payload.get("refused_files") or [],
+            "unreadable": payload.get("unreadable_files") or [],
+        }
+
+    def catalogue_warnings(self, facts: Dict[str, Any]) -> List[str]:
+        """Reasons to doubt that Agent 3 matched against the client's catalogue."""
+        notes: List[str] = []
+        if not facts:
+            return notes
+        items = facts.get("items") or 0
+        if not items:
+            notes.append(
+                "Agent 3 loaded no catalogue item at all, so every line was bound "
+                "to report no match. Point --catalogues at the client's item "
+                "catalogue file.")
+        elif items < CATALOGUE_ITEMS_EXPECTED:
+            notes.append(
+                f"Agent 3 loaded only {items:,} catalogue item(s). The client's "
+                f"master holds far more than that, so this is very likely an old "
+                f"or partial copy rather than the catalogue they sent.")
+        if facts.get("unreadable"):
+            notes.append(
+                f"Agent 3 could not read {len(facts['unreadable'])} catalogue "
+                f"file(s): {', '.join(str(entry) for entry in facts['unreadable'][:3])}. "
+                f"Missing openpyxl is the usual cause.")
+        if items and not facts.get("rows_with_match") and not facts.get("rows_already_standard"):
+            # Two very different runs end here, and saying only "no match" would
+            # report them identically. A catalogue that was read and whose best
+            # candidate fell just short of the acceptance threshold is a threshold
+            # question for the client; a best score nowhere near it means these
+            # purchases are genuinely not in the catalogue.
+            best = facts.get("best_score")
+            accept = facts.get("accept_threshold")
+            if isinstance(best, (int, float)) and isinstance(accept, (int, float)):
+                shortfall = accept - best
+                if 0 < shortfall <= 0.1:
+                    notes.append(
+                        f"Agent 3 read {items:,} catalogue item(s) and matched no "
+                        f"line, but only just: its best candidate scored "
+                        f"{best:.3f} against an acceptance threshold of {accept:.2f}. "
+                        f"These are near misses, not absences. "
+                        f"agent3_match_calibration.csv shows how many lines each "
+                        f"threshold would accept, and Fortum set the threshold.")
+                else:
+                    notes.append(
+                        f"Agent 3 read {items:,} catalogue item(s) and matched no "
+                        f"line. Its best candidate scored {best:.3f} against a "
+                        f"threshold of {accept:.2f}, so these purchases are not in "
+                        f"the catalogue rather than borderline.")
+            else:
+                notes.append(
+                    f"Agent 3 read {items:,} catalogue item(s) and still matched no "
+                    f"line. That is a real answer on a small extract of services "
+                    f"and charges, but worth a look before it is reported as one.")
+        return notes
+
+    def spend(self) -> Dict[str, Any]:
+        """What the language model cost, per agent and in total.
+
+        Two totals, because they answer different questions. The run total is what
+        this run spent; the recorded total includes agents whose output was reused,
+        which cost nothing today but did cost something when they were produced.
+        """
+        per_agent = []
+        this_run = 0.0
+        recorded = 0.0
+        requests = 0
+        cache_hits = 0
+        stopped: List[str] = []
+        for step in self.steps:
+            if not step.usage:
+                continue
+            amount = step.spend
+            recorded += amount
+            if not step.reused:
+                this_run += amount
+                requests += int(step.usage.get("requests") or 0)
+                cache_hits += int(step.usage.get("cache_hits") or 0)
+            if step.usage.get("spend_limit_stopped"):
+                stopped.append(step.tag or step.name)
+            per_agent.append({
+                "agent": step.tag or step.name,
+                "reused": step.reused,
+                "estimated_cost_usd": round(amount, 4),
+                "requests": step.usage.get("requests") or 0,
+                "input_tokens": step.usage.get("input_tokens") or 0,
+                "output_tokens": step.usage.get("output_tokens") or 0,
+                "cache_hits": step.usage.get("cache_hits") or 0,
+                "failed_requests": step.usage.get("failed_requests") or 0,
+                "spend_limit_usd": step.usage.get("spend_limit_usd") or 0,
+                "spend_limit_stopped": bool(step.usage.get("spend_limit_stopped")),
+            })
+        return {
+            "per_agent": per_agent,
+            "this_run_usd": round(this_run, 4),
+            "recorded_usd": round(recorded, 4),
+            "requests_this_run": requests,
+            "cache_hits_this_run": cache_hits,
+            "stopped_at_limit": stopped,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1511,6 +1957,8 @@ class Runner:
         self.placement: Optional[Placement] = None
         self.verification: Optional[Verification] = None
         self.consolidation: Optional[SupplierConsolidation] = None
+        self.catalogue: Dict[str, Any] = {}
+        self.spend: Dict[str, Any] = {}
 
     def run(self) -> int:
         started = time.time()
@@ -1528,7 +1976,20 @@ class Runner:
         input_header = self.input_header
 
         self.chain = AgentChain(self.settings)
+        print(f"\n  Model tier           : "
+              f"{'on' if self.settings.use_llm else 'off, local stack only'}"
+              + (f", alert at ${self.settings.llm_spend_limit:,.2f}"
+                 if self.settings.use_llm and self.settings.llm_spend_limit else ""))
+        print("  Running the agents. Their own logs follow, tagged by agent.\n",
+              flush=True)
         self.chain.run(self.input.path)
+
+        self.catalogue = self.chain.catalogue_facts()
+        for note in self.chain.catalogue_warnings(self.catalogue):
+            LOGGER.warning(note)
+            self.warnings.append(note)
+        self.warnings.extend(self.chain.catalogue.warnings)
+        self.spend = self.chain.spend()
 
         last = self.chain.last_line_output()
         if last is None or not last.output_path:
@@ -1704,6 +2165,14 @@ class Runner:
         if self.consolidation:
             statistics["agent4_supplier_scope_findings"] = self.consolidation.rows_available
             statistics["agent4_primary_scope"] = self.consolidation.primary_scope
+        if self.catalogue:
+            statistics["catalogue_items_loaded"] = self.catalogue.get("items", 0)
+            statistics["rows_matched_to_catalogue"] = self.catalogue.get("rows_with_match", 0)
+            statistics["rows_already_standard"] = self.catalogue.get(
+                "rows_already_standard", 0)
+        if self.spend:
+            statistics["model_spend_this_run_usd"] = self.spend["this_run_usd"]
+            statistics["model_requests_this_run"] = self.spend["requests_this_run"]
         return statistics
 
     def _write_manifest(self) -> None:
@@ -1730,9 +2199,12 @@ class Runner:
                     "rows": step.rows,
                     "columns": len(step.columns),
                     "seconds": round(step.seconds, 1),
+                    "log": step.log_path.name if step.log_path else "",
                 }
                 for step in self.chain.steps
             ],
+            "catalogue": {**self.chain.catalogue.describe(), **self.catalogue},
+            "model_spend": self.spend,
             "columns_by_agent": {name: columns
                                  for name, columns in sorted(self.plan.by_agent.items())},
             "columns_renamed_to_protect_the_input": dict(sorted(self.plan.renamed.items())),
@@ -1783,10 +2255,59 @@ def print_summary(runner: Runner, settings: Settings) -> None:
     for step in runner.chain.steps if runner.chain else []:
         mark = {"reused": "reused", "ran": "ran   ", "failed": "FAILED"}[step.status]
         detail = f"{step.rows:,} row(s)" if step.ok else step.reason
-        timing = f"  {step.seconds:.0f}s" if step.seconds >= 1 else ""
+        timing = f"  {human_seconds(step.seconds)}" if step.seconds >= 1 else ""
         print(f"    {mark}  {step.name:<38} {detail}{timing}")
         if step.reused:
             print(f"            {step.reason}")
+
+    catalogue = runner.catalogue
+    if runner.chain and runner.chain.catalogue.arguments:
+        print("\n  Catalogue Agent 3 matched against")
+        print(f"    {runner.chain.catalogue.origin}")
+        for entry in catalogue.get("sources") or []:
+            print(f"    {entry.get('file', '')}: {entry.get('items', 0):,} item(s), "
+                  f"modified {entry.get('modified') or 'unknown'}, "
+                  f"sha256 {entry.get('sha256') or 'unknown'}")
+        if catalogue:
+            print(f"    {catalogue.get('rows_with_match', 0):,} line(s) matched a "
+                  f"catalogue item, {catalogue.get('rows_already_standard', 0):,} were "
+                  f"already standard purchases")
+            best, accept = catalogue.get("best_score"), catalogue.get("accept_threshold")
+            if isinstance(best, (int, float)) and isinstance(accept, (int, float)):
+                print(f"    best candidate scored {best:.3f}, acceptance threshold "
+                      f"{accept:.2f}")
+            if catalogue.get("adjudicated_by_model"):
+                print(f"    {catalogue['adjudicated_by_model']:,} borderline match(es) "
+                      f"put to the model")
+        for entry in runner.chain.catalogue.alternatives:
+            print(f"    not used: {entry.get('file')} in the {entry.get('location')}, "
+                  f"{entry.get('bytes', 0):,} bytes")
+
+    spend = runner.spend or {}
+    if spend.get("per_agent"):
+        print("\n  Language model")
+        for entry in spend["per_agent"]:
+            note = " (reused, spent on an earlier run)" if entry["reused"] else ""
+            print(f"    {entry['agent']:<10} ${entry['estimated_cost_usd']:>8,.2f}  "
+                  f"{entry['requests']:,} request(s), "
+                  f"{entry['input_tokens']:,} in / {entry['output_tokens']:,} out"
+                  f"{note}")
+        print(f"    {'this run':<10} ${spend['this_run_usd']:>8,.2f}  "
+              f"{spend['requests_this_run']:,} request(s), "
+              f"{spend['cache_hits_this_run']:,} answer(s) served from cache")
+        if spend["recorded_usd"] > spend["this_run_usd"]:
+            print(f"    {'recorded':<10} ${spend['recorded_usd']:>8,.2f}  including "
+                  f"the reused agents' earlier spend")
+        if spend["stopped_at_limit"]:
+            print(f"    {', '.join(spend['stopped_at_limit'])} stopped calling the "
+                  f"model at the spend limit and finished on the local stack.")
+        print("    Estimated from the published rates, an upper bound rather than "
+              "an invoice.")
+    elif settings.use_llm:
+        print("\n  Language model       : switched on, but no agent reported any "
+              "spend.")
+        print("    Either every answer came from the response cache, or the calls "
+              "failed. The agent logs in the working folder say which.")
 
     print("\n  Coverage")
     annotated = statistics["rows_annotated_agents_1_to_3"]
@@ -1864,8 +2385,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="folder holding the source extracts, used only when "
                            "there is no table to reuse")
     paths.add_argument("--results", metavar="DIR", help="folder to write results into")
-    paths.add_argument("--catalogues", metavar="DIR",
-                      help="folder holding the client's item catalogues, for Agent 3")
+    paths.add_argument("--catalogues", metavar="PATH",
+                      help="the client's item catalogue for Agent 3, a file or a "
+                           "folder (default: the catalogue master in the source folder)")
     paths.add_argument("--lexicon", metavar="FILE", help="controlled vocabulary JSON file")
     paths.add_argument("--cache", metavar="DIR", help="folder for the model response cache")
 
@@ -1881,12 +2403,21 @@ def build_parser() -> argparse.ArgumentParser:
     output.add_argument("--no-jsonl", action="store_true", help="skip the JSONL export")
 
     tiers = parser.add_argument_group("model")
+    tiers.add_argument("--no-llm", action="store_true",
+                       help="run the agents on their local stack only; they still "
+                            "produce every column, with less resolved in it")
     tiers.add_argument("--use-llm", action="store_true",
-                       help="allow the agents to call the language model")
+                       help="allow the agents to call the language model (the default)")
     tiers.add_argument("--llm-spend-limit", metavar="USD", type=float, default=None,
                        help="alert each agent when its estimated spend reaches this")
     tiers.add_argument("--agent-timeout", metavar="SECONDS", type=int, default=None,
-                       help="give up on an agent that runs longer than this")
+                       help="give up on an agent that runs longer than this; Agent 3 "
+                            "needs half an hour on the client's full catalogue")
+
+    speed = parser.add_argument_group("scheduling")
+    speed.add_argument("--no-parallel", action="store_true",
+                       help="run Agents 3 and 4 one after the other rather than "
+                            "together, for a log that reads in order")
 
     parser.add_argument("--non-interactive", action="store_true",
                         help="take every default without prompting")
@@ -1937,7 +2468,10 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
             spend_limit = None
 
     reuse = not args.no_reuse
-    use_llm = args.use_llm
+
+    # On unless declined. --use-llm is kept so that the command lines already in
+    # use keep working, and because saying it out loud is harmless.
+    use_llm = not args.no_llm
 
     if not args.non_interactive:
         print(BANNER)
@@ -1968,6 +2502,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         llm_spend_limit=spend_limit,
         agent_timeout=args.agent_timeout,
         write_jsonl=not args.no_jsonl,
+        parallel=not args.no_parallel,
     )
 
 
