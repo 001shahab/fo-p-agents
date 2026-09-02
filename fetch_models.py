@@ -313,6 +313,86 @@ _CERTIFICATE_STEPS: Dict[str, Tuple[str, ...]] = {
 }
 
 
+def _clean_path_input(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return value.replace("\\ ", " ").strip()
+
+
+def ask(question: str, default: str) -> str:
+    try:
+        answer = input(f"{question}\n  [{default}]: ").strip()
+    except EOFError:
+        return default
+    return _clean_path_input(answer) or default
+
+
+def ask_yes_no(question: str, default: bool) -> bool:
+    hint = "Y/n" if default else "y/N"
+    try:
+        answer = input(f"{question} [{hint}]: ").strip().lower()
+    except EOFError:
+        return default
+    return default if not answer else answer[0] == "y"
+
+
+def interactive_wanted(args: argparse.Namespace) -> bool:
+    """Whether to ask before fetching.
+
+    Skipped when told to, when nothing is attached to read the answers, and when
+    the choices were already made on the command line - a run that named its
+    languages does not want to be asked which languages.
+    """
+    if args.non_interactive or args.check:
+        return False
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    return not (args.languages or args.all_languages or args.results
+                or args.no_translators or args.no_embedder)
+
+
+def confirm_choices(args: argparse.Namespace) -> None:
+    """Confirm the two things this script actually chooses, and say what it is not.
+
+    Worth stating plainly that no purchase data is involved. The name invites the
+    assumption that it fetches something from the extracts and adds columns to
+    them, and someone reasonably expected exactly that: the question people ask
+    here is "which folder does it read?", to which the answer is none.
+    """
+    print()
+    print("  This downloads the models the agents run on. It reads no purchase")
+    print("  data and writes no column: to widen a purchase table, run")
+    print("  all_agents.py. The folder below is where the models are written.")
+    print()
+
+    default_languages = " ".join(FORTUM_LANGUAGES)
+    while True:
+        answer = ask("Which languages should be translatable without the paid "
+                     f"model? ({' '.join(SUPPORTED_LANGUAGES)}, or 'all')",
+                     default_languages)
+        if answer.strip().lower() == "all":
+            args.all_languages = True
+            break
+        codes = [code for code in answer.replace(",", " ").split() if code]
+        unknown = [code for code in codes if code not in SUPPORTED_LANGUAGES]
+        if unknown:
+            print(f"  Not supported: {', '.join(unknown)}. "
+                  f"Choose from {', '.join(SUPPORTED_LANGUAGES)}.")
+            continue
+        args.languages = codes or list(FORTUM_LANGUAGES)
+        break
+
+    args.results = Path(ask("Which folder should the models be written to?",
+                            str(cache_root(None))))
+
+    if ask_yes_no("Also write one archive, to carry to a machine that cannot "
+                  "reach the hub?", False):
+        args.bundle = Path(ask("Where should the archive be written?",
+                               "models.tar.gz"))
+    print()
+
+
 def is_certificate_failure(record: Dict[str, object]) -> bool:
     """Whether a failure was TLS verification rather than anything else."""
     if record.get("status") != "failed":
@@ -320,6 +400,52 @@ def is_certificate_failure(record: Dict[str, object]) -> bool:
     reason = str(record.get("reason") or "").lower()
     return any(mark in reason for mark in
                ("certificate", "ssl", "self-signed", "self signed"))
+
+
+def is_blocked_failure(record: Dict[str, object]) -> bool:
+    """Whether the hub answered, but refused to serve.
+
+    Distinguished from a certificate failure because the remedy is the opposite.
+    A proxy that permits the connection and then denies the host answers with a
+    status rather than a handshake error, and it answers in milliseconds. No
+    certificate configuration changes that, so advising it wastes the reader's
+    afternoon: the only way past is to carry the models in.
+    """
+    if record.get("status") != "failed":
+        return False
+    reason = str(record.get("reason") or "").lower()
+    return any(mark in reason for mark in
+               ("503", "502", "504", "403", "service unavailable",
+                "forbidden", "bad gateway", "gateway timeout"))
+
+
+def report_blocked_advice() -> None:
+    """Say what to do when the hub answers and refuses."""
+    print()
+    print("  The hub answered and refused. TLS worked, so this is not a")
+    print("  certificate problem: something between here and huggingface.co is")
+    print("  declining to serve it, which on a corporate network is usually")
+    print("  policy rather than a fault.")
+    print()
+    print("  Check which it is. If this returns a normal page, the hub is up and")
+    print("  the refusal is local to this machine:")
+    print()
+    print("    curl -sI https://huggingface.co/api/models/"
+          "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+    print()
+    print("  If the hub is up and this machine still cannot reach it, no setting")
+    print("  here will help. Fetch on a machine that can and carry the archive:")
+    print()
+    print("    # where the hub is reachable")
+    print("    python fetch_models.py --bundle models.tar.gz")
+    print()
+    print("    # here, once the archive has been copied across")
+    print("    mkdir -p ~/.cache/huggingface")
+    print("    tar -xzf models.tar.gz -C ~/.cache/huggingface")
+    print("    export HF_HUB_OFFLINE=1")
+    print("    python fetch_models.py --check")
+    print()
+    print("  The models are not in the repository, so git will not bring them.")
 
 
 def report_certificate_advice() -> None:
@@ -409,6 +535,10 @@ def build_parser() -> argparse.ArgumentParser:
     how.add_argument("--check", action="store_true",
                      help="report what is present and missing, fetch nothing; "
                           "exits non-zero if anything is missing")
+    how.add_argument("--non-interactive", action="store_true",
+                     help="take the defaults instead of asking; implied when "
+                          "any of the options above is given, when --check is "
+                          "used, or when there is no terminal to ask at")
     how.add_argument("--verbose", action="store_true", help="debug-level logging")
     how.add_argument("--version", action="version",
                      version=f"{AGENT_NAME} {AGENT_VERSION}")
@@ -443,6 +573,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOGGER.error("Install these first: %s", ", ".join(missing_packages))
         LOGGER.error("  pip install -r requirements.txt")
         return 1
+
+    if interactive_wanted(args):
+        confirm_choices(args)
 
     root = cache_root(args.results)
     # Exported rather than merely computed, so the libraries write where this
@@ -480,13 +613,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     results: List[Dict[str, object]] = []
     for name, loader in repositories:
         results.append(fetch(name, root, loader, args.check))
-        if is_certificate_failure(results[-1]):
-            # No point working through the remaining six. The hub library retries
-            # five times per file before giving up, so carrying on means many
-            # minutes of identical failures before anyone is told the cause -
-            # which is exactly how this was first met.
-            LOGGER.error("Stopping: this is a certificate problem, and it will "
-                         "affect every remaining model the same way.")
+        # No point working through the remaining six when the cause is the
+        # network rather than the model. The hub library retries five times per
+        # file before giving up, so carrying on means many minutes of identical
+        # failures before anyone is told the cause - which is how both of these
+        # were first met.
+        stop = ("a certificate problem" if is_certificate_failure(results[-1])
+                else "the hub refusing to serve" if is_blocked_failure(results[-1])
+                else None)
+        if stop:
+            LOGGER.error("Stopping: this is %s, and it will affect every "
+                         "remaining model the same way.", stop)
             for remaining, _ in repositories[len(results):]:
                 results.append({"repository": remaining, "status": "missing",
                                 "bytes": 0, "seconds": 0.0})
@@ -536,7 +673,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOGGER.error("%d model(s) could not be fetched. The agents would send the "
                      "text these handle to the language model instead, which is "
                      "slower and not free.", len(failed))
-        report_certificate_advice()
+        # Advice chosen from what actually failed. Printing the certificate steps
+        # for a refusal sends the reader after the wrong thing entirely.
+        if any(is_certificate_failure(record) for record in failed):
+            report_certificate_advice()
+        elif any(is_blocked_failure(record) for record in failed):
+            report_blocked_advice()
+        else:
+            report_certificate_advice()
         return 1
 
     if absent:

@@ -238,6 +238,24 @@ not where data is. The script that adds columns to a purchase table is
 [`all_agents.py`](#running-all-four-in-one-command), and it writes a new wide file
 rather than modifying the extract it read.
 
+Run on a terminal with no options it says so and confirms the two things it does
+choose:
+
+```
+  This downloads the models the agents run on. It reads no purchase
+  data and writes no column: to widen a purchase table, run
+  all_agents.py. The folder below is where the models are written.
+
+Which languages should be translatable without the paid model? (fi sv pl de da no nl et fr es it cs, or 'all')
+  [fi sv et no de pl]:
+Which folder should the models be written to?
+  [/Users/you/.cache/huggingface]:
+Also write one archive, to carry to a machine that cannot reach the hub? [y/N]:
+```
+
+It does not ask when any option is given, when `--check` is used, or when there is
+no terminal to ask at; `--non-interactive` forces the defaults.
+
 **A machine that cannot reach `huggingface.co` does not fail. It gets expensive.**
 A translator that will not load is treated as an absent optional component, so
 the run continues and every foreign phrase goes to the language model instead —
@@ -345,6 +363,25 @@ Get-Content $certifi, $env:USERPROFILE\roots.pem |
 $env:REQUESTS_CA_BUNDLE = "$env:USERPROFILE\ca-bundle.pem"
 $env:SSL_CERT_FILE = "$env:USERPROFILE\ca-bundle.pem"
 ```
+
+### `503 Service Unavailable` from the hub
+
+Not a certificate problem, and worth separating from one because the remedy is
+the opposite. A 503 means TLS succeeded and something answered — usually the
+proxy itself, declining the host as a matter of policy. The giveaway is speed: a
+refusal comes back in milliseconds, where a struggling server would take
+seconds. No certificate configuration changes it.
+
+Tell an outage apart from a local refusal by asking from somewhere else:
+
+```bash
+curl -sI https://huggingface.co/api/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+```
+
+A `200` there while the run gets 503 means the hub is fine and the block is local
+to that machine, so carry the models in instead. `fetch_models.py` recognises
+this case, stops at the first refusal rather than retrying five times for each of
+seven models, and prints these steps rather than the certificate ones.
 
 ### When the network blocks the hub outright
 
