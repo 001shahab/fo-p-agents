@@ -1001,6 +1001,32 @@ nought as a finding. Where the accept threshold should sit is a decision for
 Fortum to take against the calibration file on a full extract, not from a
 twenty-five row sample.
 
+### Translating the catalogue, once
+
+About three hundred thousand catalogue items are described in Finnish, Swedish,
+German or Polish, and each has to be in English before it can be compared with
+anything. That is roughly an hour of local translation, and it used to be an hour
+on every run, producing the same strings from the same catalogue.
+
+Those translations are now kept in `cache/agent3_translation_cache.json` and
+reused, so a second run over an unchanged catalogue skips the hour and does not
+even load the translation models. A catalogue that gains items pays only for the
+items it gained. The cache is keyed by model and source text rather than by
+catalogue, so two catalogues sharing an item share its translation, and it is
+written as soon as translation finishes rather than at the end of the run — the
+embedding pass comes next and is also long, and an interrupt between the two
+would otherwise throw the hour away.
+
+Beam search is fixed and sampling is off, so a remembered translation is the one
+the model would produce again. `--no-translation-cache` renders from scratch,
+which is worth doing only to prove that.
+
+One consequence worth knowing: Agent 3 got slower before it got faster. When the
+translator would not load, this stage was skipped in silence and the run took
+about twenty minutes, comparing Finnish catalogue text against English purchase
+text and scoring nonsense. A first run now takes about an hour and twenty
+minutes, and every run after it is back to about twenty.
+
 Read that 0.630 as a property of one run rather than of the data. Scores depend
 on what text was compared, and therefore on whether the translation tier was
 working: the same sample against the same master scored 0.703 and accepted three
@@ -1707,7 +1733,8 @@ sources/                               client data, including the item catalogue
 catalogues/                            an alternative place to keep catalogues for Agent 3
 results/                               generated output
 results/all_agents/                    each agent's own output and log from a runner
-cache/                                 language-model response cache
+cache/                                 language-model responses, and Agent 3's
+                                       catalogue translations
 lexicon/agent2_group_registry.json     stable group labels
 lexicon/agent4_supplier_registry.json  stable supplier keys and merge overrides
 results/.run_journal.json              how far an interrupted all_agents.py run got

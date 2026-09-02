@@ -102,7 +102,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent3")
 
 AGENT_NAME = "Agent 3 - AI Material and Service Standardisation"
-AGENT_VERSION = "1.5.1"
+AGENT_VERSION = "1.6.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -200,6 +200,10 @@ class Settings:
 
     use_embeddings: bool = True
     use_neural_translation: bool = True
+    # Translations of catalogue text are kept between runs. Worth turning off
+    # only to prove a rendering from scratch, since it is what keeps a re-run
+    # over an unchanged catalogue from repeating an hour of translation.
+    use_translation_cache: bool = True
     use_llm: bool = False
 
     # Match thresholds. The development plan leaves these to be defined and
@@ -568,6 +572,102 @@ class Lexicon:
         return _WHITESPACE.sub(" ", " ".join(rendered)).strip(), coverage
 
 
+class TranslationCache:
+    """Remembers offline translations, so a catalogue is rendered once.
+
+    The catalogue is the reason this exists. Roughly three hundred thousand of
+    its items are described in Finnish, Swedish, German or Polish, and every one
+    has to be in English before it can be compared with anything: the type gate
+    and the lexical view are meaningless across languages. That is about an hour
+    of translation, and without somewhere to keep the result it was an hour on
+    every run, spent producing exactly the same strings from exactly the same
+    catalogue.
+
+    Entries are keyed by model and source text rather than by catalogue, so a
+    catalogue that gains items only pays for the items it gained, and two
+    catalogues sharing an item share its translation. Beam search is fixed and
+    sampling is off, so a cached translation is the one this model would produce
+    again.
+    """
+
+    NAME = "agent3_translation_cache.json"
+
+    def __init__(self, path: Path, enabled: bool = True) -> None:
+        self.path = path
+        self.enabled = enabled
+        self.hits = 0
+        self._entries: Dict[str, Dict[str, str]] = {}
+        self._dirty = False
+        if enabled:
+            self._load()
+
+    def _load(self) -> None:
+        if not self.path.is_file():
+            return
+        try:
+            stored = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, MemoryError):
+            # A cache is an optimisation. A damaged one is rebuilt, not fatal.
+            LOGGER.warning("Translation cache %s could not be read; starting a new one.",
+                           self.path.name)
+            return
+        entries = stored.get("models")
+        if isinstance(entries, dict):
+            self._entries = {model: dict(texts) for model, texts in entries.items()
+                             if isinstance(texts, dict)}
+            LOGGER.info("Translation cache loaded with %d entry(s).", len(self))
+
+    def __len__(self) -> int:
+        return sum(len(texts) for texts in self._entries.values())
+
+    def __bool__(self) -> bool:
+        """Always true, because __len__ would otherwise decide it.
+
+        Without this, an empty cache is falsy, and `if self.cache` in the
+        translator silently means "if the cache already has something in it".
+        A cold cache would then never be written to and never fill.
+        """
+        return True
+
+    def holds(self, model_name: str) -> bool:
+        """Whether anything is remembered for one model."""
+        return bool(self.enabled and self._entries.get(model_name))
+
+    def get(self, model_name: str, text: str) -> Optional[str]:
+        if not self.enabled:
+            return None
+        found = self._entries.get(model_name, {}).get(text)
+        if found is not None:
+            self.hits += 1
+        return found
+
+    def put(self, model_name: str, text: str, translated: str) -> None:
+        if not self.enabled:
+            return
+        self._entries.setdefault(model_name, {})[text] = translated
+        self._dirty = True
+
+    def save(self) -> None:
+        """Write the cache, and treat failure as unimportant.
+
+        Not indented and not sorted, unlike the model cache beside it. At three
+        hundred thousand entries the pretty form costs both size and the seconds
+        it takes to produce, and nothing reads this by eye.
+        """
+        if not self.enabled or not self._dirty:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(
+                {"agent": AGENT_NAME, "models": self._entries}, ensure_ascii=False),
+                encoding="utf-8")
+        except OSError as error:
+            LOGGER.warning("Could not write the translation cache (%s).", error)
+            return
+        self._dirty = False
+        LOGGER.info("Translation cache saved with %d entry(s).", len(self))
+
+
 class NeuralTranslator:
     """Local Helsinki-NLP opus-mt translation for reference item text.
 
@@ -588,14 +688,31 @@ class NeuralTranslator:
     # output exactly.
     GENERATION = {"max_length": 256, "num_beams": 4, "do_sample": False}
 
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(self, enabled: bool = True,
+                 cache: Optional["TranslationCache"] = None) -> None:
         self.enabled = enabled and _transformers is not None
+        self.cache = cache
         self._translators: Dict[str, Any] = {}
         self._unavailable: Set[str] = set()
         self.translated_count = 0
+        self.cached_count = 0
 
     def available_for(self, language: str) -> bool:
         return self.enabled and language in self.SUPPORTED and language not in self._unavailable
+
+    def model_name(self, language: str) -> str:
+        """The repository serving one language, which is the cache's key too."""
+        return self.MODEL_OVERRIDES.get(
+            language, self.MODEL_TEMPLATE.format(source=language))
+
+    def has_cached(self, language: str) -> bool:
+        """Whether the cache holds anything for a language.
+
+        Asked so that a language whose model will not load is still served from
+        the cache instead of skipped: the translations are already correct and
+        the reason for keeping them was to avoid needing the model again.
+        """
+        return self.cache is not None and self.cache.holds(self.model_name(language))
 
     def _build(self, model_name: str) -> Any:
         """Load one bilingual model, returning a callable that translates a list.
@@ -625,8 +742,7 @@ class NeuralTranslator:
             return self._translators[language]
         if not self.available_for(language):
             return None
-        model_name = self.MODEL_OVERRIDES.get(
-            language, self.MODEL_TEMPLATE.format(source=language))
+        model_name = self.model_name(language)
         try:
             LOGGER.info("Loading offline translation model %s ...", model_name)
             translator = self._build(model_name)
@@ -639,13 +755,36 @@ class NeuralTranslator:
         return translator
 
     def translate_batch(self, texts: Sequence[str], language: str) -> Dict[str, str]:
-        """Translate a batch into English, keyed by the input text."""
-        translator = self._translator(language)
-        if translator is None or not texts:
+        """Translate a batch into English, keyed by the input text.
+
+        Anything already in the cache is answered from it and never reaches the
+        model, which is what turns a re-run over an unchanged catalogue from an
+        hour into seconds. The model is not even loaded if the cache covers
+        everything, so the same is true of a language whose work is all done.
+        """
+        if not texts:
             return {}
+
+        name = self.model_name(language)
         results: Dict[str, str] = {}
-        for start in range(0, len(texts), self.WINDOW):
-            window = list(texts[start:start + self.WINDOW])
+        outstanding: List[str] = []
+        for text in texts:
+            remembered = self.cache.get(name, text) if self.cache is not None else None
+            if remembered:
+                results[text] = remembered
+                self.cached_count += 1
+            else:
+                outstanding.append(text)
+
+        if not outstanding:
+            return results
+
+        translator = self._translator(language)
+        if translator is None:
+            return results  # whatever the cache held is still worth returning
+
+        for start in range(0, len(outstanding), self.WINDOW):
+            window = outstanding[start:start + self.WINDOW]
             try:
                 produced = translator(window)
             except Exception as error:
@@ -656,6 +795,8 @@ class NeuralTranslator:
                 if translated:
                     results[source_text] = translated
                     self.translated_count += 1
+                    if self.cache is not None:
+                        self.cache.put(name, source_text, translated)
         return results
 
 
@@ -1675,6 +1816,12 @@ class ReferenceLibrary:
                     self.skipped_files.append(path.name)
 
         self._render_english()
+        # Banked here rather than only at the end of the run. Rendering the
+        # catalogue is the longest thing this agent does, embedding is the second
+        # longest and comes next, and a run interrupted between the two would
+        # otherwise throw the translations away and do them again.
+        if self.translator.cache is not None:
+            self.translator.cache.save()
         self._index()
         LOGGER.info("Catalogue holds %d item(s) from %d file(s); "
                     "%d file(s) refused, %d unreadable.",
@@ -1792,12 +1939,18 @@ class ReferenceLibrary:
         if self.translator.enabled:
             for language in sorted(pending):
                 items = pending[language]
-                if not self.translator.available_for(language):
+                if not (self.translator.available_for(language)
+                        or self.translator.has_cached(language)):
                     continue
                 texts = sorted({item.description for item in items})
                 LOGGER.info("Translating %d reference description(s) from %s.",
                             len(texts), language)
+                before = self.translator.cached_count
                 translations = self.translator.translate_batch(texts, language)
+                remembered = self.translator.cached_count - before
+                if remembered:
+                    LOGGER.info("  %d of them came from the cache, %d were translated.",
+                                remembered, len(texts) - remembered)
                 for item in items:
                     translated = translations.get(item.description)
                     if translated:
@@ -2206,7 +2359,11 @@ class Agent3:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.lexicon = Lexicon.load(settings.lexicon_path)
-        self.translator = NeuralTranslator(enabled=settings.use_neural_translation)
+        self.translation_cache = TranslationCache(
+            settings.cache_dir / TranslationCache.NAME,
+            enabled=settings.use_translation_cache)
+        self.translator = NeuralTranslator(enabled=settings.use_neural_translation,
+                                           cache=self.translation_cache)
         self.reader = SpecificationReader()
         self.types = TypeAnalyser(self.lexicon)
         self.library = ReferenceLibrary(self.lexicon, self.translator, self.reader)
@@ -2590,6 +2747,7 @@ class Agent3:
 
         if self.model is not None:
             self.model.save_cache()
+        self.translation_cache.save()
 
         statistics = dict(self.statistics)
         statistics.update({
@@ -2821,6 +2979,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="disable multilingual sentence embeddings")
     tiers.add_argument("--no-neural", action="store_true",
                        help="disable offline translation of reference descriptions")
+    tiers.add_argument("--no-translation-cache", action="store_true",
+                       help="translate the catalogue from scratch rather than "
+                            "reusing translations kept from earlier runs")
     tiers.add_argument("--use-llm", action="store_true",
                        help="let the language model adjudicate borderline matches")
     tiers.add_argument("--llm-spend-limit", metavar="USD", type=float, default=None,
@@ -2967,6 +3128,7 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         cache_dir=default_cache.expanduser().resolve(),
         use_embeddings=use_embeddings,
         use_neural_translation=use_neural,
+        use_translation_cache=not args.no_translation_cache,
         use_llm=use_llm,
         high_threshold=args.high_threshold,
         medium_threshold=args.medium_threshold,
