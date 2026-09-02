@@ -79,6 +79,7 @@ import logging
 import os
 import re
 import sys
+import time
 import unicodedata
 import zipfile
 from collections import Counter, defaultdict
@@ -96,7 +97,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.7.0"
+AGENT_VERSION = "1.8.0"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -132,6 +133,7 @@ _spacy = _import_optional("spacy")
 _nltk = _import_optional("nltk")
 _sentence_transformers = _import_optional("sentence_transformers")
 _transformers = _import_optional("transformers")
+_torch = _import_optional("torch")
 _sklearn_neighbors = _import_optional("sklearn.neighbors")
 
 
@@ -149,6 +151,17 @@ def describe_environment() -> Dict[str, bool]:
         "langdetect": _langdetect is not None,
         "requests": _requests is not None,
     }
+
+
+def human_seconds(seconds: float) -> str:
+    """A duration in the units a reader thinks in."""
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    minutes, rest = divmod(int(seconds), 60)
+    if minutes < 90:
+        return f"{minutes}m {rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
 
 
 # ===========================================================================
@@ -263,6 +276,11 @@ OUTPUT_COST_PER_MTOK = 10.00
 
 # Default alert threshold offered at the prompt, in dollars.
 DEFAULT_SPEND_LIMIT = 25.00
+
+# How often a long model pass says where it has got to. A residue of a few
+# hundred thousand phrases is many hours of round trips, and a log that says
+# nothing for that long is indistinguishable from a hung process.
+MODEL_PROGRESS_SECONDS = 60
 
 
 @dataclass
@@ -2180,37 +2198,71 @@ class NeuralTranslator:
     # Languages served by a dedicated bilingual model. Others fall through to
     # the multilingual model or, failing that, to the language-model tier.
     SUPPORTED = ("fi", "sv", "pl", "de", "da", "no", "nl", "et", "fr", "es", "it", "cs")
+    # Phrases per forward pass, sized for CPU memory rather than for speed.
+    WINDOW = 32
+    # Beam search with a fixed beam count and no sampling, so the same input
+    # always produces the same output. This is a hard requirement, not a
+    # preference: the whole agent is specified to be repeatable.
+    GENERATION = {"max_length": 256, "num_beams": 4, "do_sample": False}
 
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = enabled and _transformers is not None
-        self._pipelines: Dict[str, Any] = {}
+        self._translators: Dict[str, Any] = {}
         self._unavailable: Set[str] = set()
         self.translated_count = 0
 
     def available_for(self, language: str) -> bool:
         return self.enabled and language in self.SUPPORTED and language not in self._unavailable
 
-    def _pipeline(self, language: str) -> Optional[Any]:
-        """Fetch or build the pipeline for one source language."""
-        if language in self._pipelines:
-            return self._pipelines[language]
+    @property
+    def unavailable(self) -> Tuple[str, ...]:
+        """Languages whose model would not load, for the caller to report."""
+        return tuple(sorted(self._unavailable))
+
+    def _build(self, model_name: str) -> Any:
+        """Load one bilingual model, returning a callable that translates a list.
+
+        The model is driven directly rather than through
+        pipeline("translation"), because transformers 5 removed that task name
+        while keeping Marian itself. Loading the model works on both 4.x and
+        5.x, so upgrading transformers cannot quietly disable this tier and
+        push every foreign phrase to the paid one.
+        """
+        tokeniser = _transformers.AutoTokenizer.from_pretrained(model_name)
+        model = _transformers.AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        model.eval()  # CPU throughout, which keeps this portable
+
+        def translate(texts: Sequence[str]) -> List[str]:
+            encoded = tokeniser(list(texts), return_tensors="pt", padding=True,
+                                truncation=True, max_length=256)
+            if _torch is not None:
+                with _torch.no_grad():
+                    produced = model.generate(**encoded, **self.GENERATION)
+            else:
+                produced = model.generate(**encoded, **self.GENERATION)
+            return tokeniser.batch_decode(produced, skip_special_tokens=True)
+
+        return translate
+
+    def _translator(self, language: str) -> Optional[Any]:
+        """Fetch or build the translator for one source language."""
+        if language in self._translators:
+            return self._translators[language]
         if not self.available_for(language):
             return None
 
         model_name = self.MODEL_TEMPLATE.format(source=language)
         try:
             LOGGER.info("Loading offline translation model %s ...", model_name)
-            pipeline = _transformers.pipeline(
-                "translation", model=model_name, device=-1,  # CPU keeps this portable
-            )
+            translator = self._build(model_name)
         except Exception as error:
             LOGGER.warning("Translation model %s unavailable (%s).", model_name, error)
             self._unavailable.add(language)
-            self._pipelines[language] = None
+            self._translators[language] = None
             return None
 
-        self._pipelines[language] = pipeline
-        return pipeline
+        self._translators[language] = translator
+        return translator
 
     def translate_batch(self, texts: Sequence[str], language: str) -> Dict[str, str]:
         """Translate a batch of phrases from one language into English.
@@ -2218,23 +2270,20 @@ class NeuralTranslator:
         Returns a mapping keyed by the input text so that callers do not have to
         rely on positional alignment, which a failed item would break.
         """
-        pipeline = self._pipeline(language)
-        if pipeline is None or not texts:
+        translator = self._translator(language)
+        if translator is None or not texts:
             return {}
 
         results: Dict[str, str] = {}
-        # Beam search with a fixed beam count and no sampling, so the same input
-        # always produces the same output. This is a hard requirement, not a
-        # preference: the whole agent is specified to be repeatable.
-        for start in range(0, len(texts), 32):
-            window = list(texts[start:start + 32])
+        for start in range(0, len(texts), self.WINDOW):
+            window = list(texts[start:start + self.WINDOW])
             try:
-                outputs = pipeline(window, max_length=256, num_beams=4, do_sample=False)
+                produced = translator(window)
             except Exception as error:
                 LOGGER.warning("Offline translation failed for a batch (%s).", error)
                 continue
-            for source_text, output in zip(window, outputs):
-                translated = normalise_text(output.get("translation_text", ""))
+            for source_text, output in zip(window, produced):
+                translated = normalise_text(output)
                 if translated:
                     results[source_text] = translated
                     self.translated_count += 1
@@ -2690,6 +2739,9 @@ class TranslationEngine:
         self.model = model
         self.results: Dict[str, TranslationResult] = {}
         self.method_counts: Counter = Counter()
+        # The model tier runs more than once, but the warning about the local
+        # translator being absent is about the run, not about a single pass.
+        self._translator_warned = False
 
     # -- tier 1 and 2: vocabulary -------------------------------------------
 
@@ -2849,6 +2901,33 @@ class TranslationEngine:
                 if not has_non_english(english):
                     pending.pop(phrase, None)
 
+    def _warn_if_translator_missing(self, outstanding: int) -> None:
+        """Say so when the paid tier is absorbing the local translator's work.
+
+        A translator that will not load is not an error, so the run continues
+        and every foreign phrase goes to the language model instead, one batch
+        at a time. That is correct but it is the most expensive thing this agent
+        can do, and on a full extract it is hours of silence: a real run sent
+        365,532 phrases this way after failing to reach the model hub seconds
+        earlier. Nothing in the log connected the two. This does.
+        """
+        if self._translator_warned or not self.neural.unavailable:
+            return
+        self._translator_warned = True
+
+        requests = max(1, -(-outstanding // max(1, self.model.config.batch_size)))
+        LOGGER.warning(
+            "The offline translator would not load for %s, so %d phrase(s) are "
+            "going to %s instead of being translated here for nothing.",
+            ", ".join(self.neural.unavailable), outstanding,
+            self.model.config.model)
+        LOGGER.warning(
+            "  That is about %d request(s), sent one after another, and it is "
+            "the largest avoidable cost in this agent.", requests)
+        LOGGER.warning(
+            "  Stop the run and fetch the local models first if that was not "
+            "intended: python fetch_models.py")
+
     def _run_model_tier(self, pending: Dict[str, Tuple[str, float]]) -> None:
         """Send the residue to the language model, in batches, with caching."""
         if self.model is None or not self.model.config.enabled or not pending:
@@ -2870,6 +2949,7 @@ class TranslationEngine:
         if not outstanding:
             return
 
+        self._warn_if_translator_missing(len(outstanding))
         LOGGER.info("Sending %d unresolved phrase(s) to %s.",
                     len(outstanding), self.model.config.model)
 
@@ -2897,10 +2977,29 @@ class TranslationEngine:
         )
 
         batch_size = max(1, self.model.config.batch_size)
-        for start in range(0, len(outstanding), batch_size):
+        batches = -(-len(outstanding) // batch_size)
+        # A batch is one round trip, so a large residue is hours of work with
+        # nothing to show. Progress is reported on a clock rather than every
+        # batch: often enough that a caller watching the log can see movement
+        # and estimate the end, rarely enough that it does not bury the run.
+        announced = time.time()
+        started = announced
+
+        for index, start in enumerate(range(0, len(outstanding), batch_size), start=1):
             batch = outstanding[start:start + batch_size]
             user_prompt = json.dumps({"texts": batch}, ensure_ascii=False)
             response = self.model.complete_json(system_prompt, user_prompt)
+
+            if batches > 1 and time.time() - announced >= MODEL_PROGRESS_SECONDS:
+                announced = time.time()
+                done = min(start + batch_size, len(outstanding))
+                rate = done / max(0.001, announced - started)
+                left = (len(outstanding) - done) / rate if rate else 0.0
+                LOGGER.info("  translated %d of %d phrase(s), batch %d of %d, "
+                            "about %s remaining at this rate",
+                            done, len(outstanding), index, batches,
+                            human_seconds(left))
+
             if not response:
                 continue
 

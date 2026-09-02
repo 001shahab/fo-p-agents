@@ -57,6 +57,8 @@ optional, and every agent runs to completion without one.
 - [Scope: what is built and what is not](#scope-what-is-built-and-what-is-not)
 - [Design principles](#design-principles)
 - [Installation](#installation)
+- [Preparing a machine that cannot reach Hugging Face](#preparing-a-machine-that-cannot-reach-hugging-face)
+- [Running with less than the full stack](#running-with-less-than-the-full-stack)
 - [Configuration](#configuration)
 - [Running the agents](#running-the-agents)
 - [Running all four in one command](#running-all-four-in-one-command)
@@ -185,7 +187,15 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Then the language resources, both of which are optional:
+Then the local models. Unlike the packages above these are not optional in
+practice — see [preparing a machine that cannot reach Hugging
+Face](#preparing-a-machine-that-cannot-reach-hugging-face) for why:
+
+```bash
+python fetch_models.py                 # the embedder and the translators
+```
+
+Then the language resources, both of which really are optional:
 
 ```bash
 pip install -r requirements-models.txt
@@ -214,19 +224,96 @@ variables rather than `.env` entries, so the Hugging Face downloads and the
 language-model calls trust it too. `.env` is read for endpoints and keys and is
 never exported to the environment.
 
-The translation and embedding models download on first use and are cached under
-`~/.cache/huggingface` (roughly 1 GB in total). To fetch them ahead of time, or
-to stage them for a machine without internet access:
+## Preparing a machine that cannot reach Hugging Face
+
+The agents run two kinds of model locally: one multilingual sentence embedder,
+shared by all four, and a set of small Helsinki-NLP bilingual translators, one
+per source language. Both download on first use and cache under
+`~/.cache/huggingface`.
+
+**A machine that cannot reach `huggingface.co` does not fail. It gets expensive.**
+A translator that will not load is treated as an absent optional component, so
+the run continues and every foreign phrase goes to the language model instead —
+which is the one thing the translators exist to prevent. On a full Fortum extract
+that is 365,532 phrases at 25 per request, roughly 14,600 round trips issued one
+after another. It is slow, it is not free, and until now nothing in the log
+connected it to the download failure a few seconds earlier.
+
+So fetch them deliberately:
 
 ```bash
-python -c "from sentence_transformers import SentenceTransformer; \
-           SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')"
-python -c "from transformers import pipeline; \
-           [pipeline('translation', model=f'Helsinki-NLP/opus-mt-{p}') \
-            for p in ('fi-en', 'sv-en', 'pl-en', 'de-en')]"
+python fetch_models.py            # the embedder and the languages Fortum's data carries
+python fetch_models.py --check    # report what is present; exits non-zero if any are missing
 ```
 
-### Running with less than the full stack
+`--check` is the one to put in front of a long run. It downloads nothing and
+tells you whether the run is about to fall back to the paid tier:
+
+```
+    present  sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2   455.2 MB
+    present  Helsinki-NLP/opus-mt-fi-en                                   577.2 MB
+    MISSING  Helsinki-NLP/opus-mt-sv-en
+```
+
+The default set covers the languages the client's extracts actually contain —
+Finnish, Swedish, Estonian, Norwegian, German and Polish. `--languages fi sv`
+narrows it, `--all-languages` fetches all twelve the agents support. Budget
+roughly 580 MB per translator: the hub keeps more than one weight format per
+repository, so the folder is larger than the model.
+
+### When the network blocks the hub outright
+
+On a corporate network the failure is usually TLS interception rather than a
+block, and it shows up as `self-signed certificate in certificate chain`. Fix it
+the same way as for `pip`, exporting the bundle as shell variables so the Hugging
+Face downloads trust it too:
+
+```bash
+export REQUESTS_CA_BUNDLE=~/ca-bundle.pem SSL_CERT_FILE=~/ca-bundle.pem
+python fetch_models.py
+```
+
+Where the hub is unreachable whatever you do, fetch on a machine that can reach
+it and carry the result across:
+
+```bash
+# on a machine with a route to the hub
+python fetch_models.py --all-languages --bundle models.tar.gz
+
+# on the machine without one
+mkdir -p ~/.cache/huggingface && tar -xzf models.tar.gz -C ~/.cache/huggingface
+export HF_HUB_OFFLINE=1
+python fetch_models.py --check      # confirms they loaded, with no network at all
+```
+
+`HF_HUB_OFFLINE=1` stops the libraries checking the hub for updates, which
+otherwise costs a timeout per model on every run.
+
+### If it does fall back anyway
+
+Agent 1 now says so instead of leaving it to be inferred, naming the languages,
+the volume and the remedy before it starts spending:
+
+```
+WARNING The offline translator would not load for et, fi, no, sv, so 365532
+        phrase(s) are going to openai.eu.gpt-5.6-luna instead of being
+        translated here for nothing.
+WARNING   That is about 14622 request(s), sent one after another, and it is the
+          largest avoidable cost in this agent.
+WARNING   Stop the run and fetch the local models first if that was not
+          intended: python fetch_models.py
+```
+
+A long model pass also reports where it has got to once a minute, with an
+estimate, so it can be abandoned on evidence rather than on patience:
+
+```
+INFO      translated 2,150 of 365,532 phrase(s), batch 86 of 14622, about 31h 20m remaining at this rate
+```
+
+---
+
+## Running with less than the full stack
 
 Every dependency is optional and every agent degrades rather than fails. On
 start-up each agent logs which components it found:
@@ -240,7 +327,7 @@ What is lost when a component is missing:
 | Missing | Effect |
 | --- | --- |
 | `openpyxl` | `.xlsx` files cannot be read; `.csv` still works |
-| `transformers` / `torch` | no offline translation; the vocabulary and the language model cover it |
+| `transformers` / `torch` | no offline translation, so every foreign phrase goes to the language model instead — correct, but the most expensive thing in the chain |
 | `sentence-transformers` | no semantic matching; lexical comparison is used instead |
 | `spacy` | lemmatisation and head-noun detection fall back to suffix rules |
 | `nltk` | smaller stop-word lists; no Snowball stemming |
@@ -1330,6 +1417,16 @@ The token report at the end of each run states exactly what was consumed,
 separating fresh input tokens from cached ones and output tokens from reasoning
 tokens.
 
+Every one of those points rests on the local layers actually being there. The
+residue the model sees is small because the vocabulary, the compound
+decomposition and the offline translators have already absorbed almost all of it;
+remove the translators and the residue becomes the whole multilingual half of the
+data. That is not a small regression — it is the difference between a few hundred
+requests and fourteen thousand — and it happens silently, because a missing model
+is an absent optional component rather than an error. Run
+`python fetch_models.py --check` before a long run; see [preparing a machine that
+cannot reach Hugging Face](#preparing-a-machine-that-cannot-reach-hugging-face).
+
 The cheapest way to improve quality is to extend the vocabulary, not to enable
 the model.
 
@@ -1469,6 +1566,21 @@ deterministic path.
 **`Reading ... needs openpyxl`** — `pip install openpyxl`, or convert the
 workbook to CSV.
 
+**`Translation model Helsinki-NLP/opus-mt-fi-en unavailable`** — the model is
+neither cached nor reachable, so that language goes to the language model
+instead. Run `python fetch_models.py`. If the message ends in `We couldn't
+connect to 'https://huggingface.co'` the network is the problem; if it ends in
+`Unknown task translation` the installed `transformers` is a version the agents
+no longer use that path on, so reinstall from `requirements.txt`.
+
+**A run has been silent for hours** — check the last line before the silence. If
+it is `Sending N unresolved phrase(s)` with N in the hundreds of thousands, the
+local translators did not load and the paid tier is doing their work; the run now
+warns about this and prints progress with an estimate once a minute. Neither
+`all_agents.py` nor `max.py` will kill it, so it is safe to stop it yourself —
+but note that Agent 1 writes its translation cache only when it finishes, so
+stopping discards what has been paid for so far.
+
 **Mangled characters in the output** — the source file was exported through the
 wrong code page. The agents repair the common double-encoding damage
 automatically, but characters that were already replaced with `?` at export time
@@ -1530,6 +1642,7 @@ because their inputs and settings were unchanged. The summary marks each one
 ├── agent4.py                          Supplier consolidation
 ├── all_agents.py                      runs all four, returns the input table widened
 ├── max.py                             builds the wide table, then runs all four
+├── fetch_models.py                    fetch and verify the local models, or bundle them
 ├── lexicon/
 │   └── procurement_lexicon.json       controlled procurement vocabulary
 ├── requirements.txt                   Python dependencies, all from PyPI

@@ -55,8 +55,13 @@ rapidfuzz>=3.6
 sentence-transformers>=2.6
 
 # Hosts the Helsinki-NLP opus-mt translation models. Offline machine
-# translation removes the single largest language-model cost driver.
-transformers>=4.40
+# translation removes the single largest language-model cost driver, so losing
+# it is expensive rather than merely slower: every foreign phrase then falls
+# through to the paid tier. The agents load Marian directly instead of through
+# pipeline("translation"), which version 5 removed, so either major version
+# works. The ceiling is only there to stop the next major release enabling
+# itself unread.
+transformers>=4.40,<6
 torch>=2.1
 sentencepiece>=0.2
 sacremoses>=0.1
@@ -93,12 +98,13 @@ tqdm>=4.66
 #   python -m nltk.downloader punkt punkt_tab stopwords wordnet omw-1.4
 #
 # The translation and embedding models are fetched from the Hugging Face hub on
-# first use and cached under ~/.cache/huggingface. To pre-load them, or to
-# stage them for an air-gapped machine, run:
+# first use and cached under ~/.cache/huggingface. A machine that cannot reach
+# huggingface.co does not fail; it silently sends every foreign phrase to the
+# language model instead, which is slow and not free. Pre-load them:
 #
-#   python -c "from sentence_transformers import SentenceTransformer; \
-#              SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')"
-#   python -c "from transformers import pipeline; \
-#              [pipeline('translation', model=f'Helsinki-NLP/opus-mt-{p}') \
-#               for p in ('fi-en', 'sv-en', 'pl-en', 'de-en')]"
+#   python fetch_models.py
+#
+# On a machine with no route to the hub at all, run that script somewhere that
+# has one and copy the cache across. See "Preparing a machine that cannot reach
+# Hugging Face" in README.md.
 # ---------------------------------------------------------------------------

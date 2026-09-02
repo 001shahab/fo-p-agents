@@ -102,7 +102,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent3")
 
 AGENT_NAME = "Agent 3 - AI Material and Service Standardisation"
-AGENT_VERSION = "1.4.0"
+AGENT_VERSION = "1.5.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -127,6 +127,7 @@ _sentence_transformers = _import_optional("sentence_transformers")
 _sklearn_text = _import_optional("sklearn.feature_extraction.text")
 _sklearn_neighbors = _import_optional("sklearn.neighbors")
 _transformers = _import_optional("transformers")
+_torch = _import_optional("torch")
 _openpyxl = _import_optional("openpyxl")
 
 
@@ -578,50 +579,75 @@ class NeuralTranslator:
 
     MODEL_TEMPLATE = "Helsinki-NLP/opus-mt-{source}-en"
     SUPPORTED = ("pl", "fi", "sv", "de", "da", "no", "nl", "et", "fr", "es", "it", "cs")
+    WINDOW = 32
+    # Fixed beam count and no sampling, so a re-run reproduces the previous
+    # output exactly.
+    GENERATION = {"max_length": 256, "num_beams": 4, "do_sample": False}
 
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = enabled and _transformers is not None
-        self._pipelines: Dict[str, Any] = {}
+        self._translators: Dict[str, Any] = {}
         self._unavailable: Set[str] = set()
         self.translated_count = 0
 
     def available_for(self, language: str) -> bool:
         return self.enabled and language in self.SUPPORTED and language not in self._unavailable
 
-    def _pipeline(self, language: str) -> Optional[Any]:
-        if language in self._pipelines:
-            return self._pipelines[language]
+    def _build(self, model_name: str) -> Any:
+        """Load one bilingual model, returning a callable that translates a list.
+
+        Driven directly rather than through pipeline("translation"), which
+        transformers 5 removed while keeping Marian itself, so that upgrading
+        transformers cannot quietly disable this tier.
+        """
+        tokeniser = _transformers.AutoTokenizer.from_pretrained(model_name)
+        model = _transformers.AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        model.eval()
+
+        def translate(texts: Sequence[str]) -> List[str]:
+            encoded = tokeniser(list(texts), return_tensors="pt", padding=True,
+                                truncation=True, max_length=256)
+            if _torch is not None:
+                with _torch.no_grad():
+                    produced = model.generate(**encoded, **self.GENERATION)
+            else:
+                produced = model.generate(**encoded, **self.GENERATION)
+            return tokeniser.batch_decode(produced, skip_special_tokens=True)
+
+        return translate
+
+    def _translator(self, language: str) -> Optional[Any]:
+        if language in self._translators:
+            return self._translators[language]
         if not self.available_for(language):
             return None
         model_name = self.MODEL_TEMPLATE.format(source=language)
         try:
             LOGGER.info("Loading offline translation model %s ...", model_name)
-            pipeline = _transformers.pipeline("translation", model=model_name, device=-1)
+            translator = self._build(model_name)
         except Exception as error:
             LOGGER.warning("Translation model %s unavailable (%s).", model_name, error)
             self._unavailable.add(language)
-            self._pipelines[language] = None
+            self._translators[language] = None
             return None
-        self._pipelines[language] = pipeline
-        return pipeline
+        self._translators[language] = translator
+        return translator
 
     def translate_batch(self, texts: Sequence[str], language: str) -> Dict[str, str]:
         """Translate a batch into English, keyed by the input text."""
-        pipeline = self._pipeline(language)
-        if pipeline is None or not texts:
+        translator = self._translator(language)
+        if translator is None or not texts:
             return {}
         results: Dict[str, str] = {}
-        for start in range(0, len(texts), 32):
-            window = list(texts[start:start + 32])
+        for start in range(0, len(texts), self.WINDOW):
+            window = list(texts[start:start + self.WINDOW])
             try:
-                # Fixed beam count and no sampling, so a re-run reproduces the
-                # previous output exactly.
-                outputs = pipeline(window, max_length=256, num_beams=4, do_sample=False)
+                produced = translator(window)
             except Exception as error:
                 LOGGER.warning("Offline translation failed for a batch (%s).", error)
                 continue
-            for source_text, output in zip(window, outputs):
-                translated = normalise_text(output.get("translation_text", ""))
+            for source_text, output in zip(window, produced):
+                translated = normalise_text(output)
                 if translated:
                     results[source_text] = translated
                     self.translated_count += 1
