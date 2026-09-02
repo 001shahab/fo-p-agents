@@ -924,6 +924,23 @@ group they do not belong in. The number of Category L5 names is capped at 6000
 including `Other`; groups are ranked by the spend behind them and anything past
 the ceiling joins `Other`, so no row leaves the analysis.
 
+Worth being precise about what that ceiling does, because it is easy to expect the
+other behaviour. It **truncates rather than coarsens**: the 5,999 groups carrying
+the most spend keep exactly the names they had, and every remaining group — however
+sensible — is folded into `Other` wholesale. It does not merge similar groups into
+broader ones, so the surviving names are no less granular than they were without
+the cap. `groups_folded_into_other` in the run manifest counts what went that way,
+and a large number there means detail was discarded, not generalised.
+
+Granularity is set by `--threshold` instead, the clustering distance at which two
+descriptions are treated as the same purchase. The default 0.35 is deliberately
+fine, which is why a 4,546-line extract can produce over a thousand groups — about
+four lines each, close to the description level. Raising it to 0.45 or 0.55 merges
+neighbouring descriptions and yields genuinely broader categories; that is the
+lever to pull if the L5 names read as too specific, and it is worth setting from a
+representative extract before a full run rather than relying on the ceiling to
+tidy up afterwards.
+
 Useful options:
 
 | Option | Effect |
@@ -1113,6 +1130,55 @@ question, not an absence of matches, and the run says so instead of reporting
 nought as a finding. Where the accept threshold should sit is a decision for
 Fortum to take against the calibration file on a full extract, not from a
 twenty-five row sample.
+
+### Reading a nil result: is it the threshold, or the catalogue?
+
+A run that matches nothing has two quite different causes, and they call for
+opposite responses. Before touching the threshold, check whether the lines could
+match at all.
+
+The master catalogue is a materials catalogue. Its single sheet holds 846,024 rows,
+of which 845,428 survive loading as usable items, and 840,795 of them — 99.4% —
+are Ahlsell SE (512,640) and Ahlsell FI (328,155), a technical wholesaler. They
+read like it: `KAAPELIKELA 20M 3G1 OHUT IP20`, `LAIPPAKULMAYHDE FFK/DN300/45AST`,
+`PAINEPUTKI BIOZINALIUM ZNAL DN200X6000`. Cable reels, flanged bends, pressure
+pipe.
+
+The 4,546-line test extract in `sources/subset2` buys almost none of that:
+
+| Category L1 | Lines | Share |
+|---|---|---|
+| IT | 2,311 | 50.8% |
+| Indirect Services and Materials | 1,568 | 34.5% |
+| Energy assets | 587 | 12.9% |
+| Fuels | 78 | 1.7% |
+
+Half of it is ServiceNow licences, SaaS subscriptions, Check Point support
+renewals, security consultants and agency staffing hours. No threshold makes a
+ServiceNow licence match a pressure pipe. On that extract nil is the right
+answer, and only the ~6.6% in `Production supplies and consumables`, with parts
+of `Civil Works` and `Production maintenance`, is even in Ahlsell's territory.
+
+So a nil result is worth explaining before it is corrected:
+
+- **The extract is out of the catalogue's domain.** Nothing to fix. Expect a low
+  match rate on IT and services spend however the threshold is set, and judge the
+  agent on materials lines instead.
+- **The threshold is above the score distribution.** Read
+  `agent3_match_calibration.csv`. On the twenty-five row sample three of five
+  scored lines clear 0.60 and none clear 0.65, so the accept threshold alone
+  decided the outcome.
+
+More lines do not help either way. Each line is scored against all 845,428 items
+independently, so a larger extract raises the number of matches only in
+proportion to how much of it the catalogue actually covers — it does not make any
+single line match better.
+
+One caveat when reading the row-level output: `Similarity_Score` is written only
+for accepted matches, so a near miss and a line with no comparable item both
+arrive blank, distinguished only by `No_Match_Reason` (`best candidate below the
+reporting threshold` against `no comparable standard item found`). The
+calibration file, not the merged table, is where the score distribution lives.
 
 ### Translating the catalogue, once
 
