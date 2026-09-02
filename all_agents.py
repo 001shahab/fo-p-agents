@@ -166,7 +166,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 AGENT_NAME = "All Agents - Input Table Widened With Agents 1 to 4"
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 
 BANNER = f"""
 ===============================================================================
@@ -557,6 +557,98 @@ def unique_name(name: str, taken: Iterable[str]) -> str:
         if candidate not in used:
             return candidate
     raise RuntimeError(f"cannot find a free column name for {name}")
+
+
+# ---------------------------------------------------------------------------
+# One run at a time in a results folder
+# ---------------------------------------------------------------------------
+
+class ResultsLock:
+    """Stops two runs writing into one results folder at the same time.
+
+    Every stage here writes to a fixed name, so two runs sharing a folder do not
+    collide loudly: they interleave. Each overwrites the other's agent outputs,
+    the reuse stamps stop describing the files they sit beside, and the dataset
+    that survives is whichever run happened to finish last. The result looks
+    complete and is a mixture of two configurations.
+
+    This is not hypothetical. Two runs of this script, one of them with the model
+    disabled, once overlapped by seventeen minutes in the same folder and
+    reported catalogue match counts that disagreed, because each had read some of
+    the other's intermediate files.
+
+    A lock file naming the process is enough to prevent it. The one case that
+    needs care is the lock left behind by a run that was killed: refusing
+    forever because of a dead process would be worse than the problem, so a lock
+    whose process is gone is reported and taken over.
+    """
+
+    NAME = ".run.lock"
+
+    def __init__(self, results_dir: Path) -> None:
+        self.path = results_dir / self.NAME
+        self.held = False
+
+    def _holder(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        """Whether a process is still running, without disturbing it.
+
+        Signal 0 asks the kernel about a process without delivering anything. A
+        permission error means it exists but belongs to somebody else, which
+        still counts as alive.
+        """
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def acquire(self) -> Optional[str]:
+        """Take the lock, or return why it cannot be taken."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.path.exists():
+            holder = self._holder()
+            pid = int(holder.get("pid") or 0)
+            if self._alive(pid) and pid != os.getpid():
+                started = holder.get("started") or "an unknown time"
+                return (f"another run is already writing to this folder: "
+                        f"process {pid}, started {started}.\n"
+                        f"  Wait for it to finish, or stop it, or point this run "
+                        f"at a different --results folder.\n"
+                        f"  If that process is gone, delete {self.path}.")
+            if pid and pid != os.getpid():
+                LOGGER.warning("Taking over the lock left by process %d, which is "
+                               "no longer running.", pid)
+
+        payload = {
+            "pid": os.getpid(),
+            "started": datetime.datetime.now().isoformat(timespec="seconds"),
+            "command": " ".join(sys.argv),
+        }
+        self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.held = True
+        return None
+
+    def release(self) -> None:
+        """Give the lock up, but never somebody else's."""
+        if not self.held:
+            return
+        self.held = False
+        if int(self._holder().get("pid") or 0) == os.getpid():
+            self.path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2962,10 +3054,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     settings = resolve_settings(args)
     if args.non_interactive:
-        print(BANNER)
+        # Flushed so that a message written to the log immediately afterwards
+        # cannot appear above the banner when both are going to a pipe.
+        print(BANNER, flush=True)
 
     settings.results_dir.mkdir(parents=True, exist_ok=True)
     settings.work_dir.mkdir(parents=True, exist_ok=True)
+
+    # Claimed before anything is read, so a folder already in use is reported at
+    # the top rather than after an agent has overwritten a file it shares.
+    lock = ResultsLock(settings.results_dir)
+    refusal = lock.acquire()
+    if refusal:
+        LOGGER.error("Not starting: %s", refusal)
+        return 1
 
     runner = Runner(settings)
     try:
@@ -2973,6 +3075,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except KeyboardInterrupt:
         report_interruption(runner, settings)
         return 130
+    finally:
+        lock.release()
     print_summary(runner, settings)
     return code
 

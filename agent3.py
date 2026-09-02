@@ -102,7 +102,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent3")
 
 AGENT_NAME = "Agent 3 - AI Material and Service Standardisation"
-AGENT_VERSION = "1.5.0"
+AGENT_VERSION = "1.5.1"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -579,6 +579,10 @@ class NeuralTranslator:
 
     MODEL_TEMPLATE = "Helsinki-NLP/opus-mt-{source}-en"
     SUPPORTED = ("pl", "fi", "sv", "de", "da", "no", "nl", "et", "fr", "es", "it", "cs")
+    # Norwegian is published only inside the North Germanic group model, so the
+    # template above names a repository that does not exist. Kept in step with
+    # agent1.py.
+    MODEL_OVERRIDES = {"no": "Helsinki-NLP/opus-mt-gmq-en"}
     WINDOW = 32
     # Fixed beam count and no sampling, so a re-run reproduces the previous
     # output exactly.
@@ -621,7 +625,8 @@ class NeuralTranslator:
             return self._translators[language]
         if not self.available_for(language):
             return None
-        model_name = self.MODEL_TEMPLATE.format(source=language)
+        model_name = self.MODEL_OVERRIDES.get(
+            language, self.MODEL_TEMPLATE.format(source=language))
         try:
             LOGGER.info("Loading offline translation model %s ...", model_name)
             translator = self._build(model_name)

@@ -250,16 +250,31 @@ python fetch_models.py --check    # report what is present; exits non-zero if an
 tells you whether the run is about to fall back to the paid tier:
 
 ```
-    present  sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2   455.2 MB
+    present  sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2   457.5 MB
     present  Helsinki-NLP/opus-mt-fi-en                                   577.2 MB
     MISSING  Helsinki-NLP/opus-mt-sv-en
 ```
 
+A model counts as present only if a snapshot holds real weights, which is
+stricter than it sounds and deliberately so. Asking the hub for a repository
+that does not exist still leaves a folder, a ref and a `config.json` behind,
+about eight kilobytes in all. Anything that tests for the folder calls that
+present, reports the machine as ready, and the gap then surfaces hours later as
+an agent quietly sending every foreign phrase to the paid tier.
+
 The default set covers the languages the client's extracts actually contain —
 Finnish, Swedish, Estonian, Norwegian, German and Polish. `--languages fi sv`
-narrows it, `--all-languages` fetches all twelve the agents support. Budget
-roughly 580 MB per translator: the hub keeps more than one weight format per
-repository, so the folder is larger than the model.
+narrows it, `--all-languages` fetches all twelve the agents support. The download
+itself is about 2.1 GB with the embedder and takes a couple of minutes on a home
+connection, but budget nearer 3.8 GB on disk: the first load of each translator
+caches a second weight format beside the one that was downloaded, taking each
+folder from about 290 MB to about 580 MB.
+
+Norwegian is the one language whose model is not named after it. Helsinki
+publishes no `opus-mt-no-en`; Norwegian lives inside the North Germanic group
+model, `opus-mt-gmq-en`, and both agents now ask for that instead. Before this
+was corrected the agents requested a repository that has never existed, so every
+Norwegian phrase went to the paid tier — 9,781 of them in one real run.
 
 ### When the network blocks the hub outright
 
@@ -571,6 +586,30 @@ that has printed nothing for two hours is treated as hung, which is
 `--agent-silence-timeout`. An absolute ceiling is available as `--agent-timeout`
 but is off by default, because the earlier fixed six-hour limit killed Agent 1
 mid-run on the full extract and cost the whole chain.
+
+### One run at a time in a results folder
+
+Both runners take a lock on the results folder and refuse to start if another run
+already holds it:
+
+```
+12:48:31  ERROR   Not starting: another run is already writing to this folder:
+                  process 73160, started 2026-09-02T12:48:10.
+  Wait for it to finish, or stop it, or point this run at a different --results folder.
+```
+
+Two runs sharing a folder do not collide loudly, which is what makes this worth
+preventing. Every stage writes to a fixed name, so they interleave: each
+overwrites the other's agent outputs, the reuse stamps stop describing the files
+beside them, and the dataset that survives is whichever run happened to finish
+last. It looks complete and is a mixture of two configurations. Two runs of
+`all_agents.py` once overlapped by seventeen minutes this way and reported
+catalogue match counts that disagreed.
+
+A lock left behind by a run that was killed is reported and taken over rather
+than obeyed, so a stale file cannot block the folder permanently. If you need to
+clear one by hand it is `.run.lock` for `all_agents.py` and `.build.lock` for
+Max. To run two things at once, give each its own `--results` folder.
 
 ### Model spend across the four
 
@@ -961,6 +1000,15 @@ question, not an absence of matches, and the run says so instead of reporting
 nought as a finding. Where the accept threshold should sit is a decision for
 Fortum to take against the calibration file on a full extract, not from a
 twenty-five row sample.
+
+Read that 0.630 as a property of one run rather than of the data. Scores depend
+on what text was compared, and therefore on whether the translation tier was
+working: the same sample against the same master scored 0.703 and accepted three
+matches on a run where nothing translated the catalogue, because it was then
+comparing Finnish and Swedish against English. Cross-language scores are not
+meaningful, and neither is a threshold set from them. Confirm with
+`python fetch_models.py --check` that the translators are present before taking
+any calibration figure seriously.
 
 ### Output
 

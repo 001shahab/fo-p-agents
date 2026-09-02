@@ -178,7 +178,7 @@ except ImportError:
 
 
 AGENT_NAME = "Max - wide procurement dataset builder"
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "1.4.0"
 
 # ---------------------------------------------------------------------------
 # The agent interface
@@ -3929,6 +3929,78 @@ class AgentPipeline:
         LOGGER.error("Rerun the same command to carry on from %s.", blocked.name)
 
 
+class ResultsLock:
+    """Stops two builds writing into one results folder at the same time.
+
+    Every stage writes to a fixed name, so two builds sharing a folder do not
+    collide loudly: they interleave, each overwrites the other's intermediates,
+    and the dataset that survives is whichever build finished last. It looks
+    complete and is a mixture of two configurations. Kept in step with the class
+    of the same name in all_agents.py, which shares the folder.
+    """
+
+    NAME = ".build.lock"
+
+    def __init__(self, results_dir: Path) -> None:
+        self.path = results_dir / self.NAME
+        self.held = False
+
+    def _holder(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        """Whether a process is still running, without disturbing it."""
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)  # asks the kernel, delivers nothing
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # somebody else's, but running
+        except OSError:
+            return False
+        return True
+
+    def acquire(self) -> Optional[str]:
+        """Take the lock, or return why it cannot be taken."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.path.exists():
+            holder = self._holder()
+            pid = int(holder.get("pid") or 0)
+            if self._alive(pid) and pid != os.getpid():
+                started = holder.get("started") or "an unknown time"
+                return (f"another build is already writing to this folder: "
+                        f"process {pid}, started {started}.\n"
+                        f"  Wait for it to finish, or stop it, or point this build "
+                        f"at a different --results folder.\n"
+                        f"  If that process is gone, delete {self.path}.")
+            if pid and pid != os.getpid():
+                LOGGER.warning("Taking over the lock left by process %d, which is "
+                               "no longer running.", pid)
+
+        self.path.write_text(json.dumps({
+            "pid": os.getpid(),
+            "started": datetime.datetime.now().isoformat(timespec="seconds"),
+            "command": " ".join(sys.argv),
+        }, indent=2), encoding="utf-8")
+        self.held = True
+        return None
+
+    def release(self) -> None:
+        """Give the lock up, but never somebody else's."""
+        if not self.held:
+            return
+        self.held = False
+        if int(self._holder().get("pid") or 0) == os.getpid():
+            self.path.unlink(missing_ok=True)
+
+
 class RunJournal:
     """What a run has finished, so a later run can carry on from there.
 
@@ -5206,6 +5278,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             LOGGER.info("No spend alert set; the model tier will run unmetered.")
 
+    # Claimed before the resume question, so a folder already in use is reported
+    # at the top rather than after a stage has overwritten a shared file.
+    lock = ResultsLock(settings.results_dir)
+    refusal = lock.acquire()
+    if refusal:
+        LOGGER.error("Not starting: %s", refusal)
+        return 1
+
     journal = RunJournal(settings)
     decide_resume(journal, settings)
 
@@ -5229,9 +5309,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except KeyboardInterrupt:
         report_interruption(builder, journal, settings)
         builder.close()
+        lock.release()
         return 130
     finally:
         builder.close()
+        lock.release()
 
     journal.complete()
 

@@ -61,6 +61,11 @@ SUPPORTED_LANGUAGES: Tuple[str, ...] = (
     "fi", "sv", "pl", "de", "da", "no", "nl", "et", "fr", "es", "it", "cs",
 )
 
+# Languages the template above names wrongly, kept in step with
+# NeuralTranslator.MODEL_OVERRIDES. Norwegian is published only inside the
+# North Germanic group model.
+MODEL_OVERRIDES: Dict[str, str] = {"no": "Helsinki-NLP/opus-mt-gmq-en"}
+
 # The languages Fortum's own extracts carry, which is what a normal run needs.
 # Measured from a full run: Finnish dominates, then Swedish, then a long tail.
 # Fetching only these keeps the download to a few gigabytes rather than eight.
@@ -69,6 +74,11 @@ FORTUM_LANGUAGES: Tuple[str, ...] = ("fi", "sv", "et", "no", "de", "pl")
 # Roughly what one bilingual model costs on disk. The hub stores more than one
 # weight format per repository, so the figure is larger than the model itself.
 APPROXIMATE_MODEL_MB = 580
+
+
+def translation_model(code: str) -> str:
+    """The repository that actually holds the translator for one language."""
+    return MODEL_OVERRIDES.get(code, TRANSLATION_TEMPLATE.format(source=code))
 
 
 # ===========================================================================
@@ -140,18 +150,46 @@ def repository_folder(root: Path, repository: str) -> Path:
     return root / "hub" / ("models--" + repository.replace("/", "--"))
 
 
+# Any weight file smaller than this is a pointer or a stub rather than a model.
+# The smallest thing here is a bilingual translator at roughly 300 MB, so the
+# bar is far below anything real and far above anything spurious.
+MINIMUM_WEIGHT_BYTES = 1_000_000
+
+# The names the hub uses for the weights themselves, as opposed to the small
+# files that describe them.
+WEIGHT_SUFFIXES = (".safetensors", ".bin", ".msgpack", ".h5", ".ckpt")
+
+
 def is_present(root: Path, repository: str) -> bool:
     """Whether a repository looks fetched rather than half-fetched.
 
-    A snapshot folder holding at least one file is the test, because an
-    interrupted download leaves the repository folder and its lock behind with
-    no snapshot in it, and treating that as present is how a run ends up
-    discovering the gap at the worst moment.
+    The test is that a snapshot holds real weights. Merely holding a file is not
+    enough, and getting this wrong is worse than not checking at all: asking the
+    hub for a model that does not exist still leaves a repository folder, a ref
+    and a snapshot containing config.json behind, roughly eight kilobytes in
+    all. A folder-shaped test calls that present. This script then reports a
+    machine as ready, and the gap surfaces hours later as an agent quietly
+    sending every foreign phrase to the paid tier instead.
+
+    Sizes come from stat through the symlink, so the blob is measured rather
+    than the link into it.
     """
     snapshots = repository_folder(root, repository) / "snapshots"
     if not snapshots.is_dir():
         return False
-    return any(any(entry.rglob("*")) for entry in snapshots.iterdir() if entry.is_dir())
+
+    for entry in snapshots.iterdir():
+        if not entry.is_dir():
+            continue
+        for item in entry.rglob("*"):
+            if item.suffix not in WEIGHT_SUFFIXES:
+                continue
+            try:
+                if item.stat().st_size >= MINIMUM_WEIGHT_BYTES:
+                    return True
+            except OSError:
+                continue  # a dangling link into a blob that was cleaned up
+    return False
 
 
 # ===========================================================================
@@ -352,7 +390,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.no_embedder:
         repositories.append((EMBEDDING_MODEL, load_embedder))
     for code in languages:
-        repositories.append((TRANSLATION_TEMPLATE.format(source=code), load_translator))
+        repositories.append((translation_model(code), load_translator))
 
     if not repositories:
         LOGGER.error("Nothing selected to fetch.")

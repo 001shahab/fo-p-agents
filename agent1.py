@@ -97,7 +97,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.8.0"
+AGENT_VERSION = "1.8.1"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -2198,6 +2198,12 @@ class NeuralTranslator:
     # Languages served by a dedicated bilingual model. Others fall through to
     # the multilingual model or, failing that, to the language-model tier.
     SUPPORTED = ("fi", "sv", "pl", "de", "da", "no", "nl", "et", "fr", "es", "it", "cs")
+    # Languages the template names wrongly. Norwegian has no opus-mt-no-en:
+    # Helsinki publishes it inside the North Germanic group model instead, so
+    # the template asked for a repository that has never existed and every
+    # Norwegian phrase went to the paid tier as a result. One real run sent
+    # 9,781 of them. Overriding the name is the whole fix.
+    MODEL_OVERRIDES = {"no": "Helsinki-NLP/opus-mt-gmq-en"}
     # Phrases per forward pass, sized for CPU memory rather than for speed.
     WINDOW = 32
     # Beam search with a fixed beam count and no sampling, so the same input
@@ -2251,7 +2257,8 @@ class NeuralTranslator:
         if not self.available_for(language):
             return None
 
-        model_name = self.MODEL_TEMPLATE.format(source=language)
+        model_name = self.MODEL_OVERRIDES.get(
+            language, self.MODEL_TEMPLATE.format(source=language))
         try:
             LOGGER.info("Loading offline translation model %s ...", model_name)
             translator = self._build(model_name)
