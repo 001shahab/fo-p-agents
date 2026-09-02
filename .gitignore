@@ -26,6 +26,15 @@ lexicon/*_registry.json
 # Synthetic test data and the results of testing against it, rebuilt on demand
 .testruns/
 
+# Model weights and the archives that carry them between machines. Gigabytes,
+# fetched by fetch_models.py, and reproducible from the hub wherever it is
+# reachable, so they are copied across by hand rather than committed.
+*.tar.gz
+.hf_bundle/
+.hf_offline/
+.hf_probe/
+.hf_test_cache/
+
 # Operating system noise
 .DS_Store
 Thumbs.db
