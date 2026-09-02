@@ -211,18 +211,19 @@ reading long descriptions, no change to any column.
 
 On a corporate network that inspects TLS, `pip` reports `self-signed certificate
 in certificate chain` for anything it fetches. The proxy re-signs HTTPS with a
-root certificate Python does not ship, so point pip at a bundle that has it:
+root certificate Python does not ship. Allow `pip` through for one install and
+let `truststore` deal with it from then on:
 
 ```bash
-security find-certificate -a -p /Library/Keychains/System.keychain > ~/roots.pem
-cat "$(python -c 'import certifi; print(certifi.where())')" ~/roots.pem > ~/ca-bundle.pem
-pip config set global.cert ~/ca-bundle.pem
+pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org truststore
+pip install -r requirements.txt
 ```
 
-Export `REQUESTS_CA_BUNDLE` and `SSL_CERT_FILE` to that same file, as shell
-variables rather than `.env` entries, so the Hugging Face downloads and the
-language-model calls trust it too. `.env` is read for endpoints and keys and is
-never exported to the environment.
+`truststore` verifies against the operating system's certificate store, where the
+proxy's root already is, so nothing needs exporting. See
+[`self-signed certificate in certificate chain`](#self-signed-certificate-in-certificate-chain)
+for the manual alternative on each platform, including Windows, and for what to
+do when the hub is blocked rather than re-signed.
 
 ## Preparing a machine that cannot reach Hugging Face
 
@@ -230,6 +231,12 @@ The agents run two kinds of model locally: one multilingual sentence embedder,
 shared by all four, and a set of small Helsinki-NLP bilingual translators, one
 per source language. Both download on first use and cache under
 `~/.cache/huggingface`.
+
+`fetch_models.py` only downloads those models. It takes no input file, reads no
+extract and writes no column — its `--results` flag names where the *models* go,
+not where data is. The script that adds columns to a purchase table is
+[`all_agents.py`](#running-all-four-in-one-command), and it writes a new wide file
+rather than modifying the extract it read.
 
 **A machine that cannot reach `huggingface.co` does not fail. It gets expensive.**
 A translator that will not load is treated as an absent optional component, so
@@ -276,29 +283,98 @@ model, `opus-mt-gmq-en`, and both agents now ask for that instead. Before this
 was corrected the agents requested a repository that has never existed, so every
 Norwegian phrase went to the paid tier — 9,781 of them in one real run.
 
-### When the network blocks the hub outright
+### `self-signed certificate in certificate chain`
 
-On a corporate network the failure is usually TLS interception rather than a
-block, and it shows up as `self-signed certificate in certificate chain`. Fix it
-the same way as for `pip`, exporting the bundle as shell variables so the Hugging
-Face downloads trust it too:
+This is the usual corporate-network failure, and it is TLS interception rather
+than a block. The network re-signs HTTPS with a root of its own. That root is
+installed in the operating system's certificate store, which is why the browser
+reaches the hub — and Python does not read that store. It trusts certifi's
+bundle, which knows nothing about the proxy.
+
+The fix is to let Python read the system store, which needs no certificates
+exported and no variables set:
 
 ```bash
-export REQUESTS_CA_BUNDLE=~/ca-bundle.pem SSL_CERT_FILE=~/ca-bundle.pem
-python fetch_models.py
+pip install truststore
 ```
 
-Where the hub is unreachable whatever you do, fetch on a machine that can reach
-it and carry the result across:
+It is in `requirements.txt`, so a normal install already has it, and every agent
+picks it up. When `pip` itself fails the same way, allow it through for that one
+install:
+
+```bash
+pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org truststore
+```
+
+`fetch_models.py` says which store it is verifying against, so you can see it
+took effect:
+
+```
+  Cache                : /Users/you/.cache/huggingface
+  Verifying TLS with   : the operating system trust store
+```
+
+It also stops at the first certificate failure rather than working through the
+remaining six models. The hub library retries five times per file, so carrying on
+meant many minutes of identical failures before anything explained the cause.
+
+#### Exporting the root by hand
+
+Only needed where `truststore` cannot be installed at all. `fetch_models.py`
+prints the steps for the platform it is running on; both are recorded here
+because the choice of platform is not usually the reader's.
+
+On macOS or Linux:
+
+```bash
+security find-certificate -a -p /Library/Keychains/System.keychain > ~/roots.pem
+cat "$(python -c 'import certifi; print(certifi.where())')" ~/roots.pem > ~/ca-bundle.pem
+export REQUESTS_CA_BUNDLE=~/ca-bundle.pem SSL_CERT_FILE=~/ca-bundle.pem
+```
+
+On Windows, in PowerShell:
+
+```powershell
+Get-ChildItem Cert:\LocalMachine\Root | ForEach-Object {
+  '-----BEGIN CERTIFICATE-----'
+  [Convert]::ToBase64String($_.RawData, 'InsertLineBreaks')
+  '-----END CERTIFICATE-----' } | Set-Content $env:USERPROFILE\roots.pem -Encoding ascii
+$certifi = python -c "import certifi; print(certifi.where())"
+Get-Content $certifi, $env:USERPROFILE\roots.pem |
+  Set-Content $env:USERPROFILE\ca-bundle.pem -Encoding ascii
+$env:REQUESTS_CA_BUNDLE = "$env:USERPROFILE\ca-bundle.pem"
+$env:SSL_CERT_FILE = "$env:USERPROFILE\ca-bundle.pem"
+```
+
+### When the network blocks the hub outright
+
+No certificate helps if the hub is unreachable rather than re-signed. Fetch on a
+machine that can reach it and carry the archive across.
+
+**The models do not travel with the code.** They are gigabytes of weights in the
+Hugging Face cache, not files in the repository, so `git pull` will not bring
+them and a machine that has just pulled still has none.
 
 ```bash
 # on a machine with a route to the hub
 python fetch_models.py --all-languages --bundle models.tar.gz
+```
 
-# on the machine without one
+On macOS or Linux:
+
+```bash
 mkdir -p ~/.cache/huggingface && tar -xzf models.tar.gz -C ~/.cache/huggingface
 export HF_HUB_OFFLINE=1
 python fetch_models.py --check      # confirms they loaded, with no network at all
+```
+
+On Windows, in PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.cache\huggingface" | Out-Null
+tar -xzf models.tar.gz -C "$env:USERPROFILE\.cache\huggingface"
+$env:HF_HUB_OFFLINE = "1"
+python fetch_models.py --check
 ```
 
 `HF_HUB_OFFLINE=1` stops the libraries checking the hub for updates, which

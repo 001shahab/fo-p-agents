@@ -71,6 +71,15 @@ sacremoses>=0.1
 # urllib from the standard library when this is absent.
 requests>=2.31
 
+# Verifies TLS against the operating system's certificate store instead of
+# certifi's bundle. On a corporate network that re-signs HTTPS, the proxy's root
+# is installed in the system store - which is why the browser works - and is
+# absent from certifi's, which is why Python reports "self-signed certificate in
+# certificate chain" when fetching models. This removes that whole class of
+# problem without exporting certificates by hand. Optional: where it is not
+# installed, verification is unchanged.
+truststore>=0.9; python_version >= "3.10"
+
 # Statistical language identification, used only to break ties that the
 # built-in marker heuristic leaves unresolved.
 langdetect>=1.0.9

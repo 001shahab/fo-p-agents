@@ -37,11 +37,14 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import platform
 import sys
 import tarfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+from runtime import use_system_trust_store
 
 AGENT_NAME = "Fetch Models - the local stack Agents 1 to 4 run on"
 AGENT_VERSION = "1.0.0"
@@ -277,21 +280,83 @@ def write_bundle(root: Path, path: Path, repositories: Sequence[str]) -> Optiona
 # Environment
 # ===========================================================================
 
+# The manual remedy, per platform, for a network that re-signs HTTPS. Only
+# needed where truststore cannot be installed; it is offered second for that
+# reason. Exporting the root differs per operating system, and the advice used
+# to name the macOS keychain whatever machine it was printed on - unhelpful on
+# the Windows machines this is most likely to be read on.
+_CERTIFICATE_STEPS: Dict[str, Tuple[str, ...]] = {
+    "Darwin": (
+        "security find-certificate -a -p /Library/Keychains/System.keychain > ~/roots.pem",
+        "cat \"$(python -c 'import certifi; print(certifi.where())')\" ~/roots.pem"
+        " > ~/ca-bundle.pem",
+        "export REQUESTS_CA_BUNDLE=~/ca-bundle.pem SSL_CERT_FILE=~/ca-bundle.pem",
+    ),
+    "Windows": (
+        "# in PowerShell",
+        "Get-ChildItem Cert:\\LocalMachine\\Root | ForEach-Object {",
+        "  '-----BEGIN CERTIFICATE-----'",
+        "  [Convert]::ToBase64String($_.RawData, 'InsertLineBreaks')",
+        "  '-----END CERTIFICATE-----' } | Set-Content $env:USERPROFILE\\roots.pem"
+        " -Encoding ascii",
+        "$certifi = python -c \"import certifi; print(certifi.where())\"",
+        "Get-Content $certifi, $env:USERPROFILE\\roots.pem |"
+        " Set-Content $env:USERPROFILE\\ca-bundle.pem -Encoding ascii",
+        "$env:REQUESTS_CA_BUNDLE = \"$env:USERPROFILE\\ca-bundle.pem\"",
+        "$env:SSL_CERT_FILE = \"$env:USERPROFILE\\ca-bundle.pem\"",
+    ),
+    "Linux": (
+        "cat \"$(python -c 'import certifi; print(certifi.where())')\""
+        " /etc/ssl/certs/ca-certificates.crt > ~/ca-bundle.pem",
+        "export REQUESTS_CA_BUNDLE=~/ca-bundle.pem SSL_CERT_FILE=~/ca-bundle.pem",
+    ),
+}
+
+
+def is_certificate_failure(record: Dict[str, object]) -> bool:
+    """Whether a failure was TLS verification rather than anything else."""
+    if record.get("status") != "failed":
+        return False
+    reason = str(record.get("reason") or "").lower()
+    return any(mark in reason for mark in
+               ("certificate", "ssl", "self-signed", "self signed"))
+
+
 def report_certificate_advice() -> None:
-    """Say what to do about the corporate-proxy failure, which is the usual one."""
+    """Say what to do about the corporate-proxy failure, which is the usual one.
+
+    Printed for the platform this is running on. The easy remedy comes first,
+    because the manual one is fiddly and has to be redone on every machine.
+    """
     print()
-    print("  A network that re-signs HTTPS will refuse these downloads with a")
-    print("  certificate error. Point Python at a bundle holding the proxy's root:")
+    print("  This network re-signs HTTPS with a certificate of its own, and")
+    print("  Python does not trust it. Your browser does, because it reads the")
+    print("  system certificate store and Python does not.")
     print()
-    print("    security find-certificate -a -p /Library/Keychains/System.keychain "
-          "> ~/roots.pem")
-    print("    cat \"$(python -c 'import certifi; print(certifi.where())')\" "
-          "~/roots.pem > ~/ca-bundle.pem")
-    print("    export REQUESTS_CA_BUNDLE=~/ca-bundle.pem SSL_CERT_FILE=~/ca-bundle.pem")
+    print("  The simple fix is to let Python read that store too:")
     print()
-    print("  Then run this script again. If the network blocks the hub outright,")
-    print("  run it on a machine that can reach it with --bundle, and copy the")
-    print("  archive across.")
+    print("    pip install truststore")
+    print()
+    print("  If pip fails the same way, allow it through for that one install:")
+    print()
+    print("    pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org"
+          " truststore")
+    print()
+    print("  Nothing else to configure. Every agent picks it up on the next run.")
+
+    steps = _CERTIFICATE_STEPS.get(platform.system())
+    if steps:
+        print()
+        print(f"  Failing that, export the root by hand ({platform.system()}):")
+        print()
+        for line in steps:
+            print(f"    {line}")
+
+    print()
+    print("  If the network blocks the hub outright rather than re-signing it,")
+    print("  no certificate will help. Run this on a machine that can reach the")
+    print("  hub with --bundle and copy the archive across; the models are not")
+    print("  in the repository, so git will not bring them.")
 
 
 def check_packages() -> List[str]:
@@ -397,6 +462,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     print(f"  Cache                : {root}")
+    trust = use_system_trust_store()
+    if trust:
+        print(f"  Verifying TLS with   : {trust}")
     print(f"  Sentence embedder    : "
           f"{'skipped' if args.no_embedder else EMBEDDING_MODEL}")
     print(f"  Translators          : "
@@ -409,7 +477,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print()
 
     started = time.time()
-    results = [fetch(name, root, loader, args.check) for name, loader in repositories]
+    results: List[Dict[str, object]] = []
+    for name, loader in repositories:
+        results.append(fetch(name, root, loader, args.check))
+        if is_certificate_failure(results[-1]):
+            # No point working through the remaining six. The hub library retries
+            # five times per file before giving up, so carrying on means many
+            # minutes of identical failures before anyone is told the cause -
+            # which is exactly how this was first met.
+            LOGGER.error("Stopping: this is a certificate problem, and it will "
+                         "affect every remaining model the same way.")
+            for remaining, _ in repositories[len(results):]:
+                results.append({"repository": remaining, "status": "missing",
+                                "bytes": 0, "seconds": 0.0})
+            break
     elapsed = time.time() - started
 
     fetched = [r for r in results if r["status"] == "fetched"]

@@ -56,6 +56,40 @@ def prepare_hub_environment() -> None:
     """
     for name, value in _HUB_ENV.items():
         os.environ.setdefault(name, value)
+    # Before anything opens a connection, so the first model download is
+    # verified the same way as every one after it.
+    use_system_trust_store()
+
+
+def use_system_trust_store() -> Optional[str]:
+    """Verify TLS against the operating system's certificates, if we can.
+
+    Corporate networks re-sign HTTPS with a root of their own, and Python does
+    not look in the place that root is installed: it trusts certifi's bundle,
+    which knows nothing about it. So the browser reaches the model hub and this
+    does not, failing with "self-signed certificate in certificate chain".
+
+    The usual remedy is to export the root by hand, concatenate it onto
+    certifi's bundle and set two environment variables - platform-specific
+    surgery that has to be repeated on every machine. truststore avoids all of
+    it by verifying against the system store, which is where the corporate root
+    already is, and is why the browser was fine.
+
+    Optional on purpose. Where it is not installed nothing changes and the
+    certifi behaviour applies, so a machine on an ordinary network needs
+    nothing. Returns the backend in use, for a caller that wants to say so.
+    """
+    try:
+        import truststore
+    except ImportError:
+        return None
+    try:
+        truststore.inject_into_ssl()
+    except Exception:
+        # Never worth failing a run over: the standard verification still works
+        # everywhere the corporate root is not in the way.
+        return None
+    return "the operating system trust store"
 
 
 def quiet_third_party_loggers() -> None:
