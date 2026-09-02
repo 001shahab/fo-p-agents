@@ -1005,8 +1005,17 @@ twenty-five row sample.
 
 About three hundred thousand catalogue items are described in Finnish, Swedish,
 German or Polish, and each has to be in English before it can be compared with
-anything. That is roughly an hour of local translation, and it used to be an hour
-on every run, producing the same strings from the same catalogue.
+anything. Measured on the 845,428-item master, that is not the hour a short
+benchmark suggests but nearly five, and it used to be paid on every run,
+producing the same strings from the same catalogue:
+
+| Language | Items | Time |
+| --- | --- | --- |
+| German | 108,756 | 1h 34m |
+| Swedish | 116,740 | 2h 16m |
+| Finnish | 70,101 | 47m |
+| Polish | 5,960 | 3m |
+| then embedding all 845,428 | | 7m |
 
 Those translations are now kept in `cache/agent3_translation_cache.json` and
 reused, so a second run over an unchanged catalogue skips the hour and does not
@@ -1022,10 +1031,25 @@ the model would produce again. `--no-translation-cache` renders from scratch,
 which is worth doing only to prove that.
 
 One consequence worth knowing: Agent 3 got slower before it got faster. When the
-translator would not load, this stage was skipped in silence and the run took
-about twenty minutes, comparing Finnish catalogue text against English purchase
-text and scoring nonsense. A first run now takes about an hour and twenty
-minutes, and every run after it is back to about twenty.
+translator would not load, this stage was skipped in silence and the whole agent
+took nineteen minutes, comparing Finnish catalogue text against English purchase
+text and scoring nonsense. A first run now takes about 4h 50m. Every run after it
+is back to about twenty minutes, because the translations are read rather than
+recomputed.
+
+Those long passes now report where they have got to every minute:
+
+```
+14:31:02  INFO    Translating 116740 reference description(s) from sv.
+14:32:03  INFO      sv: 3488 of 116740 translated, about 2h 12m remaining
+```
+
+That is not cosmetic. Both runners treat a silent agent as a hung one, and
+`max.py` kills one that has said nothing for two hours. Swedish alone took 2h 16m
+in silence, so Max would have killed Agent 3 part way through rendering the
+catalogue — and because Agents 2 and 3 read what comes before them, that is how a
+single silence loses all fifty-six enrichment columns. The progress line keeps
+the agent audibly alive as well as telling you when it will finish.
 
 Read that 0.630 as a property of one run rather than of the data. Scores depend
 on what text was compared, and therefore on whether the translation tier was
@@ -1428,6 +1452,14 @@ process each distinct description once and apply the result to every row that
 carries it. Agent 4 aggregates lines into portfolios and never touches a line
 again.
 
+**Budget Agent 3's first run separately.** Its cost is dominated by the catalogue
+rather than by the purchase lines: rendering the 845,428-item master into English
+takes about 4h 40m however many rows are being matched, and the same run over
+twenty-five lines and over a million takes almost the same time. That is paid
+once and then read from `cache/agent3_translation_cache.json`, so plan the first
+run around it and expect roughly twenty minutes afterwards. See [translating the
+catalogue, once](#translating-the-catalogue-once).
+
 **Watch the scope guards in Agent 4.** A scope holding thousands of suppliers is
 usually too broad to give a useful answer, and the comparison cost grows with
 the square of that number. Scopes above `--max-scope-suppliers` (default 5000)
@@ -1650,10 +1682,11 @@ no longer use that path on, so reinstall from `requirements.txt`.
 **A run has been silent for hours** — check the last line before the silence. If
 it is `Sending N unresolved phrase(s)` with N in the hundreds of thousands, the
 local translators did not load and the paid tier is doing their work; the run now
-warns about this and prints progress with an estimate once a minute. Neither
-`all_agents.py` nor `max.py` will kill it, so it is safe to stop it yourself —
-but note that Agent 1 writes its translation cache only when it finishes, so
-stopping discards what has been paid for so far.
+warns about this and prints progress with an estimate once a minute.
+`all_agents.py` will not kill it, but `max.py` stops an agent that has said
+nothing for two hours, so a genuinely silent stretch is not safe there. Stopping
+it yourself is safe — but note that Agent 1 writes its translation cache only
+when it finishes, so stopping discards what has been paid for so far.
 
 **Mangled characters in the output** — the source file was exported through the
 wrong code page. The agents repair the common double-encoding damage
@@ -1686,18 +1719,21 @@ agent and why; the usual cause is an agent killed by `--agent-timeout`. Leave
 that off and let it finish. Nothing is lost by rerunning: the agents that did
 complete are reused.
 
-**A runner appears to have hung** (Agent 3) — Agent 3 embeds all 845,428
-catalogue items before it matches anything, which takes a quarter of an hour and
-prints nothing while it works. The runner prints a heartbeat so that silence can
-be told apart from a stall:
+**A runner appears to have hung** (Agent 3) — on its first run against the full
+master, Agent 3 spends about 4h 40m rendering the catalogue into English and then
+seven minutes embedding all 845,428 items. Both report progress, and the runner
+prints a heartbeat besides, so silence can be told apart from a stall:
 
 ```
-  [Agent 3] 21:39:53  INFO    Embedding 845428 reference item(s) ...
+  [Agent 3] 14:32:03  INFO      sv: 3488 of 116740 translated, about 2h 12m remaining
   [Agent 3] still working, 14m 13s elapsed, quiet for 60s
 ```
 
 An agent that has genuinely said nothing for two hours is treated as hung and
-stopped.
+stopped by `max.py`. This used to be reachable in normal operation: before the
+per-minute progress line existed, rendering Swedish alone took 2h 16m without
+printing anything, and Max would have killed Agent 3 in the middle of it. If you
+ever do need to allow a longer silence, it is `--agent-silence-timeout`.
 
 **A rerun finished suspiciously fast** — the agents were reused rather than run,
 because their inputs and settings were unchanged. The summary marks each one

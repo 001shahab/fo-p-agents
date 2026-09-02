@@ -87,6 +87,7 @@ import os
 import re
 import statistics
 import sys
+import time
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -102,7 +103,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent3")
 
 AGENT_NAME = "Agent 3 - AI Material and Service Standardisation"
-AGENT_VERSION = "1.6.0"
+AGENT_VERSION = "1.6.1"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -572,6 +573,26 @@ class Lexicon:
         return _WHITESPACE.sub(" ", " ".join(rendered)).strip(), coverage
 
 
+def human_seconds(seconds: float) -> str:
+    """A duration in the units a reader thinks in."""
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    minutes, rest = divmod(int(seconds), 60)
+    if minutes < 90:
+        return f"{minutes}m {rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+# How often a long translation pass says where it has got to. Not cosmetic: the
+# runners treat a silent agent as a hung one and kill it after two hours, and
+# rendering one language of a full catalogue takes longer than that. A real run
+# spent 2h 15m on Swedish alone without printing a line, which max.py would have
+# killed - and because Agents 2 and 3 read what comes before them, that is how
+# one silence loses fifty-six columns.
+TRANSLATION_PROGRESS_SECONDS = 60
+
+
 class TranslationCache:
     """Remembers offline translations, so a catalogue is rendered once.
 
@@ -783,6 +804,7 @@ class NeuralTranslator:
         if translator is None:
             return results  # whatever the cache held is still worth returning
 
+        started = announced = time.time()
         for start in range(0, len(outstanding), self.WINDOW):
             window = outstanding[start:start + self.WINDOW]
             try:
@@ -797,6 +819,14 @@ class NeuralTranslator:
                     self.translated_count += 1
                     if self.cache is not None:
                         self.cache.put(name, source_text, translated)
+
+            if time.time() - announced >= TRANSLATION_PROGRESS_SECONDS:
+                announced = time.time()
+                done = min(start + self.WINDOW, len(outstanding))
+                rate = done / max(0.001, announced - started)
+                left = (len(outstanding) - done) / rate if rate else 0.0
+                LOGGER.info("  %s: %d of %d translated, about %s remaining",
+                            language, done, len(outstanding), human_seconds(left))
         return results
 
 
