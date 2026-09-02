@@ -935,11 +935,36 @@ and a large number there means detail was discarded, not generalised.
 Granularity is set by `--threshold` instead, the clustering distance at which two
 descriptions are treated as the same purchase. The default 0.35 is deliberately
 fine, which is why a 4,546-line extract can produce over a thousand groups — about
-four lines each, close to the description level. Raising it to 0.45 or 0.55 merges
-neighbouring descriptions and yields genuinely broader categories; that is the
-lever to pull if the L5 names read as too specific, and it is worth setting from a
-representative extract before a full run rather than relying on the ceiling to
-tidy up afterwards.
+four lines each, close to the description level. Raising it merges neighbouring
+descriptions, so it is the lever to pull if the L5 names read as too specific.
+
+It is a gentler lever than it looks. Swept across the 4,546-line extract:
+
+| `--threshold` | Groups | Lines per group | Singletons |
+|---|---|---|---|
+| 0.25 | 1,084 | 4.2 | 529 |
+| 0.35 (default) | 997 | 4.6 | 456 |
+| 0.45 | 908 | 5.0 | 388 |
+| 0.55 | 778 | 5.8 | 297 |
+| 0.65 | 613 | 7.4 | 240 |
+
+Nearly doubling the distance only cuts the group count by 43%, and even at 0.65
+there are 613 names for 4,546 lines. Expecting the threshold alone to turn
+description-level detail into a browsable category tree will disappoint; it moves
+the result meaningfully but not by an order of magnitude.
+
+Two caveats on reading that table, both of which argue for measuring again before
+committing to a number. It was produced by feeding the raw `Document line desc`
+straight in as the enriched column, to sweep five thresholds without paying for
+five Agent 1 passes — and Agent 1's enrichment is not cosmetic. On raw text, 81%
+of the resulting group names contain the supplier's own name, because the raw
+description embeds supplier, contract id and often an individual contractor;
+through the real chain the same lines produce `Displayport male hdmi female
+adapter` and `Freight purchase` instead. The counts above therefore describe the
+shape of the lever rather than the numbers a real run will show. Second, the
+extract is 85% IT and indirect services, which fragments differently from
+materials. Sweep on a real Agent 1 output over representative spend before fixing
+the threshold for a full run.
 
 Useful options:
 
@@ -1114,6 +1139,24 @@ Why there was no match is still reported, in `No_Match_Reason`, which is a colum
 of its own precisely so that nothing in the matched set has to be populated to
 carry it.
 
+That rule keeps the file honest but leaves a nil result hard to interpret, since a
+line that just missed and a line with nothing remotely comparable look identical.
+Three further columns close that gap without touching the matched set:
+
+| Column | Meaning |
+| --- | --- |
+| `Closest_Considered_Score` | the highest score reached by any item examined, accepted or not |
+| `Closest_Considered_Item_ID` | which catalogue item that was |
+| `Closest_Considered_Description` | how that item is described |
+
+They are filled for every row that was looked up, so a blank `Similarity_Score`
+beside a `Closest_Considered_Score` of 0.62 says the threshold decided it, while
+0.11 says the catalogue does not stock the thing. Being named `Closest_Considered_*`
+rather than `Matched_*` and sitting outside `MATCHED_COLUMNS`, they cannot be read
+as a proposed match, and they are reported below the reporting threshold too — a
+line whose best was 0.35 has no candidate at all yet still shows how far off it
+was.
+
 ### Thresholds
 
 The plan leaves the similarity threshold to be defined and tested. The defaults
@@ -1174,11 +1217,12 @@ independently, so a larger extract raises the number of matches only in
 proportion to how much of it the catalogue actually covers — it does not make any
 single line match better.
 
-One caveat when reading the row-level output: `Similarity_Score` is written only
-for accepted matches, so a near miss and a line with no comparable item both
-arrive blank, distinguished only by `No_Match_Reason` (`best candidate below the
-reporting threshold` against `no comparable standard item found`). The
-calibration file, not the merged table, is where the score distribution lives.
+Read `Closest_Considered_Score` to tell the two apart per row: it carries the best
+score reached whether or not the match was accepted, so the distinction is visible
+in the merged table rather than only in the calibration file. On the sample extract
+one line came within 0.45 of a desk it plausibly matched while the rest sat between
+0.10 and 0.28, which is the difference between a threshold to argue about and a
+catalogue that does not stock the item.
 
 ### Translating the catalogue, once
 

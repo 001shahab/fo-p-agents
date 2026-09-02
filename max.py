@@ -233,7 +233,8 @@ AGENT3_REQUIRED: Tuple[str, ...] = (
     "Matched_Item_Source", "Matched_Item_Unit_Price", "Similarity_Score",
     "Match_Band", "Match_Method", "Match_Rationale", "Type_Compatible",
     "Specification_Agreement", "Price_Difference_Percent", "Alternative_Matches",
-    "No_Match_Reason", "Agent3_Run_Id",
+    "No_Match_Reason", "Closest_Considered_Score", "Closest_Considered_Item_ID",
+    "Closest_Considered_Description", "Agent3_Run_Id",
 )
 
 # Columns produced by both Max's own stage 3 and by Agent 1. The agent's reading

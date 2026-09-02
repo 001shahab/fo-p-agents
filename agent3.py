@@ -103,7 +103,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent3")
 
 AGENT_NAME = "Agent 3 - AI Material and Service Standardisation"
-AGENT_VERSION = "1.6.1"
+AGENT_VERSION = "1.7.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -2058,6 +2058,10 @@ class MatchEngine:
         self._lexical_vectoriser: Optional[Any] = None
         self._lexical_matrix: Optional[Any] = None
 
+        # The best item considered for each description, keyed the same way as
+        # the accepted matches, so a nil result can still say how close it came.
+        self.closest_considered: Dict[str, Tuple[float, "ReferenceItem"]] = {}
+
     # -- index construction -------------------------------------------------
 
     def build(self) -> None:
@@ -2180,6 +2184,11 @@ class MatchEngine:
         if len(compact_key(item_number)) >= 4:
             purchase_codes.add(compact_key(item_number))
 
+        # The closest thing considered, whatever became of it. Kept separately
+        # from the candidates because the report threshold discards most of them,
+        # and a line whose best was 0.62 is a different finding from a line whose
+        # best was 0.11 - a nil result cannot be read without knowing which.
+        closest: Optional[Tuple[float, ReferenceItem]] = None
         candidates: List[MatchCandidate] = []
         for index, semantic, lexical in self._retrieve(description, item_number):
             item = self.library.items[index]
@@ -2227,6 +2236,10 @@ class MatchEngine:
                 score = min(1.0, score + 0.05)
                 reasons.append("matching specification")
 
+            settled = round(min(1.0, max(0.0, score)), 4)
+            if closest is None or settled > closest[0]:
+                closest = (settled, item)
+
             if score < self.settings.report_threshold:
                 continue
 
@@ -2240,6 +2253,9 @@ class MatchEngine:
                 spec_agreement=spec_agreement, method=method,
                 rationale="; ".join(reasons),
             ))
+
+        if closest is not None:
+            self.closest_considered[lookup_key(description)] = closest
 
         candidates.sort(key=lambda candidate: (-candidate.score, candidate.item.item_id))
         return candidates[: self.settings.top_k]
@@ -2660,7 +2676,8 @@ class Agent3:
             "Similarity_Score", "AI_Confidence", "Match_Band", "Match_Method",
             "Match_Rationale", "Type_Compatible", "Specification_Agreement",
             "Price_Difference_Percent", "Alternative_Matches", "No_Match_Reason",
-            "Agent3_Run_Id",
+            "Closest_Considered_Score", "Closest_Considered_Item_ID",
+            "Closest_Considered_Description", "Agent3_Run_Id",
         ]
         headers = list(self.table.headers) + [name for name in appended
                                               if name not in self.table.headers]
@@ -2708,11 +2725,17 @@ class Agent3:
                         # column that would then read as a match after all.
                         for column in MATCHED_COLUMNS:
                             output[column] = ""
-                        output["No_Match_Reason"] = (
-                            "already a standard catalogue purchase"
-                            if standard == "Y" else
-                            "best candidate below the reporting threshold" if best
-                            else "no comparable standard item found")
+                        if standard == "Y":
+                            output["No_Match_Reason"] = "already a standard catalogue purchase"
+                        elif best is not None:
+                            # It cleared the reporting threshold to be considered
+                            # at all, so naming that one as the obstacle - which
+                            # this did - pointed at the wrong setting.
+                            output["No_Match_Reason"] = (
+                                f"best candidate scored {best.score:.2f}, below the "
+                                f"accept threshold of {self.settings.medium_threshold:.2f}")
+                        else:
+                            output["No_Match_Reason"] = "no comparable standard item found"
                     else:
                         output["No_Match_Reason"] = ""
                         confidence = self._confidence(best)
@@ -2741,6 +2764,24 @@ class Agent3:
                                 f"{candidate.item.item_id}:{candidate.score:.2f}"
                                 for candidate in candidates[1:]),
                         })
+
+                    # Reported for every row that was actually looked up, match or
+                    # not, and named so it cannot be mistaken for one: a blank
+                    # Similarity_Score beside a Closest_Considered_Score of 0.62
+                    # is a threshold to review, while 0.11 is a catalogue that
+                    # does not stock the thing. Deliberately outside
+                    # MATCHED_COLUMNS, which Fortum asked be blank on a non-match.
+                    closest = (self.engine.closest_considered.get(lookup_key(description))
+                               if description and standard != "Y" else None)
+                    if closest is not None:
+                        score, item = closest
+                        output["Closest_Considered_Score"] = round(score, 4)
+                        output["Closest_Considered_Item_ID"] = item.item_id
+                        output["Closest_Considered_Description"] = item.description
+                    else:
+                        output["Closest_Considered_Score"] = ""
+                        output["Closest_Considered_Item_ID"] = ""
+                        output["Closest_Considered_Description"] = ""
 
                     if best is not None:
                         best_scores.append(best.score)
