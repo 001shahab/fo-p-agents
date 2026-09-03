@@ -938,33 +938,47 @@ fine, which is why a 4,546-line extract can produce over a thousand groups — a
 four lines each, close to the description level. Raising it merges neighbouring
 descriptions, so it is the lever to pull if the L5 names read as too specific.
 
-It is a gentler lever than it looks. Swept across the 4,546-line extract:
+It is a gentler lever than it looks. Swept across the 4,546-line extract, on a real
+Agent 1 pass with the model tier enabled:
 
-| `--threshold` | Groups | Lines per group | Singletons |
-|---|---|---|---|
-| 0.25 | 1,084 | 4.2 | 529 |
-| 0.35 (default) | 997 | 4.6 | 456 |
-| 0.45 | 908 | 5.0 | 388 |
-| 0.55 | 778 | 5.8 | 297 |
-| 0.65 | 613 | 7.4 | 240 |
+| `--threshold` | Groups | Lines per group | Singletons | In `Other` |
+|---|---|---|---|---|
+| 0.25 | 1,208 | 3.8 | 707 | 421 |
+| 0.35 (default) | 1,088 | 4.2 | 600 | 421 |
+| 0.45 | 966 | 4.7 | 498 | 421 |
+| 0.55 | 842 | 5.4 | 380 | 421 |
+| 0.65 | 626 | 7.3 | 270 | 893 |
 
-Nearly doubling the distance only cuts the group count by 43%, and even at 0.65
-there are 613 names for 4,546 lines. Expecting the threshold alone to turn
-description-level detail into a browsable category tree will disappoint; it moves
-the result meaningfully but not by an order of magnitude.
+Nearly tripling the distance only halves the group count, and even at 0.65 there
+are 626 names for 4,546 lines. The threshold alone will not turn
+description-level detail into a browsable category tree.
 
-Two caveats on reading that table, both of which argue for measuring again before
-committing to a number. It was produced by feeding the raw `Document line desc`
-straight in as the enriched column, to sweep five thresholds without paying for
-five Agent 1 passes — and Agent 1's enrichment is not cosmetic. On raw text, 81%
-of the resulting group names contain the supplier's own name, because the raw
-description embeds supplier, contract id and often an individual contractor;
-through the real chain the same lines produce `Displayport male hdmi female
-adapter` and `Freight purchase` instead. The counts above therefore describe the
-shape of the lever rather than the numbers a real run will show. Second, the
-extract is 85% IT and indirect services, which fragments differently from
-materials. Sweep on a real Agent 1 output over representative spend before fixing
-the threshold for a full run.
+The reason it cannot is visible in the names it produces. At the default, 60% of
+the 1,088 names contain the supplier's own name, covering 66% of lines —
+`Device accessory purchase telia finland`, `Dataverse purchase capacity crayon
+under`, `Office cleaning service carry koloryt`. Agent 1's enrichment writes a
+faithful sentence, and a faithful sentence names who supplied the thing, so the
+supplier reaches the signature and splits one purchase type across as many groups
+as it has vendors. The enrichment's connecting verbs do the same on a smaller
+scale: `purchase`, `carry`, `provide`, `supply` and `under` all survive into
+labels and separate otherwise identical lines by phrasing. Amazon web services
+lands in three groups at once — `Amazon web service purchase capacity` (35 lines),
+`Aws capacity service purchase amazon` (22) and `Amazon web service capacity
+purchase` (15) — and scaffolding and insulation each split two ways on word order
+alone.
+
+So a group count near the line count is mostly a signature problem rather than a
+distance problem, and raising `--threshold` treats the symptom. The bigger gain
+would come from dropping the supplier name — which arrives in its own column and
+need not be inferred — and the enrichment's filler verbs before the signature is
+taken. Until that is done, expect roughly a thousand L5 names per five thousand
+lines whatever the threshold, and read the ceiling accordingly: at this
+granularity a full extract reaches 6000 names quickly, and everything past it is
+folded into `Other` rather than generalised.
+
+One caveat on the numbers above: the extract is 85% IT and indirect services,
+which fragments differently from materials, so sweep again on representative spend
+before fixing a threshold for a full run.
 
 Useful options:
 
@@ -1166,13 +1180,29 @@ and `--minimum-threshold 0.50`. Every run writes
 be accepted at every cut-off from 0.20 to 1.00. Set the thresholds from that
 file rather than from the defaults.
 
-The sample extract is worth reading as a warning about how to read a nil result.
-Against the full 845,428-item master it returns no matches at all — but its best
-candidate scored 0.630 against an accept threshold of 0.65. That is a threshold
-question, not an absence of matches, and the run says so instead of reporting
-nought as a finding. Where the accept threshold should sit is a decision for
-Fortum to take against the calibration file on a full extract, not from a
-twenty-five row sample.
+The defaults have since been shown to work, which is worth recording because the
+opposite was believed for a while. Run against the full 845,428-item master with
+the catalogue translated, the twenty-five line sample accepts 2 matches at 0.65
+and reaches a top score of 0.703:
+
+| | p10 | p25 | p50 | p75 | p90 | max |
+|---|---|---|---|---|---|---|
+| Best-match score | 0.519 | 0.519 | 0.549 | 0.636 | 0.679 | 0.703 |
+
+Earlier the same sample matched nothing and topped out at 0.630, which read as an
+accept threshold set slightly too high. It was not. That run loaded the correct
+master, but every translation model failed to load under `transformers` 5.x, so
+301,557 catalogue descriptions stayed in Finnish, Swedish, German and Polish while
+being compared against English purchase text. Nothing could score well, and the
+agent reported a nil result rather than a broken one.
+
+With the loader fixed and the catalogue translated, the same sample and the same
+threshold accept matches. So 0.65 is not the obstacle it appeared to be, and the
+lesson is to check the run before the setting: confirm the reference file and item
+count in the summary, and confirm the translation tier loaded, before drawing any
+conclusion about the threshold. Where it should finally sit is still Fortum's
+decision, taken against the calibration file on a representative extract rather
+than a twenty-five line sample.
 
 ### Reading a nil result: is it the threshold, or the catalogue?
 
@@ -1207,10 +1237,18 @@ So a nil result is worth explaining before it is corrected:
 - **The extract is out of the catalogue's domain.** Nothing to fix. Expect a low
   match rate on IT and services spend however the threshold is set, and judge the
   agent on materials lines instead.
+- **The catalogue was never translated.** The likeliest cause, and invisible in the
+  output. Two thirds of the master is Finnish, Swedish, German or Polish; if the
+  translation tier fails to load, that text is matched against English and scores
+  far too low. The run logs `Translation model ... unavailable` and carries on. This
+  is what produced the first nil result on the full master.
+- **A stale or partial catalogue was loaded.** Check the reference file named in the
+  run summary and its item count. The 4,200-item copies under `catalogues/` and
+  `feedback/` cost 99.5% of the items a line could have matched.
 - **The threshold is above the score distribution.** Read
-  `agent3_match_calibration.csv`. On the twenty-five row sample three of five
-  scored lines clear 0.60 and none clear 0.65, so the accept threshold alone
-  decided the outcome.
+  `agent3_match_calibration.csv`, which gives the accepted share at every cut-off.
+  Consider this last, and only once the two above are ruled out — it was blamed
+  first and was not the cause.
 
 More lines do not help either way. Each line is scored against all 845,428 items
 independently, so a larger extract raises the number of matches only in
@@ -1219,10 +1257,10 @@ single line match better.
 
 Read `Closest_Considered_Score` to tell the two apart per row: it carries the best
 score reached whether or not the match was accepted, so the distinction is visible
-in the merged table rather than only in the calibration file. On the sample extract
-one line came within 0.45 of a desk it plausibly matched while the rest sat between
-0.10 and 0.28, which is the difference between a threshold to argue about and a
-catalogue that does not stock the item.
+in the merged table rather than only in the calibration file. Against the stale
+4,200-item copy one sample line came within 0.45 of a desk it plausibly matched
+while the rest sat between 0.10 and 0.28 — the difference between a threshold worth
+arguing about and a catalogue that does not stock the item.
 
 ### Translating the catalogue, once
 
@@ -1274,14 +1312,18 @@ catalogue — and because Agents 2 and 3 read what comes before them, that is ho
 single silence loses all fifty-six enrichment columns. The progress line keeps
 the agent audibly alive as well as telling you when it will finish.
 
-Read that 0.630 as a property of one run rather than of the data. Scores depend
-on what text was compared, and therefore on whether the translation tier was
-working: the same sample against the same master scored 0.703 and accepted three
-matches on a run where nothing translated the catalogue, because it was then
-comparing Finnish and Swedish against English. Cross-language scores are not
-meaningful, and neither is a threshold set from them. Confirm with
-`python fetch_models.py --check` that the translators are present before taking
-any calibration figure seriously.
+Read that 0.630 as a property of one run rather than of the data. Scores depend on
+what text was compared, and therefore on whether the translation tier was working.
+The same sample against the same master gives:
+
+| Catalogue | Top score | Matches at 0.65 |
+|---|---|---|
+| left in Finnish, Swedish, German and Polish | 0.630 | 0 |
+| translated to English | 0.703 | 2 |
+
+Cross-language scores are not meaningful, and neither is a threshold set from them.
+Confirm with `python fetch_models.py --check` that the translators are present
+before taking any calibration figure seriously.
 
 ### Output
 
