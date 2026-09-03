@@ -1236,6 +1236,29 @@ a separator followed by a long digit run, which leaves a hyphen inside a product
 name alone. If cleaning would leave nothing to match on, the original is kept, so
 a line described only by its supplier still gets whatever chance it had.
 
+Which words belong to a vendor is read off the extract rather than from a word
+list, because the list cannot settle it: *battery* is a word the vocabulary knows
+and Battery Ikaalinen is a supplier. A lone word is kept when the vocabulary
+claims it or when vendors *not* named after it also use it, counting only those,
+since one corporate group arrives under several legal entities. Two of the
+supplier's words in a row are removed regardless, because adjacency is the name
+itself — `Battery Ikaalinen OY` goes, while the lone `gas` in `industrial gas
+cylinders` stays out of it, the words not being adjacent there.
+
+Where nothing survives, the description said nothing about the purchase: `Boost AI
+BOOST AI AS/11860 - BOOST AI AS - 11860` is a vendor's name four times over. Such a
+line reports no text of its own and the next column is tried, ending at the
+enriched English sentence, which is a better thing to match on than a vendor. Left
+in, that line was answered with an analog input card called `AI531` at 0.769, on
+the strength of the letters A and I — which is also why the floor is two
+characters rather than three.
+
+The cost of reading it off the data is that a word only ever bought from the vendor
+named after it is treated as a name: on this extract nobody but Linde sells `gas`,
+so `industrial gas cylinders` is matched as `industrial cylinders`. In practice
+little is lost, since the Finnish and Swedish lines say `gasflaskor` and
+`nestekaasu` as single words, but it is a real trade and worth knowing about.
+
 One further exception to the original-first rule. The catalogue is compared in
 English, and when cleaning leaves a product named only in Finnish or Swedish —
 `hyra gas` — the enriched English sentence is the better text, because a

@@ -104,7 +104,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent3")
 
 AGENT_NAME = "Agent 3 - AI Material and Service Standardisation"
-AGENT_VERSION = "1.8.0"
+AGENT_VERSION = "1.8.1"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -1569,13 +1569,24 @@ class PurchaseTextCleaner:
     accepted above 0.83 before this existed.
 
     The supplier arrives in its own column, so removing it needs no inference.
-    The care is in not removing an ordinary word that happens to be in the name -
-    Linde *Gas* really does sell gas - so a token is dropped only where the
-    controlled vocabulary does not claim it as something one can buy.
+    The care is in not removing an ordinary word that happens to be in the name,
+    because Linde *Gas* really does sell gas. The extract itself decides that, and
+    it is better evidence than any word list: a word used by vendors *not* named
+    after it describes a thing, while a word seen only beside its owner is a name.
+    *gas* is bought from many vendors and survives; *battery* appears only on
+    Battery Ikaalinen's lines and does not, which is why the vocabulary cannot be
+    the judge - it lists *battery* as a thing one can buy, and on this data that is
+    beside the point. ``observe`` must therefore be called over every row before
+    anything is cleaned.
     """
+
+    # A word is treated as naming a purchase once this many suppliers who are not
+    # named after it have used it.
+    SHARED_SUPPLIER_MINIMUM = 2
 
     def __init__(self, lexicon: Lexicon) -> None:
         self.lexicon = lexicon
+        self._suppliers_by_token: Dict[str, Set[str]] = defaultdict(set)
         self._identity: Dict[str, FrozenSet[str]] = {}
         # Counted per distinct description rather than per call, because a row's
         # match text is resolved more than once in a run - once to collect the
@@ -1591,15 +1602,50 @@ class PurchaseTextCleaner:
                 return value
         return ""
 
+    def observe(self, description: str, supplier: str) -> None:
+        """Note which suppliers use a word, before any of them is removed."""
+        who = lookup_key(supplier)
+        if not who:
+            return
+        for token in tokenise(lookup_key(description)):
+            if len(token) > 1:
+                self._suppliers_by_token[token].add(who)
+
+    def _shared_across_suppliers(self, token: str) -> bool:
+        """Whether vendors not named after this word also use it.
+
+        Only those count. One corporate group arrives under several legal
+        entities, so Telia Finland and Telia Cygate between them would otherwise
+        make "telia" look like a word two different vendors use.
+        """
+        outsiders = 0
+        for who in self._suppliers_by_token.get(token, ()):
+            if token not in who.split():
+                outsiders += 1
+                if outsiders >= self.SHARED_SUPPLIER_MINIMUM:
+                    return True
+        return False
+
     def identity_tokens(self, supplier: str) -> FrozenSet[str]:
         """The words that name this supplier and nothing it sells."""
         key = lookup_key(supplier)
         if key in self._identity:
             return self._identity[key]
 
+        # Two letters is the floor, not three: "BOOST AI" is a chatbot vendor, and
+        # with "ai" left in it matched an analog input card called AI531 at 0.769.
+        # Single letters stay, being mostly the debris of "A/S" and "S.A.".
         tokens = set()
         for token in tokenise(key):
-            if len(token) < 3:
+            if len(token) < 2:
+                continue
+            # A word standing on its own is only the supplier's if nothing else
+            # claims it: neither the vocabulary, nor other vendors who are not
+            # named after it. Both protections are needed, because "battery" is
+            # a word the vocabulary knows *and* one that vendors not called
+            # Battery Ikaalinen use. Contiguous runs of the name are handled
+            # separately and are not subject to this.
+            if self._shared_across_suppliers(token):
                 continue
             if self.lexicon.names_a_purchase(token):
                 continue
@@ -1616,18 +1662,54 @@ class PurchaseTextCleaner:
         self._identity[key] = result
         return result
 
+    def _without_supplier_phrase(self, text: str, supplier: str) -> str:
+        """Remove runs of words that spell out the supplier's name.
+
+        Separate from the single-word rule, and not subject to its protections,
+        because two of the supplier's words in a row is the name itself rather
+        than a coincidence. "Battery Ikaalinen OY" goes even though *battery* is
+        a word other vendors use, while "Linde Gas" leaves the lone *gas* in
+        "industrial gas cylinders" alone - the words are not adjacent there, so
+        nothing says that *gas* came from the name.
+        """
+        name = [token for token in tokenise(lookup_key(supplier)) if len(token) > 1]
+        if len(name) < 2:
+            return text
+        wanted = set(name)
+
+        words = text.split()
+        keys = [lookup_key(word) for word in words]
+        keep = [True] * len(words)
+        start = 0
+        while start < len(words):
+            end = start
+            while end < len(words) and keys[end] in wanted:
+                end += 1
+            if end - start >= 2:
+                for position in range(start, end):
+                    keep[position] = False
+                start = end
+            else:
+                start += 1
+        return " ".join(word for word, wanted_here in zip(words, keep) if wanted_here)
+
     def clean(self, description: str, supplier: str) -> str:
         """The description with the supplier and the paperwork taken out.
 
-        The original is returned whenever cleaning would leave nothing to match
-        on, so a line described only by its supplier and a reference still gets
-        whatever chance it had rather than silently becoming unmatchable.
+        An empty string is returned when nothing survives, which says the line
+        has no purchase text of its own - "Boost AI BOOST AI AS/11860 - BOOST AI
+        AS - 11860" describes no purchase at all. The caller then moves on to the
+        next description column, and to the enriched English sentence in the end,
+        which is a far better thing to match on than a vendor's name. Keeping the
+        original here instead is what had that line answered with an analog input
+        card called AI531, on the strength of the letters A and I.
         """
         if not description:
-            return description
+            return ""
 
         text = REFERENCE_TAIL.sub(" ", description)
         text = BARE_REFERENCE.sub(" ", text)
+        text = self._without_supplier_phrase(text, supplier)
 
         identity = self.identity_tokens(supplier)
         if identity:
@@ -1636,11 +1718,11 @@ class PurchaseTextCleaner:
 
         text = " ".join(text.replace("/", " ").split())
         if not text or not any(character.isalpha() for character in text):
-            return description
+            return ""
         # Nothing but codes left is nothing to compare: a match found on a bare
         # part number alone is the code path's business, not the text's.
         if not any(not is_code_token(token) for token in tokenise(lookup_key(text))):
-            return description
+            return ""
 
         removed = len(description.split()) - len(text.split())
         if removed > 0:
@@ -2606,6 +2688,13 @@ class Agent3:
         # carried alongside the text. Derived from the text it would be wrong
         # exactly where it matters: "hyra gas" names a service in a language the
         # English marker list does not cover.
+        # Which words belong to vendors and which to purchases is read off the
+        # extract, so every row is seen before any of them is cleaned.
+        for row in self.table.rows:
+            supplier = self.cleaner.supplier_of(row)
+            for column in MATCH_TEXT_COLUMNS:
+                self.cleaner.observe(normalise_text(row.get(column, "")), supplier)
+
         distinct: Dict[str, Tuple[str, str]] = {}
         for row in self.table.rows:
             description, _ = self.match_text(row)
