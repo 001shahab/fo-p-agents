@@ -1208,6 +1208,57 @@ happens to carry. `Potential_Standard_Match` then takes one of three values:
 five `Matched_*` fields, both scores, the band, the method, the rationale, the
 compatibility and specification verdicts, the price difference and the
 alternatives — so the file cannot be read as proposing a match it did not make.
+### What the line is matched on
+
+Fortum asked that a match be made against the original ERP description rather
+than the enriched English sentence, because the original names the specific
+product a catalogue entry has to be recognised as. It is preferred, but it is
+cleaned first, because the original is not only the purchase:
+
+```
+DJE hyra gas LINDE GAS AB/6513423814 - LINDE GAS AB - 6513423814
+```
+
+Two words there are the purchase — gas rental. The rest is the supplier's name
+three times and a document number twice. Matched as it stood, the similarity was
+carried by `LINDE GAS AB`, so every catalogue item containing *gas* scored highly:
+a welding gas nozzle at 0.883, a dust bag for a *Bosch GAS 35/55* at 0.838, and a
+bicycle inner tube, `Sisärengas`, at 0.842 — that last one matching on the letters
+g-a-s inside a Finnish word, since the lexical view is character n-grams. On a
+4,546-line extract all 71 accepted matches were reached this way and essentially
+all of them were wrong.
+
+The supplier arrives in its own column, so removing it needs no inference. The
+care is in not removing an ordinary word that happens to be in the name, since
+Linde *Gas* does sell gas, so a word is dropped only where the vocabulary does not
+claim it as something one can buy. The document tail is removed on the pattern of
+a separator followed by a long digit run, which leaves a hyphen inside a product
+name alone. If cleaning would leave nothing to match on, the original is kept, so
+a line described only by its supplier still gets whatever chance it had.
+
+One further exception to the original-first rule. The catalogue is compared in
+English, and when cleaning leaves a product named only in Finnish or Swedish —
+`hyra gas` — the enriched English sentence is the better text, because a
+comparison across two languages is not a comparison. `Match_Source_Column` reports
+which text was used, so the choice is visible on every row.
+
+### Services are not answered with articles
+
+A stocked article is not a substitute for an activity, whatever words the two
+share. That was being checked by inferring the type from both descriptions, and
+the inference failed in exactly the case that mattered: head detection is
+English-only, found no head in `KAASUSUUTIN`, and an undetermined head is treated
+as nothing to disagree about. The result was that 55 of those 71 accepted matches
+were services answered with articles — a gas *rental* met with a welding nozzle —
+and every one of them was marked `Type_Compatible = Yes`.
+
+The check now uses Agent 1's `Item_Or_Service` verdict, which is stated on the row
+rather than guessed from text a marker list does not cover. A stated disagreement
+costs the pair the usual type-mismatch penalty of 0.55, which takes the worst of
+those matches from 0.883 to 0.486 and so below the 0.65 accept threshold.
+`Unclear` rules nothing out, and an item naming no activity is treated as an
+article, which is what an item catalogue almost entirely consists of.
+
 Why there was no match is still reported, in `No_Match_Reason`, which is a column
 of its own precisely so that nothing in the matched set has to be populated to
 carry it.

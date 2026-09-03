@@ -92,7 +92,8 @@ import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import (Any, Dict, FrozenSet, Iterable, List, Optional, Sequence,
+                    Set, Tuple)
 
 from runtime import (
     DEFAULT_AZURE_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT,
@@ -103,7 +104,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent3")
 
 AGENT_NAME = "Agent 3 - AI Material and Service Standardisation"
-AGENT_VERSION = "1.7.0"
+AGENT_VERSION = "1.8.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -506,6 +507,17 @@ class Lexicon:
         self.noise_terms: Set[str] = {lookup_key(t) for t in payload.get("noise_terms", [])}
         self.unit_terms: Dict[str, str] = {lookup_key(k): v
                                            for k, v in (payload.get("unit_terms") or {}).items()}
+        # Needed to take a supplier's name out of a purchase description without
+        # taking the purchase with it. See PurchaseTextCleaner.
+        self.legal_forms: Set[str] = {lookup_key(t) for t in payload.get("legal_forms", [])}
+        self.geographic_qualifiers: Set[str] = {
+            lookup_key(t) for t in payload.get("geographic_qualifiers", [])}
+
+    def names_a_purchase(self, token: str) -> bool:
+        """Whether a word describes something bought rather than who sold it."""
+        key = lookup_key(token)
+        return (key in self.service_markers or key in self.material_markers
+                or key in self.any_term or key in self.unit_terms)
 
     @classmethod
     def load(cls, path: Path) -> "Lexicon":
@@ -1106,6 +1118,23 @@ class TypeAnalyser:
         """Whether a description names an activity rather than an object."""
         return bool(content & self.lexicon.service_markers)
 
+    def names_a_service(self, text: str) -> bool:
+        _, content = self.analyse(text)
+        return self._is_service(content)
+
+    def disagrees_with_kind(self, purchase_kind: str, item_text: str) -> bool:
+        """Whether a declared purchase kind rules this catalogue item out.
+
+        Only a stated disagreement counts. "Unclear" rules nothing out, and an
+        item whose text names no activity is treated as an article, which is what
+        an item catalogue almost entirely consists of.
+        """
+        kind = lookup_key(purchase_kind)
+        if kind not in {"service", "material"}:
+            return False
+        item_is_service = self.names_a_service(item_text)
+        return item_is_service != (kind == "service")
+
     def compatible(self, left: str, right: str) -> bool:
         """Whether two descriptions could denote the same kind of thing.
 
@@ -1509,6 +1538,123 @@ MATCH_TEXT_COLUMNS: Tuple[str, ...] = (
     "Invoice_Article_Name",
     PURCHASE_DESCRIPTION_COLUMN,
 )
+
+# The tail an ERP writes after the purchase itself: the supplier repeated and the
+# document number, as "... LINDE GAS AB/6513423814 - LINDE GAS AB - 6513423814".
+# Matched from the first separator that is followed by a run of digits, so a
+# description containing a hyphen in the product name is not truncated at it.
+REFERENCE_TAIL = re.compile(r"[/\-–—]\s*\d{5,}\b.*$")
+
+# A bare document or transaction number standing on its own. Long digit runs only:
+# a four-digit number is as likely to be a size or a rating as a reference.
+BARE_REFERENCE = re.compile(r"\b\d{6,}\b")
+
+# Columns that may name the supplier, in the order they are trusted.
+SUPPLIER_NAME_COLUMNS: Tuple[str, ...] = (
+    "Supplier_Name", "Supplier", "ERP supplier name", "ERP_Supplier_Name",
+    "Supplier Name", "Vendor", "Vendor_Name",
+)
+
+
+class PurchaseTextCleaner:
+    """Removes everything from a description except the purchase.
+
+    An ERP description is not only the purchase. `DJE hyra gas LINDE GAS
+    AB/6513423814 - LINDE GAS AB - 6513423814` is two words of purchase - gas
+    rental - and then the supplier's name three times and a document number
+    twice. Matched as it stands, the similarity is carried by "LINDE GAS AB", and
+    every catalogue item containing *gas* scores highly: a welding gas nozzle, a
+    dust bag for a *Bosch GAS 35/55*, and a bicycle inner tube, `Sisärengas`,
+    whose match is the letters g-a-s inside a Finnish word. All three were
+    accepted above 0.83 before this existed.
+
+    The supplier arrives in its own column, so removing it needs no inference.
+    The care is in not removing an ordinary word that happens to be in the name -
+    Linde *Gas* really does sell gas - so a token is dropped only where the
+    controlled vocabulary does not claim it as something one can buy.
+    """
+
+    def __init__(self, lexicon: Lexicon) -> None:
+        self.lexicon = lexicon
+        self._identity: Dict[str, FrozenSet[str]] = {}
+        # Counted per distinct description rather than per call, because a row's
+        # match text is resolved more than once in a run - once to collect the
+        # descriptions and again to write each row - and a tally that grew each
+        # time reported more descriptions cleaned than the input has rows.
+        self._seen: Dict[str, int] = {}
+
+    @staticmethod
+    def supplier_of(row: Dict[str, str]) -> str:
+        for column in SUPPLIER_NAME_COLUMNS:
+            value = normalise_text(row.get(column, ""))
+            if value:
+                return value
+        return ""
+
+    def identity_tokens(self, supplier: str) -> FrozenSet[str]:
+        """The words that name this supplier and nothing it sells."""
+        key = lookup_key(supplier)
+        if key in self._identity:
+            return self._identity[key]
+
+        tokens = set()
+        for token in tokenise(key):
+            if len(token) < 3:
+                continue
+            if self.lexicon.names_a_purchase(token):
+                continue
+            tokens.add(token)
+        # The generic remainder of a company name is not a purchase either, and
+        # is safe to drop unconditionally because it is only ever dropped for a
+        # supplier that carries it.
+        for token in tokenise(key):
+            if (token in self.lexicon.legal_forms
+                    or token in self.lexicon.geographic_qualifiers):
+                tokens.add(token)
+
+        result = frozenset(tokens)
+        self._identity[key] = result
+        return result
+
+    def clean(self, description: str, supplier: str) -> str:
+        """The description with the supplier and the paperwork taken out.
+
+        The original is returned whenever cleaning would leave nothing to match
+        on, so a line described only by its supplier and a reference still gets
+        whatever chance it had rather than silently becoming unmatchable.
+        """
+        if not description:
+            return description
+
+        text = REFERENCE_TAIL.sub(" ", description)
+        text = BARE_REFERENCE.sub(" ", text)
+
+        identity = self.identity_tokens(supplier)
+        if identity:
+            text = " ".join(word for word in text.split()
+                            if lookup_key(word) not in identity)
+
+        text = " ".join(text.replace("/", " ").split())
+        if not text or not any(character.isalpha() for character in text):
+            return description
+        # Nothing but codes left is nothing to compare: a match found on a bare
+        # part number alone is the code path's business, not the text's.
+        if not any(not is_code_token(token) for token in tokenise(lookup_key(text))):
+            return description
+
+        removed = len(description.split()) - len(text.split())
+        if removed > 0:
+            self._seen[lookup_key(description)] = removed
+        return text
+
+    @property
+    def cleaned_rows(self) -> int:
+        return len(self._seen)
+
+    @property
+    def words_removed(self) -> int:
+        return sum(self._seen.values())
+
 
 # Placeholders that mean the field is empty, whatever the source system wrote.
 EMPTY_MARKERS = frozenset({
@@ -2174,7 +2320,8 @@ class MatchEngine:
     # -- scoring ------------------------------------------------------------
 
     def match(self, description: str, item_number: str = "",
-              unit_price: Optional[float] = None) -> List[MatchCandidate]:
+              unit_price: Optional[float] = None,
+              purchase_kind: str = "") -> List[MatchCandidate]:
         """Return the best reference items for one purchase description."""
         if not description or not self.library.items:
             return []
@@ -2208,6 +2355,18 @@ class MatchEngine:
 
             shared_codes = purchase_codes & item.codes
             type_compatible = self.types.compatible(description, item.comparison_text)
+
+            # A stocked article is not a substitute for an activity, whatever
+            # words the two happen to share. This is checked from the declared
+            # kind rather than inferred from the text, because inference is what
+            # let a gas *rental* be answered with a welding nozzle: head
+            # detection is English-only, found no head in `KAASUSUUTIN`, and
+            # `compatible` treats an undetermined head as nothing to disagree
+            # about. Fifty-five of seventy-one accepted matches were services
+            # answered with articles, every one of them marked compatible.
+            if type_compatible and self.types.disagrees_with_kind(
+                    purchase_kind, item.comparison_text):
+                type_compatible = False
             spec_agreement = SpecificationReader.agreement(purchase_specs, item.specifications)
 
             score = base
@@ -2412,6 +2571,7 @@ class Agent3:
                                            cache=self.translation_cache)
         self.reader = SpecificationReader()
         self.types = TypeAnalyser(self.lexicon)
+        self.cleaner = PurchaseTextCleaner(self.lexicon)
         self.library = ReferenceLibrary(self.lexicon, self.translator, self.reader)
         self.engine = MatchEngine(self.library, settings, self.types, self.reader)
         self.detector = CatalogueCandidateDetector(settings)
@@ -2442,14 +2602,26 @@ class Agent3:
                 "and will still be produced.")
             return
 
-        distinct: Dict[str, str] = {}
+        # Agent 1's verdict on whether the line bought a thing or an activity is
+        # carried alongside the text. Derived from the text it would be wrong
+        # exactly where it matters: "hyra gas" names a service in a language the
+        # English marker list does not cover.
+        distinct: Dict[str, Tuple[str, str]] = {}
         for row in self.table.rows:
             description, _ = self.match_text(row)
             if not description or self.lexicon.is_noise(description):
                 continue
             key = lookup_key(description)
             if key not in distinct:
-                distinct[key] = description
+                distinct[key] = (description,
+                                 normalise_text(row.get("Item_Or_Service", "")))
+
+        if self.cleaner.cleaned_rows:
+            LOGGER.info("Supplier names and document references removed from %d "
+                        "description(s) before matching (%d word(s)).",
+                        self.cleaner.cleaned_rows, self.cleaner.words_removed)
+        self.statistics["descriptions_cleaned"] = self.cleaner.cleaned_rows
+        self.statistics["reference_words_removed"] = self.cleaner.words_removed
 
         LOGGER.info("Matching %d distinct purchase description(s) against %d reference item(s).",
                     len(distinct), len(self.library.items))
@@ -2461,8 +2633,8 @@ class Agent3:
                 "back to a direct scan of the catalogue for every description. Install "
                 "sentence-transformers and scikit-learn before running at full volume.")
 
-        for position, (key, description) in enumerate(sorted(distinct.items()), start=1):
-            self.matches[key] = self.engine.match(description)
+        for position, (key, (description, kind)) in enumerate(sorted(distinct.items()), start=1):
+            self.matches[key] = self.engine.match(description, purchase_kind=kind)
             if position % 2000 == 0:
                 LOGGER.info("  matched %d / %d description(s)", position, len(distinct))
 
@@ -2622,12 +2794,43 @@ class Agent3:
         names the specific product a catalogue entry has to be recognised as.
         The enriched English sentence is the fallback for a row whose original
         text is missing or a placeholder.
+
+        Whichever is chosen is cleaned first. The original names the product but
+        it also names the supplier and the document, and left in they carry the
+        similarity instead of the product - see PurchaseTextCleaner.
         """
+        supplier = self.cleaner.supplier_of(row)
         for column in MATCH_TEXT_COLUMNS:
             value = normalise_text(row.get(column, ""))
-            if is_populated(value) and not self.lexicon.is_noise(value):
-                return value, column
+            if not is_populated(value) or self.lexicon.is_noise(value):
+                continue
+            cleaned = self.cleaner.clean(value, supplier)
+            if self.lexicon.is_noise(cleaned):
+                continue
+
+            # The catalogue is compared in English. When cleaning leaves a
+            # product named only in Finnish or Swedish - "hyra gas" - the
+            # enriched English sentence is the better text to match on, even
+            # though the original is preferred in principle, because a comparison
+            # across two languages is not a comparison. The column reported says
+            # which was used, so the choice is visible in the output.
+            if column != PURCHASE_DESCRIPTION_COLUMN and not self._reads_as_english(cleaned):
+                english = normalise_text(row.get(PURCHASE_DESCRIPTION_COLUMN, ""))
+                if is_populated(english) and not self.lexicon.is_noise(english):
+                    return (self.cleaner.clean(english, supplier),
+                            PURCHASE_DESCRIPTION_COLUMN)
+            return cleaned, column
         return "", ""
+
+    def _reads_as_english(self, text: str) -> bool:
+        """Whether any word here is one the English vocabulary recognises.
+
+        A deliberately weak test. It only has to separate text the catalogue
+        comparison can work with from text where no word is shared with it, and a
+        part number or a unit is common to both languages so neither counts.
+        """
+        return any(self.lexicon.names_a_purchase(token)
+                   for token in tokenise(lookup_key(text)))
 
     def standard_item(self, row: Dict[str, str]) -> str:
         """Whether the line was already raised as a standard catalogue purchase.
