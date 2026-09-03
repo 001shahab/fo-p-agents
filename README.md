@@ -1232,6 +1232,45 @@ ServiceNow licence match a pressure pipe. On that extract nil is the right
 answer, and only the ~6.6% in `Production supplies and consumables`, with parts
 of `Civil Works` and `Production maintenance`, is even in Ahlsell's territory.
 
+Measured on materials spend, where the catalogue does apply, the agent performs as
+intended. Four thousand lines drawn from `Production supplies and consumables`,
+`Civil Works`, `Automation and Electrification`, `Mechanical and Main Equipment`
+and `Hardware and Accessories`, run against the full master:
+
+| | Lines | Share |
+|---|---|---|
+| Matched at 0.65 or above | 421 | 10.5% |
+| of which High band | 138 | 3.5% |
+| of which Medium band | 283 | 7.1% |
+| Best score reached | 0.970 | |
+
+Against 0% on the IT and services extract, so the domain, not the agent, sets the
+rate. The strongest matches are exact:
+
+```
+0.97  LED-pistokantalamppu DULUX DE26 HF 10W/840 G24Q-3
+   -> LED-PISTOKANTALAMPPU DULUX D/E HF 10W/830 G24Q-3     AHLSELL FI   9.39
+0.97  Kauluslaippa DN80 PN16 P250GH EN1092-1/11
+   -> KAULUSLAIPPA EN 1092-1/11 DN80/88.9 P250GH PN16       AHLSELL FI  19.23
+0.92  SUODATUSYKS 2340016 HYDAC MFU15E9SMFE/NX9DM010FSDN
+   -> SUODATUSYKS 2340016 HYDAC MFU15E9SMFE/NX9DM010FSDN    AHLSELL FI  3698.50
+```
+
+Two limitations are worth stating before anyone treats a match as a purchasing
+instruction. The agent identifies the product family reliably but not always the
+variant: a few accepted matches pair the right garment or fitting in the wrong
+size, such as `MIDJEBYXA ... STL C46` against `MIDJEBYXA ... STL C146` at 0.90, or
+a DN25 check valve against a DN100 ball valve. And the guard meant to catch that,
+`Specification_Agreement`, reads `Not stated` on 405 of the 421 matches, because
+garment sizes and DN/PN ratings are not among the specifications it extracts. It is
+therefore close to inert on this spend rather than actively confirming anything.
+Treat `High` as "this is the right item family, check the variant" rather than "this
+is the right stock code", and read `Matched_Item_Description` before acting.
+
+The threshold is not leaving much on the table here: of the 3,579 unmatched lines
+with a score, only 32 sit between 0.60 and 0.65, and the median is 0.438. Dropping
+the accept threshold to 0.60 would add under one percentage point.
+
 So a nil result is worth explaining before it is corrected:
 
 - **The extract is out of the catalogue's domain.** Nothing to fix. Expect a low
