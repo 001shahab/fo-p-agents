@@ -904,6 +904,39 @@ removal*, this keeps "asbestos" and "removal" and drops the rest, producing
 actually purchased. The language model is offered the few groups where this
 produces a weak name, and nothing else.
 
+The supplier's own name is removed before the signature is taken, because a
+category named after a vendor is not a category. Agent 1 writes a faithful
+sentence, and a faithful sentence says who supplied the thing, so `TELIA FINLAND
+OYJ` reached the signature and split one purchase type across every vendor selling
+it. Measured before this was added, 60% of Category L5 names carried a supplier's
+name and covered two thirds of lines.
+
+The difficulty is that a supplier is often named after what it sells — Linde
+*Gas*, *Delete* Finland, *Boost* — so removing the name blindly takes the purchase
+with it. Two tests protect against that, since neither suffices alone:
+
+- the controlled vocabulary, which knows `scaffolding` and `cleaning`; and
+- the extract itself, which is the better guide. A word used by vendors *not*
+  named after it describes a thing; a word seen only alongside its owner is a
+  name. `gas` is bought from many vendors, `telia` from one.
+
+The second test counts only suppliers whose own name lacks the word, because one
+corporate group arrives under several legal entities — Telia Finland and Telia
+Cygate between them made `telia` look like a word two different vendors use.
+Company suffixes and country words are removed too, but only for suppliers that
+carry them, so a description naming a country for its own sake keeps it. If
+removal would leave nothing, the original is kept, and a line whose description is
+only its supplier's name still groups somewhere.
+
+The supplier is read from `Supplier_Name`, which Agent 1 populates on every row.
+Pass `--keep-supplier-names` to disable the whole behaviour; the run reports how
+many rows it changed, and says so when it finds no supplier column, since the
+alternative is doing nothing silently.
+
+One limitation: an acronym is not a name. `AWS` does not appear in `AMAZON WEB
+SERVICES EMEA SARL`, so it survives, and the clustering rather than the signature
+has to merge it.
+
 Words that say how a purchase was fulfilled rather than what was purchased —
 `delivery`, `incl. delivery`, `for site use`, `replacement`, `supply of`,
 `(standard)` — are removed before the signature is taken. `Bat survey for wind
@@ -911,6 +944,32 @@ site incl. delivery` therefore lands in the same group as `Bat survey for wind
 site` instead of becoming a category of its own. A line whose only content word
 is one of them keeps it, because that line really did buy a delivery, and
 `power supply` keeps its head noun.
+
+The verbs Agent 1 uses to join a purchase to its supplier — `purchased`, `bought`,
+`supplied`, `provided`, `covering`, `carried out` — go the same way. A faithful
+sentence carries one on almost every line, so they say nothing about what was
+bought while still reaching labels and splitting identical purchases by phrasing:
+`Amazon web services capacity was purchased` and `Amazon web service capacity
+purchase` were two groups on wording alone. They are removed on the same terms as
+fulfilment words, only while something else remains.
+
+Removing the supplier exposed what sat underneath it. An enriched sentence often
+ends by identifying the transaction — `... under reference 4501234` — and with the
+vendor gone, that was all some labels had left, giving groups called `Refurbishment
+service under` and `Consult service supply under reference`. So the paperwork words
+`reference`, `ref`, `number`, `period` and `detail` go as well, along with the
+prepositions that held the sentence together. `invoice` and `line` are deliberately
+kept, because an invoice processing service and a power line are real purchases.
+Together these turn `Refurbishment service voith hydro under` into `Refurbishment
+services` and `Medium advertising service ipg mediabrand` into `Medium advertising
+service`.
+
+What this does *not* do is reduce the group count much on a small extract: on 400
+lines it moved 93 to 95, because at that size nearly every description is unique
+however it is worded. The gain is that names now describe purchases instead of
+vendors, and identical purchases from different vendors can finally meet — which
+only shows on a full extract, where the same purchase recurs across suppliers. The
+group count on representative spend has not been measured since the change.
 
 `site` is the awkward one, because it names the purchase in Fortum's own `Bat
 survey for wind site` and names only the fulfilment in `for site use`. It is
@@ -967,14 +1026,14 @@ lands in three groups at once — `Amazon web service purchase capacity` (35 lin
 purchase` (15) — and scaffolding and insulation each split two ways on word order
 alone.
 
-So a group count near the line count is mostly a signature problem rather than a
-distance problem, and raising `--threshold` treats the symptom. The bigger gain
-would come from dropping the supplier name — which arrives in its own column and
-need not be inferred — and the enrichment's filler verbs before the signature is
-taken. Until that is done, expect roughly a thousand L5 names per five thousand
-lines whatever the threshold, and read the ceiling accordingly: at this
-granularity a full extract reaches 6000 names quickly, and everything past it is
-folded into `Other` rather than generalised.
+So a group count near the line count was mostly a signature problem rather than a
+distance problem, and raising `--threshold` treated the symptom. Both causes are
+now removed before the signature is taken — the supplier name, which arrives in
+its own column and never had to be inferred, and the connecting verbs — as
+described under "the signature" above. The measurements in this section are what
+the diagnosis rested on and predate the fix, so they record why the change was
+made rather than what the agent now produces; the sweep is worth repeating on
+representative spend to see where the count settles.
 
 One caveat on the numbers above: the extract is 85% IT and indirect services,
 which fragments differently from materials, so sweep again on representative spend

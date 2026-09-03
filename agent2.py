@@ -80,7 +80,8 @@ import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import (Any, Dict, FrozenSet, Iterable, Iterator, List, Optional,
+                    Sequence, Set, Tuple)
 
 from runtime import (
     DEFAULT_AZURE_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT,
@@ -91,7 +92,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent2")
 
 AGENT_NAME = "Agent 2 - AI Purchase Group (Category L5)"
-AGENT_VERSION = "1.2.1"
+AGENT_VERSION = "1.3.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -208,6 +209,11 @@ class Settings:
     # one of them. Everything below the line is folded into "Other" rather than
     # dropped, so no row leaves the analysis.
     max_total_groups: int = 6000
+
+    # Take the supplier's own name out of a description before grouping it. On by
+    # default: a category named after a vendor is not a category, and it splits
+    # one purchase type across every vendor that sells it.
+    mask_suppliers: bool = True
 
     write_jsonl: bool = True
     verbose: bool = False
@@ -516,6 +522,42 @@ class Lexicon:
         self.service_markers: Set[str] = {lookup_key(t) for t in payload.get("service_markers", [])}
         self.material_markers: Set[str] = {lookup_key(t) for t in payload.get("material_markers", [])}
         self.noise_terms: Set[str] = {lookup_key(t) for t in payload.get("noise_terms", [])}
+        # Needed to tell a supplier's name from the thing it sold. The corporate
+        # and country words are what remains of a supplier once its identity is
+        # taken out, and the marker lists are what must survive: "Linde Gas"
+        # sells gas, so "gas" cannot be discarded merely for being in the name.
+        self.legal_forms: Set[str] = {lookup_key(t) for t in payload.get("legal_forms", [])}
+        self.geographic_qualifiers: Set[str] = {
+            lookup_key(t) for t in payload.get("geographic_qualifiers", [])}
+
+        # Every word the vocabulary knows, as single tokens. Used to protect
+        # ordinary procurement words from being mistaken for a supplier's name.
+        # Deliberately drawn from the whole file rather than the marker lists,
+        # which are far too narrow for the job on their own.
+        self.known_words: Set[str] = set()
+        for section in ("phrases", "terms", "compound_parts", "service_markers",
+                        "material_markers", "unit_terms"):
+            for phrase in self._walk(payload.get(section)):
+                for token in lookup_key(phrase).split():
+                    if len(token) > 2:
+                        self.known_words.add(token)
+
+    @classmethod
+    def _walk(cls, value: Any) -> Iterator[str]:
+        """Every string anywhere inside a vocabulary section, keys included."""
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, list):
+            for item in value:
+                yield from cls._walk(item)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                yield str(key)
+                yield from cls._walk(item)
+
+    def names_a_purchase(self, token: str) -> bool:
+        """Whether a word describes what was bought rather than who sold it."""
+        return lookup_key(token) in self.known_words
 
     @classmethod
     def load(cls, path: Path) -> "Lexicon":
@@ -534,6 +576,133 @@ class Lexicon:
         if not key or key in self.noise_terms:
             return True
         return not any(ch.isalpha() for ch in key)
+
+
+# Columns that may name the supplier, in the order they are trusted. Matched on
+# the normalised key, so "ERP supplier name" and "ERP_Supplier_Name" both count.
+SUPPLIER_COLUMNS: Tuple[str, ...] = (
+    "Supplier", "ERP supplier name", "ERP_Supplier_Name", "Supplier_Name",
+    "Supplier Name", "Vendor", "Vendor_Name",
+)
+
+
+class SupplierMasker:
+    """Removes the supplier's own name from a purchase description.
+
+    Agent 1 writes a faithful sentence, and a faithful sentence says who supplied
+    the thing: "Device accessories were purchased from TELIA FINLAND OYJ". The
+    supplier then reaches the signature and splits one purchase type across as
+    many groups as it has vendors - 60% of Category L5 names on a Fortum extract
+    carried a supplier's name, covering two thirds of lines. Since the supplier
+    arrives in a column of its own it does not have to be inferred, only removed.
+
+    The care is in not removing too much. A supplier name is very often an
+    ordinary word - Linde *Gas*, *Delete* Finland, *Boost* - and removing it
+    would take the purchase with it. Two things protect against that, because
+    neither is sufficient alone:
+
+    * the controlled vocabulary, which knows *scaffolding* and *cleaning*; and
+    * the extract itself, which is the better guide. A word used by many
+      different suppliers describes a thing, while a word seen only alongside its
+      owner is a name. *gas* is bought from dozens of vendors, *telia* from one.
+
+    The second test needs a look at the data before any row is grouped, so
+    ``observe`` is called over every row first and ``strip`` only afterwards.
+    """
+
+    # A word seen with at least this many distinct suppliers is treated as
+    # describing a purchase rather than naming a vendor.
+    SHARED_SUPPLIER_MINIMUM = 2
+
+    def __init__(self, lexicon: Lexicon) -> None:
+        self.lexicon = lexicon
+        self._suppliers_by_token: Dict[str, Set[str]] = defaultdict(set)
+        self._cache: Dict[str, FrozenSet[str]] = {}
+        self.masked_rows = 0
+        self.masked_tokens = 0
+
+    def observe(self, description: str, supplier: str) -> None:
+        """Note which suppliers a word is seen with, before anything is removed."""
+        who = lookup_key(supplier)
+        if not who:
+            return
+        for token in tokenise(lookup_key(description)):
+            if len(token) > 2:
+                self._suppliers_by_token[token].add(who)
+
+    def _shared_across_suppliers(self, token: str) -> bool:
+        """Whether vendors who are not named after this word also use it.
+
+        Counting distinct suppliers alone is not enough: one corporate group
+        arrives under several legal entities, and Telia Finland plus Telia Cygate
+        made "telia" look like a word two different vendors use. Only suppliers
+        whose own name lacks the word are evidence that it describes a purchase.
+        """
+        outsiders = 0
+        for who in self._suppliers_by_token.get(token, ()):
+            if token not in who.split():
+                outsiders += 1
+                if outsiders >= self.SHARED_SUPPLIER_MINIMUM:
+                    return True
+        return False
+
+    def identity_tokens(self, supplier: str) -> FrozenSet[str]:
+        """The tokens that identify this supplier and nothing it sells."""
+        key = lookup_key(supplier)
+        if key in self._cache:
+            return self._cache[key]
+
+        tokens = set()
+        for token in tokenise(key):
+            if len(token) < 3 or is_code_token(token):
+                continue
+            if self.lexicon.names_a_purchase(token):
+                continue
+            if self._shared_across_suppliers(token):
+                continue
+            tokens.add(token)
+
+        # The generic remainder of a company name carries no purchase meaning
+        # either, and leaving it behind produced groups called "Finland oyj".
+        # Removed only for suppliers that actually carry them, so a description
+        # that names a country for its own sake keeps it.
+        for token in tokenise(key):
+            if (token in self.lexicon.legal_forms
+                    or token in self.lexicon.geographic_qualifiers):
+                tokens.add(token)
+
+        result = frozenset(tokens)
+        self._cache[key] = result
+        return result
+
+    def supplier_of(self, row: Dict[str, str]) -> str:
+        for column in SUPPLIER_COLUMNS:
+            value = normalise_text(row.get(column, ""))
+            if value:
+                return value
+        return ""
+
+    def strip(self, description: str, supplier: str) -> str:
+        """Return the description with the supplier's identity removed.
+
+        The original is returned untouched when removal would leave nothing that
+        names a purchase, so a line whose description is only its supplier's name
+        still groups somewhere rather than being dropped for having no content.
+        """
+        identity = self.identity_tokens(supplier)
+        if not identity or not description:
+            return description
+
+        words = description.split()
+        kept = [word for word in words if lookup_key(word) not in identity]
+        if not any(any(ch.isalpha() for ch in word) for word in kept):
+            return description
+
+        removed = len(words) - len(kept)
+        if removed:
+            self.masked_rows += 1
+            self.masked_tokens += removed
+        return " ".join(kept)
 
 
 # ===========================================================================
@@ -559,7 +728,22 @@ class SignatureBuilder:
         "with", "from", "as", "is", "are", "was", "were", "be", "per", "pcs",
         "each", "new", "used", "other", "misc", "various", "general", "total",
         "no", "not", "incl", "excl", "etc", "pc", "set", "item", "items",
+        # Prepositions and adverbs that survive into labels once the supplier is
+        # gone. Left behind, "carried out during the annual maintenance" named a
+        # group "out during annual".
+        "under", "during", "within", "via", "out", "over", "between", "through",
+        "against", "upon", "into", "about", "this", "that", "these", "those",
+        "it", "its", "their", "which", "who", "whom", "whose",
     }
+
+    # Paperwork that identifies a transaction rather than describing a purchase.
+    # Common at the end of an enriched sentence - "... under reference 4501234"
+    # - and once the supplier is removed these were all that some labels had left.
+    # Kept deliberately short: "invoice" and "line" are left in, because an
+    # invoice processing service and a power line are real purchases.
+    _REFERENCE_LEMMAS = frozenset({
+        "reference", "ref", "number", "period", "detail", "details",
+    })
 
     def __init__(self) -> None:
         self._pipeline: Optional[Any] = None
@@ -670,12 +854,28 @@ class SignatureBuilder:
     # Where a thing is used, as opposed to what the thing is.
     _USE_LEMMAS = frozenset({"use", "usage"})
 
+    # The verbs Agent 1's enrichment uses to join a purchase to its supplier.
+    # A faithful sentence says who supplied the thing, so these arrive on almost
+    # every line and carry no information about what was bought - yet they reach
+    # labels and split otherwise identical purchases by phrasing. Amazon web
+    # services landed in three groups differing only in word order because of
+    # them. Removed on the same terms as fulfilment: only while something else
+    # remains, so a line that really did buy a service keeps its head noun.
+    _ENRICHMENT_VERB_LEMMAS = frozenset({
+        "purchase", "purchased", "purchasing", "buy", "bought",
+        "supplied", "provide", "provides", "providing", "provided",
+        "cover", "covering", "carry", "carried",
+        "receive", "received", "receiving", "invoiced", "billed", "charged",
+    })
+
     @classmethod
     def drop_fulfilment(cls, lemmas: Sequence[str]) -> Tuple[str, ...]:
         """Remove words that describe fulfilment rather than the purchase."""
         kept: List[str] = []
         for position, lemma in enumerate(lemmas):
-            if lemma in cls._FULFILMENT_LEMMAS:
+            if (lemma in cls._FULFILMENT_LEMMAS
+                    or lemma in cls._ENRICHMENT_VERB_LEMMAS
+                    or lemma in cls._REFERENCE_LEMMAS):
                 continue
             # "site" is the purchase in Fortum's own "Bat survey wind site" and
             # mere fulfilment in "for site use". Only the following word tells
@@ -1579,6 +1779,7 @@ class Agent2:
         self.settings = settings
         self.lexicon = Lexicon.load(settings.lexicon_path)
         self.builder = SignatureBuilder()
+        self.masker = SupplierMasker(self.lexicon)
         self.similarity = SimilarityModel(use_embeddings=settings.use_embeddings)
         self.labeller = GroupLabeller(self.builder, self.lexicon, settings.max_label_words)
         self.registry = GroupRegistry(settings.registry_path)
@@ -1625,11 +1826,24 @@ class Agent2:
         assert self.table is not None
         skipped = 0
 
+        if self.settings.mask_suppliers:
+            # Learn which words belong to vendors and which to purchases before
+            # removing anything, since the test is how widely a word is used.
+            for row in self.table.rows:
+                self.masker.observe(normalise_text(row.get(REQUIRED_COLUMN, "")),
+                                    self.masker.supplier_of(row))
+
         for row in self.table.rows:
             description = normalise_text(row.get(REQUIRED_COLUMN, ""))
             if not description or self.lexicon.is_noise(description):
                 skipped += 1
                 continue
+
+            if self.settings.mask_suppliers:
+                # Before the signature, so the supplier neither splits a group
+                # nor reaches its name.
+                description = self.masker.strip(
+                    description, self.masker.supplier_of(row))
 
             bucket = self._category_bucket(row)
             signature = self.builder.signature(description)
@@ -1664,6 +1878,15 @@ class Agent2:
         self.statistics["rows_total"] = len(self.table.rows)
         self.statistics["rows_without_description"] = skipped
         self.statistics["distinct_descriptions"] = len(self.entries)
+        self.statistics["rows_supplier_masked"] = self.masker.masked_rows
+        self.statistics["supplier_words_removed"] = self.masker.masked_tokens
+        if self.settings.mask_suppliers and self.masker.masked_rows:
+            LOGGER.info("Supplier names removed from %d row(s) before grouping "
+                        "(%d word(s)); pass --keep-supplier-names to leave them.",
+                        self.masker.masked_rows, self.masker.masked_tokens)
+        elif self.settings.mask_suppliers:
+            LOGGER.info("No supplier names found to remove; check that a supplier "
+                        "column (%s) reaches Agent 2.", SUPPLIER_COLUMNS[0])
 
         buckets = {bucket for bucket, _ in self.entries}
         self.statistics["category_buckets"] = len(buckets)
@@ -2287,6 +2510,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help="word budget for a group label (default 5)")
     grouping.add_argument("--max-bucket-size", type=int, default=6000,
                           help="new descriptions per category before splitting (default 6000)")
+    grouping.add_argument("--keep-supplier-names", action="store_true",
+                          help="leave the supplier's own name in the text used "
+                               "for grouping and naming; by default it is removed "
+                               "so a vendor does not become a category")
     grouping.add_argument("--max-total-groups", type=int, default=6000,
                           help="ceiling on Category L5 names including 'Other'; "
                                "groups below the spend line join 'Other' "
@@ -2412,6 +2639,7 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         bucket_level=args.bucket_level,
         max_bucket_size=args.max_bucket_size,
         max_total_groups=args.max_total_groups,
+        mask_suppliers=not args.keep_supplier_names,
         write_jsonl=not args.no_jsonl,
         verbose=args.verbose,
         interactive=not args.non_interactive,
