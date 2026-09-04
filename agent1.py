@@ -85,7 +85,8 @@ import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import (Any, Callable, Dict, FrozenSet, Iterable, Iterator, List,
+                    Optional, Sequence, Set, Tuple)
 from xml.etree import ElementTree
 
 from runtime import (
@@ -783,14 +784,9 @@ def is_foreign_common_noun(token: str) -> bool:
     return False
 
 
-def foreign_tokens_in(text: str) -> List[str]:
-    """Common nouns in ``text`` that are not English."""
-    return [token for token in tokenise(text) if is_foreign_common_noun(token)]
-
-
-def has_non_english(text: str) -> bool:
+def has_non_english(text: str, protected: Iterable[str] = ()) -> bool:
     """True when a published description still carries a source-language word."""
-    return bool(foreign_tokens_in(text))
+    return bool(foreign_tokens_in(text, protected))
 
 
 def drop_foreign_common_nouns(text: str) -> str:
@@ -870,7 +866,35 @@ def _close_sentence_gap(text: str) -> str:
     return text if re.search(r"[A-Za-z]", text) else ""
 
 
-def strip_foreign_words(text: str) -> str:
+def protected_keys(names: Iterable[str]) -> FrozenSet[str]:
+    """Lookup keys for names that must survive the foreign-word test.
+
+    Spelling cannot tell a name from a common noun: "Gdansk" and "sprzatanie"
+    are both Polish-shaped, and the accented-letter rule flags both. The model
+    that wrote the sentence knows which is which and says so, and this turns that
+    answer into keys the deterministic layer can honour.
+    """
+    keys: Set[str] = set()
+    for name in names or ():
+        for token in tokenise(normalise_text(name)):
+            key = lookup_key(token)
+            if key:
+                keys.add(key)
+    return frozenset(keys)
+
+
+def foreign_tokens_in(text: str,
+                      protected: Iterable[str] = ()) -> List[str]:
+    """Common nouns in ``text`` that are not English.
+
+    ``protected`` holds lookup keys the model has vouched for as names.
+    """
+    allowed = protected if isinstance(protected, frozenset) else frozenset(protected)
+    return [token for token in tokenise(text)
+            if is_foreign_common_noun(token) and lookup_key(token) not in allowed]
+
+
+def strip_foreign_words(text: str, protected: Iterable[str] = ()) -> str:
     """Remove foreign common nouns from a finished sentence, keeping its shape.
 
     ``drop_foreign_common_nouns`` tokenises, which throws away the apostrophes,
@@ -882,8 +906,10 @@ def strip_foreign_words(text: str) -> str:
     text = normalise_text(text)
     if not text:
         return ""
+    allowed = protected if isinstance(protected, frozenset) else frozenset(protected)
     spans = [match.span() for match in _TOKEN.finditer(text)
-             if is_foreign_common_noun(match.group(0))]
+             if is_foreign_common_noun(match.group(0))
+             and lookup_key(match.group(0)) not in allowed]
     if not spans:
         return text
     for start, end in reversed(spans):
@@ -903,18 +929,24 @@ PUBLISHED_WORD_FLOOR = 8
 _LONE_LETTER = re.compile(r"(?<![\w'&.])[b-hj-z](?![\w'&.])", re.IGNORECASE)
 
 
-def published_faults(description: str) -> List[str]:
+def published_faults(description: str,
+                     protected: Iterable[str] = ()) -> List[str]:
     """Name what is wrong with a published description, worst first.
 
     Drives the repair pass. Each fault is something a reader would notice: a
     source-language noun, a hole where a word was lifted out, the remains of an
     abbreviation the tokeniser split, or a fragment instead of a sentence.
+
+    ``protected`` holds the names the model has vouched for, which is what stops
+    "in Gdansk" from being reported as a fault for ever: the check would keep
+    firing, the model would keep answering correctly, and the answer would keep
+    being rejected for not reducing a count that cannot fall.
     """
     text = normalise_text(description)
     if not text:
         return []
     faults: List[str] = []
-    foreign = foreign_tokens_in(text)
+    foreign = foreign_tokens_in(text, protected)
     if foreign:
         faults.append("carries the source-language word(s): "
                       + ", ".join(sorted(set(foreign))[:6]))
@@ -933,13 +965,13 @@ def published_faults(description: str) -> List[str]:
     return faults
 
 
-def keep_published_english(text: str) -> str:
+def keep_published_english(text: str, protected: Iterable[str] = ()) -> str:
     """Keep a published sentence a sentence while ridding it of foreign nouns."""
     text = normalise_text(text)
     if not text:
         return ""
-    if has_non_english(text):
-        return strip_foreign_words(text)
+    if has_non_english(text, protected):
+        return strip_foreign_words(text, protected)
     if _doubled_function_spans(text):
         # A seam left by an earlier pass, or by a run whose model tier was off.
         return _close_sentence_gap(text)
@@ -3183,7 +3215,8 @@ class TranslationEngine:
         self.results[phrase] = result
         return result
 
-    def ensure_english(self, text: str, published: bool = False) -> str:
+    def ensure_english(self, text: str, published: bool = False,
+                       protected: Iterable[str] = ()) -> str:
         """Guarantee a published string contains no source-language nouns.
 
         Vocabulary, then the local neural model (trying Finnish/Swedish/Polish
@@ -3197,9 +3230,15 @@ class TranslationEngine:
         """
         if not text:
             return ""
-        finish = strip_foreign_words if published else tidy_published_english
+        allowed = (protected if isinstance(protected, frozenset)
+                   else frozenset(protected))
+
+        def finish(value: str) -> str:
+            return (strip_foreign_words(value, allowed) if published
+                    else tidy_published_english(value))
+
         language, _ = detect_language(text, self.lexicon)
-        if not has_non_english(text) and language in {"en", "und"}:
+        if not has_non_english(text, allowed) and language in {"en", "und"}:
             return text.strip()
 
         if published:
@@ -3208,8 +3247,8 @@ class TranslationEngine:
             if language in {"en", "und"}:
                 return finish(text)
         english, _, _, _ = self._resolve_with_vocabulary(text, language)
-        if english and not has_non_english(english):
-            return finish(english) if published else tidy_published_english(english)
+        if english and not has_non_english(english, allowed):
+            return finish(english)
 
         candidates = [language] if language in {"fi", "sv", "pl", "de"} else []
         for code in ("fi", "sv", "pl", "de"):
@@ -3220,7 +3259,7 @@ class TranslationEngine:
                 if not self.neural.available_for(code):
                     continue
                 translated = self.neural.translate_batch([text], code).get(text, "")
-                if translated and not has_non_english(translated):
+                if translated and not has_non_english(translated, allowed):
                     return finish(translated)
 
         if self.model is not None and self.model.config.enabled:
@@ -3229,11 +3268,12 @@ class TranslationEngine:
                 text, english or text, language, 0.0, "lexicon", 0.0))
             self._run_model_tier(pending)
             forced = self.results.get(text)
-            if forced and forced.english_text and not has_non_english(forced.english_text):
+            if forced and forced.english_text and not has_non_english(
+                    forced.english_text, allowed):
                 return finish(forced.english_text)
 
         if published:
-            return strip_foreign_words(text)
+            return strip_foreign_words(text, allowed)
         cleaned = drop_foreign_common_nouns(english or text)
         if cleaned and not has_non_english(cleaned):
             return tidy_published_english(cleaned)
@@ -3258,7 +3298,10 @@ class TranslationEngine:
             "draft_short": short,
             "draft_item_or_service": item_or_service,
         }, ensure_ascii=False)
-        cache_key = self.model.cache_key("polish_sentence_v1", payload)
+        # The prompt text is not part of the key, so the task name carries the
+        # version: without this bump every line already in the cache would keep
+        # its old answer and never see the rules added in agent version 1.9.
+        cache_key = self.model.cache_key("polish_sentence_v2", payload)
         cached = self.model.cached(cache_key)
         if cached:
             try:
@@ -3309,7 +3352,8 @@ class TranslationEngine:
         return self._take_polish(response, draft, short, item_or_service)
 
     def repair_published(self, original: str, description: str, short: str,
-                         faults: Sequence[str]) -> Tuple[str, str]:
+                         faults: Sequence[str]
+                         ) -> Tuple[str, str, FrozenSet[str]]:
         """Ask the model to mend a published description that failed the check.
 
         The alternative is to delete the offending word locally, which is what
@@ -3319,9 +3363,9 @@ class TranslationEngine:
         and keep the other, rather than the agent guessing from spelling alone.
         """
         if self.model is None or not self.model.config.enabled:
-            return description, short
+            return description, short, frozenset()
         if not description or not faults:
-            return description, short
+            return description, short, frozenset()
 
         payload = json.dumps({
             "original": original,
@@ -3329,7 +3373,7 @@ class TranslationEngine:
             "short_description": short,
             "problems": list(faults),
         }, ensure_ascii=False)
-        cache_key = self.model.cache_key("repair_sentence_v1", payload)
+        cache_key = self.model.cache_key("repair_sentence_v2", payload)
         cached = self.model.cached(cache_key)
         if cached:
             try:
@@ -3342,13 +3386,18 @@ class TranslationEngine:
         prompt = (
             "You mend one English purchase description that failed a quality "
             "check. Return JSON: {\"description\": \"...\", "
-            "\"short_description\": \"...\"}.\n"
+            "\"short_description\": \"...\", \"keep_verbatim\": [\"...\"]}.\n"
             "Rules:\n"
             "1. Fix every listed problem and change nothing else.\n"
             "2. Keep proper nouns exactly as written: place names, company "
             "names, plant and site names, item and reference numbers. A word "
             "that looks foreign because it is a Finnish, Swedish, Polish or "
             "Norwegian name is correct English usage and must stay.\n"
+            "2b. List in keep_verbatim every word you kept that is a name "
+            "rather than an ordinary word, so it is not mistaken for untranslated "
+            "text later. 'Gdansk', 'Wroclaw' and 'Lindstrom' belong in that "
+            "list; 'sprzatanie' and 'telinetyot' do not, because they are "
+            "ordinary words you must translate instead.\n"
             "3. Translate a foreign common noun into English rather than "
             "deleting it. 'Telinetyot' is scaffolding work, 'sprzatanie' is "
             "cleaning. Never leave a source-language common noun in place.\n"
@@ -3365,28 +3414,36 @@ class TranslationEngine:
         )
         response = self.model.complete_json(prompt, payload)
         if not response:
-            return description, short
+            return description, short, frozenset()
         self.model.store(cache_key, json.dumps(response, ensure_ascii=False,
                                                sort_keys=True))
         return self._take_repair(response, description, short)
 
     @staticmethod
-    def _take_repair(parsed: Dict[str, Any], description: str,
-                     short: str) -> Tuple[str, str]:
+    def _take_repair(parsed: Dict[str, Any], description: str, short: str
+                     ) -> Tuple[str, str, FrozenSet[str]]:
         """Accept a repair only when it is an improvement.
 
-        A repair that still carries the fault, or that came back empty, is
-        discarded: the caller's own stripping is a known quantity, whereas a
-        worse sentence from the model is not.
+        A repair that came back empty, or that still carries a fault the model
+        did not vouch for, is discarded: the caller's own stripping is a known
+        quantity, whereas a worse sentence from the model is not.
+
+        The comparison holds the names the model vouched for out of *both*
+        counts. Without that, a sentence whose only fault is a place name can
+        never be mended, because the correct answer keeps the name and so scores
+        no better than the sentence it replaced.
         """
         mended = normalise_text(parsed.get("description"))
         if not mended:
-            return description, short
-        if len(published_faults(mended)) >= len(published_faults(description)):
-            return description, short
+            return description, short, frozenset()
+        names = parsed.get("keep_verbatim")
+        protected = protected_keys(names if isinstance(names, list) else ())
+        if (len(published_faults(mended, protected))
+                >= len(published_faults(description, protected))):
+            return description, short, protected
         mended_short = (normalise_text(parsed.get("short_description"))
                         or short)
-        return sentence_case(mended), sentence_case(mended_short)
+        return sentence_case(mended), sentence_case(mended_short), protected
 
     @staticmethod
     def _take_polish(parsed: Dict[str, Any], draft: str, short: str,
@@ -3739,6 +3796,9 @@ class DescriptionResult:
     basis: str = "none"                 # description | context | taxonomy | none
     used_fragments: Tuple[str, ...] = ()
     specificity: float = 0.0
+    # Lookup keys for the words the model vouched for as names rather than
+    # untranslated text, so the stripping that follows leaves them alone.
+    protected_names: FrozenSet[str] = frozenset()
 
 
 class DescriptionSynthesiser:
@@ -4600,24 +4660,30 @@ class Agent1:
             faults = published_faults(description.description)
             if faults:
                 self.repairs_attempted += 1
-                mended, mended_short = self.translator.repair_published(
+                mended, mended_short, vouched = self.translator.repair_published(
                     source, description.description,
                     description.short_description, faults)
+                # The names the model vouched for are kept even when its rewrite
+                # was refused: a sentence whose only fault was a place name was
+                # already right, and the vouching is what says so.
+                description.protected_names = vouched
                 if mended != description.description:
                     self.repairs_accepted += 1
                     description.description = mended
                     description.short_description = mended_short
 
+        protected = description.protected_names
         description.description = self.translator.ensure_english(
-            description.description, published=True)
+            description.description, published=True, protected=protected)
         description.short_description = self.translator.ensure_english(
-            description.short_description, published=True)
+            description.short_description, published=True, protected=protected)
         # A source-language noun that survived both the repair and the stripping
         # leaves nothing publishable; anything else keeps the sentence.
-        if has_non_english(description.description):
-            description.description = strip_foreign_words(description.description)
+        if has_non_english(description.description, protected):
+            description.description = strip_foreign_words(
+                description.description, protected)
             description.short_description = strip_foreign_words(
-                description.short_description)
+                description.short_description, protected)
         if not description.description:
             description.short_description = ""
         elif description.description and not description.short_description:
@@ -4647,9 +4713,11 @@ class Agent1:
             # gate used to blank the whole description, which is how a good
             # English sentence disappeared over a single Finnish token.
             "Enriched_Purchase_Description": restore_source_specifications(
-                keep_published_english(description.description), *sources),
+                keep_published_english(description.description,
+                                      description.protected_names), *sources),
             "Enriched_Description_Short": restore_source_specifications(
-                keep_published_english(description.short_description), *sources),
+                keep_published_english(description.short_description,
+                                      description.protected_names), *sources),
             # Never blank. Fortum asked for "Unclear" rather than an empty cell,
             # and a header, subtotal or empty row is the clearest case of a line
             # that does not say what was purchased.

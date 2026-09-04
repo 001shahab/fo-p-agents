@@ -287,6 +287,10 @@ CATALOGUE_ITEMS_EXPECTED = 10_000
 # and a pipeline that looks hung gets killed by whoever is watching it.
 HEARTBEAT_SECONDS = 60
 
+# The figure the budget prompt offers. Matches Agent 1's own default so that a
+# run started here and a run started from agent1.py brake at the same point.
+DEFAULT_SPEND_LIMIT = 25.00
+
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -530,6 +534,50 @@ def ask_yes_no(question: str, default: bool) -> bool:
     if not answer:
         return default
     return answer.startswith("y")
+
+
+def find_catalogue_default(source_dir: Path, results_dir: Path,
+                           here: Path) -> Optional[Path]:
+    """The item catalogue the run would pick, for the prompt to show.
+
+    Only used to fill the prompt in. The run's own resolution is the authority,
+    and it looks in the same places in the same order.
+    """
+    seen: List[Path] = []
+    for folder in (source_dir, here / "sources", here / "catalogues", results_dir):
+        if not folder or not folder.is_dir():
+            continue
+        seen.extend(path for path in sorted(folder.glob(CATALOGUE_MASTER_GLOB))
+                    if path.is_file() and not path.name.startswith((".", "~$")))
+    if not seen:
+        return None
+    # Fortum send the master as a full replacement rather than as a delta, so of
+    # two copies the larger is the newer one.
+    return max(seen, key=lambda path: path.stat().st_size)
+
+
+def ask_amount(question: str, default: float) -> float:
+    """One dollar-amount prompt, for the interactive path.
+
+    Re-asks rather than falling back on a default, because a mistyped budget is
+    the one answer where silently proceeding is the wrong thing to do.
+    """
+    while True:
+        try:
+            answer = input(f"  {question} [${default:,.2f}]: ").strip()
+        except EOFError:
+            return default
+        if not answer:
+            return default
+        try:
+            value = float(answer.lstrip("$").replace(",", "").strip())
+        except ValueError:
+            print("    Enter an amount in dollars, for example 25 or 25.00.")
+            continue
+        if value < 0:
+            print("    Enter zero or more; zero runs without a spend alert.")
+            continue
+        return value
 
 
 def human_seconds(seconds: float) -> str:
@@ -3021,9 +3069,34 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
             from_sources = not reuse
         if from_sources or not existing:
             source_dir = Path(ask("Source extracts folder", str(source_dir)))
+
+        # Asked explicitly because the one way this run fails quietly is Agent 3
+        # finding no catalogue: it reads the source folder, correctly refuses the
+        # purchase extracts in it, and reports no match on every line.
+        catalogue_default = catalogue_dir or find_catalogue_default(
+            source_dir, results_dir, here)
+        print("\n  Agent 3 matches purchase lines against the client's item "
+              "catalogue.")
+        if catalogue_default:
+            print(f"  Found: {catalogue_default}")
+        else:
+            print("  No catalogue found. Without one, Agent 3 can propose no "
+                  "match on any line.")
+        catalogue_dir = Path(ask("Item catalogue file or folder",
+                                 str(catalogue_default) if catalogue_default
+                                 else str(source_dir)))
+
         print()
         use_llm = ask_yes_no("Let the agents call the language model where they ask to",
                              use_llm)
+        if use_llm:
+            print("\n  The agents stop and ask before passing this figure, so it "
+                  "is a brake rather than a cap.")
+            print("  Agent 1 spent about $7 on 4,500 lines; the sentence repair "
+                  "in agent version 1.9 adds to that.")
+            spend_limit = ask_amount(
+                "Budget for the language model, in dollars (0 for no alert)",
+                spend_limit if spend_limit is not None else DEFAULT_SPEND_LIMIT)
         print()
 
     return Settings(

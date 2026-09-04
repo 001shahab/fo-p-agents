@@ -593,10 +593,37 @@ minutes Agent 3 spends on the catalogue. Max runs them one after the other.
 ### all_agents.py
 
 ```bash
+python all_agents.py                    # asks for the paths and the budget
 python all_agents.py --from-sources     # start from the raw extracts
 python all_agents.py --input mytable.csv  # widen a table you already have
-python all_agents.py                    # reuse Max's stage-3 table if it is there
 ```
+
+Run with no arguments and it asks five questions, each with a default that Enter
+accepts:
+
+| Question | Default |
+| --- | --- |
+| Results folder | `./results` |
+| Use a stage-3 table already in that folder, or start from the extracts | use it, when one is there |
+| Source extracts folder | `./sources` |
+| Item catalogue file or folder for Agent 3 | the largest `*Item*Catalogue*Master*.xls*` found |
+| Let the agents call the language model | yes |
+| Budget for the language model | `$25.00` |
+
+The catalogue is asked about explicitly because it is the one way the run fails
+quietly. Given only a source folder, Agent 3 reads it, correctly refuses the
+purchase extracts in it as not being catalogues, and then reports no match on
+every single line — which reads as a modelling result rather than as a missing
+file. Naming it up front, and showing which file was found, makes that visible
+before the hours are spent rather than after.
+
+The budget is an alert, not a cap: the agents stop and ask before passing it, so a
+run left unattended pauses rather than either overspending or dying. `0` runs with
+no alert at all. For scale, Agent 1 spent about $7 on 4,546 lines, and the
+sentence repair described below adds to that.
+
+`--non-interactive` takes every default without asking, which is what `app.py` and
+any scheduled job use.
 
 Where the input comes from is decided in that order of preference: a file named
 with `--input`, then the raw extracts if `--from-sources` or `--sources` says so,
@@ -822,11 +849,30 @@ The order is now reversed, and the model is trusted over the filter:
 2. **A failing sentence goes back to the model.** It is asked to mend exactly
    the listed faults: translate a foreign *common* noun, and keep a foreign
    *proper* noun as written. Spelling alone cannot tell `Gdańsk` from
-   `sprzątanie`; the model can. A rewrite is accepted only when it carries fewer
-   faults than the original, so a worse answer is discarded.
-3. **Stripping is the fallback, and it is surgical.** With no model available,
+   `sprzątanie`; the model can.
+3. **The model says which words are names.** It returns them in `keep_verbatim`,
+   and those words are then excluded both from the fault check and from the
+   stripping. This is the part that makes the rest work. Without it the check
+   reports `Gdańsk` as untranslated text for ever: the model answers correctly
+   by keeping the name, the answer scores no better than the sentence it
+   replaced because the fault count cannot fall, the rewrite is rejected, and
+   the name is deleted anyway. A rewrite is accepted only when it carries fewer
+   faults than the original with the vouched names held out of both counts, and
+   the vouching is honoured even when the rewrite itself is refused — a sentence
+   whose only fault was a place name was already right.
+4. **Stripping is the fallback, and it is surgical.** With no model available,
    only the offending words are lifted out and the seam they leave is closed, so
-   `L&T` and `port's 24/7` survive a line that also carries a Finnish noun.
+   `L&T` and `port's 24/7` survive a line that also carries a Finnish noun. With
+   no model there is also nothing to vouch for a name, so a place name is still
+   lost on that path: running without `--use-llm` costs accuracy here, not just
+   polish.
+
+One consequence worth knowing when reading a diff of two runs: the model cache
+is keyed on the task name, the model name and the payload, but **not** on the
+prompt text. Changing a prompt therefore requires bumping the task name, which
+is why they carry versions — `polish_sentence_v2`, `repair_sentence_v2`. Without
+that bump every line already in `agent1_model_cache.json` keeps its old answer
+and the new instruction never takes effect.
 
 The word floor is deliberately eight rather than the twelve the prompt requests.
 `Argon gas was purchased from Linde Gas AB under item 6513424191` is a complete
