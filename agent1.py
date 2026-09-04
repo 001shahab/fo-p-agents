@@ -97,7 +97,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.8.1"
+AGENT_VERSION = "1.9.0"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -686,6 +686,12 @@ _FOREIGN_ENDINGS = (
     "owy", "owa", "owe", "ami", "ach", "owi",
     "ungen", "keiten", "schaft",
 )
+# ``lookup_key`` folds accents, so an ending written with one could never match:
+# "telinetyöt" arrives as "telinetyot" and "työt" never fired. Folding both
+# sides is what makes the ending test, rather than the bare presence of an
+# accent, the thing that identifies a foreign common noun.
+_FOREIGN_ENDINGS_FOLDED = tuple(sorted(
+    {fold_accents(ending).lower() for ending in _FOREIGN_ENDINGS}))
 
 _POLISH_SHAPE = re.compile(
     r"(cz|sz|rz|dz|prz|sci|ych|owi|ami|ach|enie|anie)", re.IGNORECASE)
@@ -765,7 +771,7 @@ def is_foreign_common_noun(token: str) -> bool:
     if _FOREIGN_LETTERS.search(token) and len(key) > 2:
         return True
     if any(key.endswith(ending) and len(key) > len(ending) + 1
-           for ending in _FOREIGN_ENDINGS):
+           for ending in _FOREIGN_ENDINGS_FOLDED):
         return True
     if len(key) >= 6 and _POLISH_SHAPE.search(key):
         return True
@@ -793,17 +799,150 @@ def drop_foreign_common_nouns(text: str) -> str:
     return sentence_case(" ".join(kept)) if kept else ""
 
 
-def keep_published_english(text: str) -> str:
-    """Keep punctuation when the string is already English.
+# Function words that must not be left doubled or dangling once a word has been
+# lifted out of a finished sentence. Articles are held apart from prepositions
+# because "for the office" is correct English and only "for at the office" is a
+# hole: a preposition may be followed by an article, never by a preposition.
+_ARTICLES = ("a", "an", "the")
+_PREPOSITIONS = ("of", "for", "to", "in", "on", "at", "by", "with", "from",
+                 "as", "under", "per", "into", "onto")
+_SENTENCE_FUNCTION = _ARTICLES + _PREPOSITIONS + ("and", "or")
+_FUNCTION_ALTERNATION = "|".join(_SENTENCE_FUNCTION)
+_PREPOSITION_ALTERNATION = "|".join(_PREPOSITIONS)
+_REPEATED_FUNCTION = re.compile(
+    rf"\b({_FUNCTION_ALTERNATION})\s+(\1)\b", re.IGNORECASE)
+_DOUBLED_PREPOSITION = re.compile(
+    rf"\b({_PREPOSITION_ALTERNATION})\s+({_PREPOSITION_ALTERNATION})\b",
+    re.IGNORECASE)
+_DANGLING_FUNCTION = re.compile(
+    rf"[\s,;]+({_FUNCTION_ALTERNATION})\s*([.;:,]?)\s*$", re.IGNORECASE)
+_SPACE_BEFORE_PUNCTUATION = re.compile(r"\s+([.,;:)])")
+_EMPTY_BRACKETS = re.compile(r"\(\s*\)")
+# Preposition pairs English writes on purpose. Without these, "as of 1 August"
+# and "according to the offer" would each lose a word.
+_LEGITIMATE_FUNCTION_PAIRS = frozenset({
+    ("as", "of"), ("out", "of"), ("up", "to"), ("due", "to"), ("next", "to"),
+    ("prior", "to"), ("instead", "of"), ("part", "of"), ("according", "to"),
+    ("subject", "to"), ("close", "to"), ("in", "on"), ("from", "under"),
+})
 
-    ``drop_foreign_common_nouns`` tokenises, which would turn a polished
-    sentence back into a noun phrase.
+
+def _doubled_function_spans(text: str) -> List[str]:
+    """The doubled function words in ``text`` that signal a missing word."""
+    found = [match.group(0) for match in _REPEATED_FUNCTION.finditer(text)]
+    found.extend(
+        match.group(0) for match in _DOUBLED_PREPOSITION.finditer(text)
+        if match.group(1).lower() != match.group(2).lower()
+        and (match.group(1).lower(), match.group(2).lower())
+        not in _LEGITIMATE_FUNCTION_PAIRS)
+    return found
+
+
+def _close_sentence_gap(text: str) -> str:
+    """Close the grammar hole left by removing a word from a sentence.
+
+    Removing "Gdansk" from "for the office in Gdansk in September" leaves
+    "in in", which is the artefact Fortum reported. Repairing the seam is what
+    makes in-place removal safe enough to prefer over re-tokenising.
+    """
+    text = _WHITESPACE.sub(" ", text).strip()
+
+    def keep_first(match: "re.Match[str]") -> str:
+        first, second = match.group(1), match.group(2)
+        if (first.lower(), second.lower()) in _LEGITIMATE_FUNCTION_PAIRS:
+            return match.group(0)
+        return first
+
+    previous = None
+    while previous != text:
+        previous = text
+        text = _REPEATED_FUNCTION.sub(r"\1", text)
+        text = _DOUBLED_PREPOSITION.sub(keep_first, text)
+    text = _EMPTY_BRACKETS.sub("", text)
+    text = _SPACE_BEFORE_PUNCTUATION.sub(r"\1", text)
+    text = _WHITESPACE.sub(" ", text).strip()
+    previous = None
+    while previous != text:
+        previous = text
+        text = _DANGLING_FUNCTION.sub(r"\2", text).strip()
+    text = text.strip(" ,;:")
+    # Punctuation with nothing left to punctuate is not a description.
+    return text if re.search(r"[A-Za-z]", text) else ""
+
+
+def strip_foreign_words(text: str) -> str:
+    """Remove foreign common nouns from a finished sentence, keeping its shape.
+
+    ``drop_foreign_common_nouns`` tokenises, which throws away the apostrophes,
+    ampersands, slashes and closing full stop the model wrote and turns a
+    sentence back into a word list: ``L&T`` became ``L T`` and ``port's 24/7``
+    became ``port s 24 7``. Here only the offending words are lifted out and the
+    seam is closed, so the rest of the sentence reaches the reader intact.
     """
     text = normalise_text(text)
     if not text:
         return ""
+    spans = [match.span() for match in _TOKEN.finditer(text)
+             if is_foreign_common_noun(match.group(0))]
+    if not spans:
+        return text
+    for start, end in reversed(spans):
+        text = text[:start] + text[end:]
+    return _close_sentence_gap(text)
+
+
+# Below this a description is a fragment rather than the sentence Fortum asked
+# for. Deliberately well under the 12 words the prompt requests: a terse line
+# such as "Argon gas was purchased from Linde Gas AB under item 6513424191" is
+# complete, and re-asking for length alone would pad it with the filler verbs
+# that made Agent 2's groups too granular.
+PUBLISHED_WORD_FLOOR = 8
+# A single letter standing alone as a word, which is what survives when a
+# tokeniser splits "L&T" or "port's". Letters joined by an ampersand or a full
+# stop are excluded, because "L&T" and "Bloomberg Finance L.P." are correct.
+_LONE_LETTER = re.compile(r"(?<![\w'&.])[b-hj-z](?![\w'&.])", re.IGNORECASE)
+
+
+def published_faults(description: str) -> List[str]:
+    """Name what is wrong with a published description, worst first.
+
+    Drives the repair pass. Each fault is something a reader would notice: a
+    source-language noun, a hole where a word was lifted out, the remains of an
+    abbreviation the tokeniser split, or a fragment instead of a sentence.
+    """
+    text = normalise_text(description)
+    if not text:
+        return []
+    faults: List[str] = []
+    foreign = foreign_tokens_in(text)
+    if foreign:
+        faults.append("carries the source-language word(s): "
+                      + ", ".join(sorted(set(foreign))[:6]))
+    doubled = _doubled_function_spans(text)
+    if doubled:
+        faults.append("has a gap where a word is missing, showing as: "
+                      + ", ".join(sorted(set(doubled))[:4]))
+    if _DANGLING_FUNCTION.search(text):
+        faults.append("ends on a preposition, so the sentence is unfinished")
+    if _LONE_LETTER.search(text):
+        faults.append("contains a stray single letter, the remains of an "
+                      "abbreviation such as L&T")
+    if len(text.split()) < PUBLISHED_WORD_FLOOR:
+        faults.append(f"is only {len(text.split())} words, a fragment rather "
+                      "than a sentence")
+    return faults
+
+
+def keep_published_english(text: str) -> str:
+    """Keep a published sentence a sentence while ridding it of foreign nouns."""
+    text = normalise_text(text)
+    if not text:
+        return ""
     if has_non_english(text):
-        return drop_foreign_common_nouns(text)
+        return strip_foreign_words(text)
+    if _doubled_function_spans(text):
+        # A seam left by an earlier pass, or by a run whose model tier was off.
+        return _close_sentence_gap(text)
     return text
 
 
@@ -3044,22 +3183,33 @@ class TranslationEngine:
         self.results[phrase] = result
         return result
 
-    def ensure_english(self, text: str) -> str:
+    def ensure_english(self, text: str, published: bool = False) -> str:
         """Guarantee a published string contains no source-language nouns.
 
         Vocabulary, then the local neural model (trying Finnish/Swedish/Polish
         if identification was unsure), then the language model, then stripping
         leftover foreign tokens. An empty return means the line must be Unclear.
+
+        ``published`` marks text the model has already written as a sentence.
+        Such text is never sent through the vocabulary, which substitutes word by
+        word and would rewrite a finished sentence into a word list, and its
+        tidying preserves punctuation instead of re-tokenising.
         """
         if not text:
             return ""
+        finish = strip_foreign_words if published else tidy_published_english
         language, _ = detect_language(text, self.lexicon)
         if not has_non_english(text) and language in {"en", "und"}:
             return text.strip()
 
+        if published:
+            # One foreign noun in an otherwise English sentence is a word to
+            # lift out, not grounds for translating the sentence again.
+            if language in {"en", "und"}:
+                return finish(text)
         english, _, _, _ = self._resolve_with_vocabulary(text, language)
         if english and not has_non_english(english):
-            return tidy_published_english(english)
+            return finish(english) if published else tidy_published_english(english)
 
         candidates = [language] if language in {"fi", "sv", "pl", "de"} else []
         for code in ("fi", "sv", "pl", "de"):
@@ -3071,7 +3221,7 @@ class TranslationEngine:
                     continue
                 translated = self.neural.translate_batch([text], code).get(text, "")
                 if translated and not has_non_english(translated):
-                    return tidy_published_english(translated)
+                    return finish(translated)
 
         if self.model is not None and self.model.config.enabled:
             pending = {text: (language if language in {"fi", "sv", "pl", "de"} else "fi", 0.0)}
@@ -3080,8 +3230,10 @@ class TranslationEngine:
             self._run_model_tier(pending)
             forced = self.results.get(text)
             if forced and forced.english_text and not has_non_english(forced.english_text):
-                return tidy_published_english(forced.english_text)
+                return finish(forced.english_text)
 
+        if published:
+            return strip_foreign_words(text)
         cleaned = drop_foreign_common_nouns(english or text)
         if cleaned and not has_non_english(cleaned):
             return tidy_published_english(cleaned)
@@ -3140,7 +3292,13 @@ class TranslationEngine:
             "5. If the draft is a fragment, expand it into a sentence using "
             "only facts in original. Do not invent detail that is not in the source.\n"
             "6. If original is empty or a placeholder, set item_or_service to "
-            "Unclear rather than guessing from a category."
+            "Unclear rather than guessing from a category.\n"
+            "7. Keep the names of places, companies, plants and sites exactly as "
+            "the original writes them, accents included. Gdansk, Wroclaw and "
+            "Lindstrom are correct English usage.\n"
+            "8. Do not name an individual person. Contingent-workforce lines "
+            "often carry the contractor's name; describe the role or the work "
+            "instead, so the description carries no personal data."
         )
         response = self.model.complete_json(prompt, payload)
         if not response:
@@ -3149,6 +3307,86 @@ class TranslationEngine:
                     item_or_service)
         self.model.store(cache_key, json.dumps(response, ensure_ascii=False, sort_keys=True))
         return self._take_polish(response, draft, short, item_or_service)
+
+    def repair_published(self, original: str, description: str, short: str,
+                         faults: Sequence[str]) -> Tuple[str, str]:
+        """Ask the model to mend a published description that failed the check.
+
+        The alternative is to delete the offending word locally, which is what
+        used to happen and what turned "for the office in Gdansk in September"
+        into "for the office in in September". The model can tell a place or a
+        supplier from a Finnish common noun, so it is asked to translate the one
+        and keep the other, rather than the agent guessing from spelling alone.
+        """
+        if self.model is None or not self.model.config.enabled:
+            return description, short
+        if not description or not faults:
+            return description, short
+
+        payload = json.dumps({
+            "original": original,
+            "description": description,
+            "short_description": short,
+            "problems": list(faults),
+        }, ensure_ascii=False)
+        cache_key = self.model.cache_key("repair_sentence_v1", payload)
+        cached = self.model.cached(cache_key)
+        if cached:
+            try:
+                parsed = json.loads(cached)
+            except json.JSONDecodeError:
+                parsed = None
+            if parsed:
+                return self._take_repair(parsed, description, short)
+
+        prompt = (
+            "You mend one English purchase description that failed a quality "
+            "check. Return JSON: {\"description\": \"...\", "
+            "\"short_description\": \"...\"}.\n"
+            "Rules:\n"
+            "1. Fix every listed problem and change nothing else.\n"
+            "2. Keep proper nouns exactly as written: place names, company "
+            "names, plant and site names, item and reference numbers. A word "
+            "that looks foreign because it is a Finnish, Swedish, Polish or "
+            "Norwegian name is correct English usage and must stay.\n"
+            "3. Translate a foreign common noun into English rather than "
+            "deleting it. 'Telinetyot' is scaffolding work, 'sprzatanie' is "
+            "cleaning. Never leave a source-language common noun in place.\n"
+            "4. Keep the punctuation, apostrophes, ampersands and units the "
+            "sentence needs. 'L&T' and \"port's 24/7\" are correct.\n"
+            "5. description is one or two complete English sentences with a "
+            "verb, typically 12 to 30 words. Use only facts in 'original'; "
+            "never invent detail to reach a length.\n"
+            "6. Do not name an individual person. Where the original names a "
+            "contractor or a requester, describe the role or the work instead, "
+            "so the description carries no personal data.\n"
+            "7. short_description is a compact English noun phrase of at most "
+            "twelve words for the same purchase."
+        )
+        response = self.model.complete_json(prompt, payload)
+        if not response:
+            return description, short
+        self.model.store(cache_key, json.dumps(response, ensure_ascii=False,
+                                               sort_keys=True))
+        return self._take_repair(response, description, short)
+
+    @staticmethod
+    def _take_repair(parsed: Dict[str, Any], description: str,
+                     short: str) -> Tuple[str, str]:
+        """Accept a repair only when it is an improvement.
+
+        A repair that still carries the fault, or that came back empty, is
+        discarded: the caller's own stripping is a known quantity, whereas a
+        worse sentence from the model is not.
+        """
+        mended = normalise_text(parsed.get("description"))
+        if not mended:
+            return description, short
+        if len(published_faults(mended)) >= len(published_faults(description)):
+            return description, short
+        mended_short = (normalise_text(parsed.get("short_description"))
+                        or short)
+        return sentence_case(mended), sentence_case(mended_short)
 
     @staticmethod
     def _take_polish(parsed: Dict[str, Any], draft: str, short: str,
@@ -3895,6 +4133,12 @@ class Agent1:
 
         self.tables: List[Tuple[Table, SourceProfile, ColumnResolver]] = []
         self.run_id = ""
+        # How often a published description failed the quality check and how
+        # often the model mended it. Reported, because a rising attempt count
+        # with a flat acceptance count means the check is firing on sentences
+        # the model cannot improve.
+        self.repairs_attempted = 0
+        self.repairs_accepted = 0
 
         # Cross-source evidence, keyed by every identifier a row can be found by.
         self.evidence_by_key: Dict[str, EvidenceBundle] = defaultdict(EvidenceBundle)
@@ -4350,11 +4594,31 @@ class Agent1:
             if description.item_or_service == "Unclear" and not description.description:
                 description.short_description = ""
 
-        description.description = self.translator.ensure_english(description.description)
+            # Checked before anything is stripped locally, so the model still
+            # sees the sentence it wrote. Deleting the offending word here is
+            # what produced "for the office in in September 2024".
+            faults = published_faults(description.description)
+            if faults:
+                self.repairs_attempted += 1
+                mended, mended_short = self.translator.repair_published(
+                    source, description.description,
+                    description.short_description, faults)
+                if mended != description.description:
+                    self.repairs_accepted += 1
+                    description.description = mended
+                    description.short_description = mended_short
+
+        description.description = self.translator.ensure_english(
+            description.description, published=True)
         description.short_description = self.translator.ensure_english(
-            description.short_description)
+            description.short_description, published=True)
+        # A source-language noun that survived both the repair and the stripping
+        # leaves nothing publishable; anything else keeps the sentence.
         if has_non_english(description.description):
-            description.description = ""
+            description.description = strip_foreign_words(description.description)
+            description.short_description = strip_foreign_words(
+                description.short_description)
+        if not description.description:
             description.short_description = ""
         elif description.description and not description.short_description:
             description.short_description = self.synthesiser._shorten(description.description)
@@ -4379,12 +4643,13 @@ class Agent1:
         business = record.business
         sources = list(record.own_descriptions_raw) + [record.primary_text]
         return {
-            "Enriched_Purchase_Description": (
-                "" if has_non_english(description.description)
-                else restore_source_specifications(description.description, *sources)),
-            "Enriched_Description_Short": (
-                "" if has_non_english(description.short_description)
-                else restore_source_specifications(description.short_description, *sources)),
+            # A leftover source-language noun costs that word, not the row. This
+            # gate used to blank the whole description, which is how a good
+            # English sentence disappeared over a single Finnish token.
+            "Enriched_Purchase_Description": restore_source_specifications(
+                keep_published_english(description.description), *sources),
+            "Enriched_Description_Short": restore_source_specifications(
+                keep_published_english(description.short_description), *sources),
             # Never blank. Fortum asked for "Unclear" rather than an empty cell,
             # and a header, subtotal or empty row is the clearest case of a line
             # that does not say what was purchased.
@@ -4538,6 +4803,8 @@ class Agent1:
             "mean_confidence": round(sum(confidence_totals) / len(confidence_totals), 1)
                                if confidence_totals else 0.0,
             "confidence_bands": dict(band_counts),
+            "sentence_repairs_attempted": self.repairs_attempted,
+            "sentence_repairs_accepted": self.repairs_accepted,
         })
         if self.model is not None:
             statistics["token_usage"] = {
@@ -4874,6 +5141,15 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
     if bands:
         band_summary = "  ".join(f"{name} {count:,}" for name, count in sorted(bands.items()))
         print(f"  Confidence bands     : {band_summary}")
+
+    attempted = statistics.get("sentence_repairs_attempted", 0)
+    if attempted:
+        accepted = statistics.get("sentence_repairs_accepted", 0)
+        print(f"  Sentences re-asked   : {attempted:,} failed the quality check, "
+              f"{accepted:,} mended")
+        if accepted < attempted:
+            print(f"    {attempted - accepted:,} kept the agent's own wording: the "
+                  "model's rewrite was not an improvement.")
 
     methods = [(name.replace("translation_", ""), value)
                for name, value in statistics.items() if name.startswith("translation_")]

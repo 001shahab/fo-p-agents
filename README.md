@@ -794,6 +794,66 @@ The tier that produced each description is recorded in `Translation_Method`, and
 `Translation_Coverage` gives the share of content tokens the local stack
 resolved.
 
+### The model has the last word on the published sentence
+
+Both published columns are written by the model when the language-model tier is
+on, and until version 1.9.0 a deterministic filter then ran over what it wrote.
+That filter worked on the whole sentence: a single word it read as foreign sent
+the entire sentence back through the tokeniser, which threw away the punctuation
+and deleted the offending word wherever it stood. One accented place name was
+enough to do it, and roughly 44% of published sentences on the Fortum extract
+came out that way — no closing full stop, no apostrophes, no ampersands.
+
+The damage that caused is worth naming, because it is what a reader notices:
+
+| the model wrote | the filter published |
+| --- | --- |
+| `... for the office in Gdańsk in September 2024.` | `... for the office in in September 2024` |
+| `... from LINDSTRÖM OY under agreement 4501.` | `... from OY under agreement 4501` |
+| `... from L&T Siivous Oy under reference 23277031.` | `... from L T Oy under reference 23277031` |
+| `Fortum Inkoo port's 24/7 security guarding` | `Fortum Inkoo port s 24 7 security guarding` |
+
+The order is now reversed, and the model is trusted over the filter:
+
+1. **The sentence is checked, not rewritten.** `published_faults` reports what is
+   wrong with a description — a source-language noun, a gap showing as `in in`,
+   an unfinished ending, the single letter left when `L&T` is split, or a
+   fragment shorter than eight words.
+2. **A failing sentence goes back to the model.** It is asked to mend exactly
+   the listed faults: translate a foreign *common* noun, and keep a foreign
+   *proper* noun as written. Spelling alone cannot tell `Gdańsk` from
+   `sprzątanie`; the model can. A rewrite is accepted only when it carries fewer
+   faults than the original, so a worse answer is discarded.
+3. **Stripping is the fallback, and it is surgical.** With no model available,
+   only the offending words are lifted out and the seam they leave is closed, so
+   `L&T` and `port's 24/7` survive a line that also carries a Finnish noun.
+
+The word floor is deliberately eight rather than the twelve the prompt requests.
+`Argon gas was purchased from Linde Gas AB under item 6513424191` is a complete
+description, and re-asking for length alone would pad it with the filler verbs
+that made Agent 2's groups too granular.
+
+Two counters are reported at the end of a run and recorded in the manifest as
+`sentence_repairs_attempted` and `sentence_repairs_accepted`. A rising attempt
+count with a flat acceptance count means the check is firing on sentences the
+model cannot improve, which is a signal to read a sample rather than to raise a
+threshold. On the 4,546-line extract the check fires on about 13% of rows, one
+cached call each.
+
+### No individual is named
+
+Contingent-workforce lines carry the contractor's name: `Consulting - Ville
+Seppänen MAGNIT GLOBAL FINLAND OY` and `Heli Grönholm for IT Assistant Team` are
+both real Fortum lines, and Magnit Global alone accounts for 495 rows of the
+4,546-line extract. Before 1.9.0 whether the name survived was an accident of
+spelling — `Grönholm` was deleted because it carries an umlaut, `Erik Karlsson`
+was published because it does not.
+
+Both prompts now state the rule: describe the role or the work, never the
+person. This is a privacy requirement rather than a tidiness one. A published
+description is a deliverable, and an individual's name beside a cost centre and
+a supplier is personal data about their employment.
+
 ### Output
 
 | File | Contents |
