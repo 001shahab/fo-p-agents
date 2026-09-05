@@ -431,11 +431,21 @@ def probe_chat_endpoint(endpoint: str, api_key: str, model: str,
     add", the run completes with the AI columns filled by the fallback. Finding
     that out at the end costs the whole run; finding it out here costs a second.
 
+    The transport is assembled to match the agents' rather than merely to work.
+    The trust store is injected as ``configure_process_logging`` does for them,
+    and ``requests`` is preferred where it is installed because that is what
+    they use. The first version of this did neither, and refused to start a run
+    on the client's estate that all four agents would have completed: the
+    corporate root is in the system store and not in certifi's bundle, so the
+    check failed the TLS handshake the agents go on to make successfully. A
+    preflight stricter than the thing it vouches for is its own kind of wrong.
+
     The return value is a sentence naming what went wrong, ready to print.
     """
     import urllib.error
     import urllib.request
 
+    trust = use_system_trust_store()
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -446,10 +456,19 @@ def probe_chat_endpoint(endpoint: str, api_key: str, model: str,
     body = chat_completion_body(
         model, 'Reply with the JSON object {"ok": true} and nothing else.', "ok")
 
+    try:
+        import requests as _requests
+    except ImportError:
+        _requests = None
+
     def send(payload: Dict[str, Any]) -> Tuple[int, str]:
-        request = urllib.request.Request(
-            endpoint, data=json.dumps(payload).encode("utf-8"),
-            headers=headers, method="POST")
+        data = json.dumps(payload).encode("utf-8")
+        if _requests is not None:
+            response = _requests.post(endpoint, headers=headers, data=data,
+                                      timeout=timeout)
+            return response.status_code, response.text
+        request = urllib.request.Request(endpoint, data=data, headers=headers,
+                                         method="POST")
         try:
             with urllib.request.urlopen(request, timeout=timeout) as handle:
                 return handle.status, handle.read().decode("utf-8", errors="replace")
@@ -466,9 +485,17 @@ def probe_chat_endpoint(endpoint: str, api_key: str, model: str,
     except Exception as error:  # noqa: BLE001 - the reason is what is wanted
         detail = str(error)
         if "CERTIFICATE_VERIFY_FAILED" in detail or "certificate" in detail.lower():
-            return (f"the endpoint could not be verified ({detail}). Install "
-                    f"truststore so Python trusts the same certificates the "
-                    f"browser does: pip install truststore")
+            if trust is None:
+                return (f"the endpoint could not be verified ({detail}). Python is "
+                        f"trusting certifi's bundle, which does not hold this "
+                        f"network's root certificate. Install truststore so it "
+                        f"trusts the same certificates the browser does: "
+                        f"pip install truststore")
+            return (f"the endpoint could not be verified ({detail}). This was "
+                    f"checked against {trust}, so the network's root certificate "
+                    f"is not installed there either, and exporting it by hand is "
+                    f"the remaining option: see 'self-signed certificate in "
+                    f"certificate chain' in the README")
         return f"the endpoint could not be reached ({detail})"
 
     if status == 200:

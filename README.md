@@ -2359,11 +2359,24 @@ Note that `AZURE_ENABLE=true` reads `AZURE_OPENAI_API_KEY`, not `OPENAI_API_KEY`
 and that an exported-but-empty variable no longer blanks the key in the file.
 
 **`the check before the run failed`** — the key is present and the endpoint did
-not accept it. The message distinguishes the cases: `HTTP 401` or `403` means the
-key is not accepted, `HTTP 404` means no deployment of that name exists on this
-endpoint (check `AZURE_OPENAI_MODEL`), and `could not be reached` means the
-network is in the way — on the PwC estate, usually because `AZURE_ENABLE=true` is
-missing and the agents are resolving `api.openai.com`.
+not answer. The message distinguishes the cases:
+
+- `HTTP 401` or `403` — the key is not accepted.
+- `HTTP 404` — no deployment of that name exists on this endpoint. Check
+  `AZURE_OPENAI_MODEL` or `MODEL_NAME`.
+- `could not be reached` — the network is in the way. On the PwC estate this is
+  usually `AZURE_ENABLE=true` missing, so the agents resolve `api.openai.com`,
+  which that network does not route.
+- `could not be verified` — TLS. The check is made against the operating system
+  trust store where `truststore` is installed, which is where a corporate root
+  already is; if the message says Python is trusting certifi's bundle instead,
+  `pip install truststore`. If it says the system store was used and the
+  certificate still failed, the root is not installed there either and has to be
+  exported by hand: see [`self-signed certificate in certificate chain`](#self-signed-certificate-in-certificate-chain).
+
+The check builds its request the way the agents build theirs — same trust store,
+same HTTP library — because a check stricter than the agents it vouches for would
+refuse runs that would have worked.
 
 **`The language model has spent an estimated $... reaching the $... budget`** —
 an unattended run reached its ceiling and stopped. It stops rather than finishing
