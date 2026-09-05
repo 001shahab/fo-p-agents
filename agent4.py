@@ -96,7 +96,6 @@ import hashlib
 import json
 import logging
 import math
-import os
 import re
 import sys
 import unicodedata
@@ -106,9 +105,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from runtime import (
-    DEFAULT_AZURE_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT,
-    chat_completion_body, configure_process_logging, load_sentence_transformer,
-    retry_chat_body,
+    DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT, SpendLimitReached,
+    chat_completion_body, chat_endpoint, configure_process_logging,
+    load_sentence_transformer, missing_key_message, model_environment, parse_dotenv,
+    resolve_credentials, retry_chat_body,
 )
 
 LOGGER = logging.getLogger("agent4")
@@ -185,8 +185,8 @@ class ModelConfig:
 
     @property
     def endpoint(self) -> str:
-        url = self.base_url.rstrip("/")
-        return url if url.endswith("/chat/completions") else f"{url}/chat/completions"
+        """Full chat-completions URL. See ``runtime.chat_endpoint``."""
+        return chat_endpoint(self.base_url)
 
 
 # The scopes the comparison is run within. The plan names Category L2 as the
@@ -281,25 +281,12 @@ class Settings:
 
 
 def load_dotenv(path: Path) -> Dict[str, str]:
-    """Parse a ``.env`` file into a dictionary; later assignments win."""
-    values: Dict[str, str] = {}
-    if not path.is_file():
-        return values
-    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.lower().startswith("export "):
-            line = line[7:].strip()
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        if key:
-            values[key] = value
-    return values
+    """Read the ``.env`` beside this script.
+
+    Delegates so that every script parses the file identically; the reasoning
+    for each concession the parser makes is in ``runtime.parse_dotenv``.
+    """
+    return parse_dotenv(path)
 
 
 def _env_flag(value: Optional[str], default: bool = False) -> bool:
@@ -339,28 +326,20 @@ def resolve_model_config(env: Dict[str, str], use_llm: bool,
     config.output_cost_per_mtok = max(
         0.0, _env_float(env.get("LLM_OUTPUT_COST_PER_MTOK"), OUTPUT_COST_PER_MTOK))
 
-    if _env_flag(env.get("AZURE_ENABLE"), False):
-        config.backend = "azure"
-        config.api_key = (env.get("AZURE_OPENAI_API_KEY") or env.get("AZURE_API_KEY")
-                          or env.get("OPENAI_API_KEY") or "")
-        config.base_url = (env.get("AZURE_OPENAI_BASE_URL") or env.get("AZURE_BASE_URL")
-                           or env.get("BASE_URL")
-                           or "https://genai-sharedservice-emea.pwcinternal.com/v1/chat/completions")
-        config.model = env.get("AZURE_OPENAI_MODEL") or env.get("MODEL_NAME") or DEFAULT_AZURE_MODEL
-        config.reasoning_effort = (
-            env.get("LLM_REASONING_EFFORT") or DEFAULT_REASONING_EFFORT).strip().lower()
-    else:
-        config.backend = "openai"
-        config.api_key = env.get("OPENAI_API_KEY", "")
-        config.base_url = env.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
-        config.model = env.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
-        config.reasoning_effort = (
-            env.get("LLM_REASONING_EFFORT") or DEFAULT_REASONING_EFFORT).strip().lower()
+    credentials = resolve_credentials(env)
+    config.backend = credentials["backend"]
+    config.api_key = credentials["api_key"]
+    config.base_url = credentials["base_url"]
+    config.model = credentials["model"]
+    config.reasoning_effort = credentials["reasoning_effort"]
 
     if config.enabled and not config.api_key:
-        LOGGER.warning("Language-model tier requested but no API key was found for the "
-                       "%s backend; continuing without it.", config.backend)
-        config.enabled = False
+        # Refuses rather than warns. Every call site falls back to a
+        # deterministic answer when the model is silent, so a run without a key
+        # produces a full set of columns and looks finished; runtime's message
+        # says which variables were read and where.
+        raise SystemExit(missing_key_message(
+            config.backend, Path(__file__).resolve().parent / ".env"))
     return config
 
 
@@ -1894,6 +1873,15 @@ class SpendGuard:
     already has a deterministic path to fall back on, and the work completed so
     far is kept.
 
+    Where there is nobody to ask - under ``--non-interactive``, which is how
+    ``all_agents.py`` starts every agent - reaching the figure stops the run
+    instead of switching the model off. Switching it off is safe for a person
+    who chose it and knows which half of the output it applies to, and unsafe
+    for a run left alone overnight, which would produce a file whose first rows
+    were read by the model and whose remaining rows were not, with nothing in it
+    to say where the boundary fell. A budget of zero means no ceiling, for a run
+    that should read every row whatever it costs.
+
     The estimate is derived from the token counts the API reports, so it lags
     the true figure by at most one request and cannot account for discounts
     applied at invoicing. It is a guard rail, not an accounting record.
@@ -1936,12 +1924,21 @@ class SpendGuard:
         # by more than a whole step, and each step still needs its own answer.
         while self.usage.estimated_cost >= self.limit:
             if not self.interactive:
-                LOGGER.warning(
-                    "Estimated language-model spend is $%.2f, at or above the $%.2f limit. "
-                    "Continuing without the model; raise --llm-spend-limit to allow more.",
-                    self.usage.estimated_cost, self.limit)
-                self._stop()
-                return
+                # Stops the run rather than finishing it on the local stack.
+                # Carrying on would leave the rows read before this point with
+                # AI columns and every row after it without, and nothing in the
+                # output would say which were which - the failure that is
+                # expensive precisely because it looks like success.
+                raise SpendLimitReached(
+                    f"\nThe language model has spent an estimated "
+                    f"${self.usage.estimated_cost:,.2f}, reaching the "
+                    f"${self.limit:,.2f} budget, and this run has nobody to ask "
+                    f"for more, so it stops here.\n\n"
+                    f"Every answer paid for has been written to the response "
+                    f"cache, so starting again reads those back for nothing and "
+                    f"only the rows still to do cost anything.\n\n"
+                    f"Raise the budget with --llm-spend-limit, or pass "
+                    f"--llm-spend-limit 0 to run with no ceiling at all.")
             if not self._ask():
                 self._stop()
                 return
@@ -2096,7 +2093,14 @@ class LanguageModelClient:
         self.usage.record(response.get("usage") or {})
         # Checked after every response, so a limit reached mid-batch takes
         # effect on the next call rather than at the end of the phase.
-        self.guard.review()
+        try:
+            self.guard.review()
+        except SpendLimitReached:
+            # The cache is otherwise written once, when the run finishes. Without
+            # this, a run stopped by the budget discards every answer it paid
+            # for and the next attempt buys them a second time.
+            self.save_cache()
+            raise
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
@@ -3040,13 +3044,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     configure_logging(args.verbose)
 
-    env = load_dotenv(Path(__file__).resolve().parent / ".env")
-    env.update({key: value for key, value in os.environ.items() if key in {
-        "AZURE_ENABLE", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
-        "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_MODEL",
-        "BASE_URL", "MODEL_NAME", "LLM_BATCH_SIZE", "LLM_TIMEOUT", "LLM_MAX_REQUESTS",
-        "LLM_REASONING_EFFORT",
-    }})
+    env = model_environment(Path(__file__).resolve().parent / ".env")
 
     try:
         settings = resolve_settings(args, env)

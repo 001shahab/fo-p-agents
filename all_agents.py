@@ -165,6 +165,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
+from runtime import (
+    budget_for_rows, chat_endpoint, estimated_model_cost, missing_key_message,
+    model_environment, parse_dotenv, probe_chat_endpoint, resolve_credentials,
+)
+
 AGENT_NAME = "All Agents - Input Table Widened With Agents 1 to 4"
 AGENT_VERSION = "1.1.0"
 
@@ -1313,7 +1318,19 @@ class AgentChain:
         merge goes on to compare business keys row by row and refuses to write
         anything if they disagree, so a stale output that passes here is still
         caught before it can reach the deliverable.
+
+        What they cannot establish is whether the model was on when the file was
+        written, and that is not a detail: an output produced without it has all
+        of its columns and differs only in the quality of what is in them, so it
+        passes both checks and reads as a finished result. So the agent's own
+        manifest is consulted for that one fact. Max leaves it beside the output
+        it wrote, which is the case this reuse exists for; a folder of CSVs copied
+        from another machine without their manifests is the case it must refuse,
+        because reusing one of those would silently undo the reason for asking for
+        the model in the first place.
         """
+        if not self._written_with_same_tier(step, candidate):
+            return False
         header = read_header(candidate)
         if ROW_NUMBER_COLUMN not in header:
             return False
@@ -1542,6 +1559,35 @@ class AgentChain:
         step.rows = count_rows(step.output_path)
         step.usage = self._read_usage(step)
 
+    def _written_with_same_tier(self, step: AgentStep, candidate: Path) -> bool:
+        """Whether this output was written with the model tier this run is using.
+
+        Only asked of an output with no reuse record of its own, where it is the
+        difference between reusing a result and reusing the absence of one. A
+        stamped output already records the tier among its settings.
+        """
+        manifest = candidate.parent / f"{Path(step.script).stem}_run_manifest.json"
+        if not manifest.is_file():
+            if self.settings.use_llm:
+                LOGGER.info("%s in %s has no manifest beside it, so there is nothing "
+                            "to say whether the model wrote it. It is rerun rather "
+                            "than reused.", candidate.name, candidate.parent.name)
+                return False
+            return True
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return not self.settings.use_llm
+        had_model = bool((payload.get("configuration") or {}).get("language_model"))
+        if had_model != self.settings.use_llm:
+            LOGGER.info("%s in %s was written with the model %s and this run has it "
+                        "%s, so it is rerun rather than reused.",
+                        candidate.name, candidate.parent.name,
+                        "on" if had_model else "off",
+                        "on" if self.settings.use_llm else "off")
+            return False
+        return True
+
     def _read_usage(self, step: AgentStep) -> Dict[str, Any]:
         """What the agent's own manifest says the model cost it."""
         if not step.output_path:
@@ -1558,11 +1604,40 @@ class AgentChain:
 
     # -- the chain -----------------------------------------------------------
 
+    def _report_expected_spend(self, input_path: Path) -> None:
+        """Say what the model is likely to cost on this table, and whether the
+        budget covers it.
+
+        Said here because this is the first point at which both figures are
+        known: the budget was chosen before the table was built. A budget that
+        does not cover the file is not an error - it may be exactly what was
+        intended - but it does decide how the run ends, so it is worth one line
+        before the hours rather than a surprise after them.
+        """
+        if not self.settings.use_llm:
+            return
+        rows = count_rows(input_path)
+        expected = estimated_model_cost(rows)
+        budget = self.settings.llm_spend_limit or 0.0
+        if not budget:
+            LOGGER.info("Model budget: no ceiling. %d row(s) at the measured rate is "
+                        "about $%.0f.", rows, expected)
+            return
+        LOGGER.info("Model budget: $%.2f for %d row(s), which the measured rate puts "
+                    "at about $%.0f.", budget, rows, expected)
+        if expected > budget:
+            LOGGER.warning(
+                "That budget is unlikely to cover the file. The agent that reaches "
+                "it stops, having read part of the table, and this run ends without "
+                "a dataset. Start again with --llm-spend-limit %.0f, or 0 for no "
+                "ceiling, to read every row.", budget_for_rows(rows, budget))
+
     def run(self, input_path: Path) -> List[AgentStep]:
         """Run the four agents over the purchase table, in order."""
         self.settings.work_dir.mkdir(parents=True, exist_ok=True)
         self.origin_name = input_path.name
         self.journal.start(input_path, digest_of(input_path), self.settings.use_llm)
+        self._report_expected_spend(input_path)
         common = self._common_arguments()
         lexicon_dir = self.here / "lexicon"
 
@@ -2860,13 +2935,29 @@ def print_summary(runner: Runner, settings: Settings) -> None:
         if spend["stopped_at_limit"]:
             print(f"    {', '.join(spend['stopped_at_limit'])} stopped calling the "
                   f"model at the spend limit and finished on the local stack.")
+        # Named rather than left in the manifest. A run whose calls all failed
+        # costs nothing and produces exactly the output of a run with the model
+        # switched off, so silence here reads as success.
+        failed = [entry for entry in spend["per_agent"]
+                  if entry["failed_requests"] and not entry["reused"]]
+        for entry in failed:
+            print(f"    {entry['agent']} had {entry['failed_requests']:,} of "
+                  f"{entry['requests'] + entry['failed_requests']:,} request(s) "
+                  f"refused; those lines carry the local answer. "
+                  f"{settings.work_dir.name}/"
+                  f"{entry['agent'].replace(' ', '').lower()}.log says why.")
         print("    Estimated from the published rates, an upper bound rather than "
               "an invoice.")
     elif settings.use_llm:
-        print("\n  Language model       : switched on, but no agent reported any "
-              "spend.")
-        print("    Either every answer came from the response cache, or the calls "
-              "failed. The agent logs in the working folder say which.")
+        # This wording used to offer two possibilities and point at the logs. It
+        # was read on a run whose .env had not travelled to the client's machine,
+        # where the true answer was a third thing: every agent found no key and
+        # continued without the model. The agents now refuse to start in that
+        # case, so what remains here really is the cache.
+        print("\n  Language model       : switched on, and no agent needed to call it.")
+        print("    Every answer came from the response cache, which is what a "
+              "second run over the same rows looks like.")
+        print("    Delete the cache folder to make the agents ask the model again.")
 
     print("\n  Coverage")
     annotated = statistics["rows_annotated_agents_1_to_3"]
@@ -2979,7 +3070,10 @@ def build_parser() -> argparse.ArgumentParser:
     tiers.add_argument("--use-llm", action="store_true",
                        help="allow the agents to call the language model (the default)")
     tiers.add_argument("--llm-spend-limit", metavar="USD", type=float, default=None,
-                       help="alert each agent when its estimated spend reaches this")
+                       help="stop each agent when its estimated spend reaches this; "
+                            "0 for no ceiling")
+    tiers.add_argument("--skip-model-check", action="store_true",
+                       help="start without checking that the model endpoint answers")
     tiers.add_argument("--agent-timeout", metavar="SECONDS", type=int, default=None,
                        help="give up on an agent that runs longer than this; Agent 3 "
                             "needs many minutes on the client's full catalogue")
@@ -2998,24 +3092,68 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def read_dotenv(path: Path) -> Dict[str, str]:
-    """Read .env for the spend limit default, without exporting anything.
+    """Read .env for the preflight check and the budget default.
 
-    The agents read their own endpoints and keys from the same file in their own
-    processes. Nothing is put into the environment here.
+    Nothing is exported. The agents read their own endpoints and keys from the
+    same file in their own processes; what is read here is used to establish,
+    before any of them starts, that there is something for them to read.
+
+    Parsed by ``runtime.parse_dotenv``, which is what the agents use. A local
+    copy that read the file even slightly differently would be able to find a
+    key where the agents find none, which is the one thing this must not do.
     """
-    values: Dict[str, str] = {}
-    if not path.is_file():
-        return values
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            name, _, value = line.partition("=")
-            values[name.strip()] = value.strip().strip('"').strip("'")
+        return parse_dotenv(path)
     except OSError:
-        pass
-    return values
+        return {}
+
+
+def preflight_model(here: Path, skip_check: bool) -> Dict[str, str]:
+    """Establish that the model can be called, before anything depends on it.
+
+    The reason this exists is a run on the client's machine that took hours,
+    reported success, and had no AI content in it at all. Its .env had not
+    travelled with the repository, so each agent found no key, said so in a line
+    of its own log, and carried on: every call site falls back to a
+    deterministic answer, so all the columns were present and the only outward
+    sign was that the descriptions were noun phrases rather than sentences.
+
+    Two checks, in the order they fail. Whether there is a key at all, which is
+    free. Then whether the endpoint accepts it, which costs one request and
+    catches the cases a key's presence cannot: revoked, wrong tenant, or a model
+    name that does not exist on this deployment.
+    """
+    credentials = resolve_credentials(model_environment(here / ".env"))
+    if not credentials["api_key"]:
+        raise SystemExit(missing_key_message(credentials["backend"], here / ".env"))
+
+    endpoint = chat_endpoint(credentials["base_url"])
+    if skip_check:
+        LOGGER.warning("Not checking the model endpoint, as asked. The agents will "
+                       "fall back to the local stack for any call it refuses.")
+        return credentials
+
+    LOGGER.info("Checking the %s endpoint before starting: %s",
+                credentials["backend"], endpoint)
+    failure = probe_chat_endpoint(endpoint, credentials["api_key"],
+                                  credentials["model"])
+    if failure:
+        raise SystemExit(
+            f"\nThe language model is switched on and the check before the run "
+            f"failed: {failure}\n\n"
+            f"  endpoint  {endpoint}\n"
+            f"  model     {credentials['model']}\n"
+            f"  backend   {credentials['backend']}\n\n"
+            f"The run stops here rather than starting, because the agents treat a "
+            f"refused call as 'the model had nothing to add' and fall back to a "
+            f"local answer. It would finish with every column present and none of "
+            f"them written by the model.\n\n"
+            f"Fix the endpoint, or pass --no-llm to run on the local stack "
+            f"deliberately. If the check itself is wrong, --skip-model-check "
+            f"starts the run anyway.")
+    LOGGER.info("The model answered, using %s on the %s backend.",
+                credentials["model"], credentials["backend"])
+    return credentials
 
 
 def resolve_settings(args: argparse.Namespace) -> Settings:
@@ -3061,12 +3199,20 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         results_dir = Path(ask("Results folder", str(results_dir)))
         existing = next((results_dir / name for name in MAX_STAGE_FILES
                          if (results_dir / name).is_file()), None)
+        # Kept so the budget can be quoted against the size of the job rather
+        # than against a figure that meant something on a different dataset.
+        known_rows = 0
+        if input_path and input_path.is_file():
+            known_rows = count_rows(input_path)
         if existing and not from_sources:
+            known_rows = count_rows(existing)
             print(f"\n  Found {existing.name} in the results folder, "
-                  f"holding {count_rows(existing):,} row(s).")
+                  f"holding {known_rows:,} row(s).")
             reuse = ask_yes_no("Use it as the input rather than starting from the "
                                "raw extracts", True)
             from_sources = not reuse
+            if from_sources:
+                known_rows = 0
         if from_sources or not existing:
             source_dir = Path(ask("Source extracts folder", str(source_dir)))
 
@@ -3090,13 +3236,24 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         use_llm = ask_yes_no("Let the agents call the language model where they ask to",
                              use_llm)
         if use_llm:
-            print("\n  The agents stop and ask before passing this figure, so it "
-                  "is a brake rather than a cap.")
-            print("  Agent 1 spent about $7 on 4,500 lines; the sentence repair "
-                  "in agent version 1.9 adds to that.")
+            # Quoted against this file's row count, because the cost follows the
+            # number of lines almost exactly: Agent 1 reads every one of them and
+            # accounts for all but a couple of cents of the total.
+            print("\n  Agent 1 reads every line, so the cost follows the row count. "
+                  "On 4,543 lines")
+            print("  the four agents spent $7.24 between them, all but two cents "
+                  "of it Agent 1.")
+            if known_rows:
+                print(f"\n  This input holds {known_rows:,} row(s), so expect "
+                      f"about ${estimated_model_cost(known_rows):,.0f}.")
+            print("\n  Reaching the figure stops the run rather than finishing it "
+                  "without the model,")
+            print("  so it needs to cover the whole file. Enter 0 for no ceiling.")
+            offered = (spend_limit if spend_limit is not None
+                       else budget_for_rows(known_rows, DEFAULT_SPEND_LIMIT))
             spend_limit = ask_amount(
-                "Budget for the language model, in dollars (0 for no alert)",
-                spend_limit if spend_limit is not None else DEFAULT_SPEND_LIMIT)
+                "Budget for the language model, in dollars (0 for no ceiling)",
+                offered)
         print()
 
     return Settings(
@@ -3130,6 +3287,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Flushed so that a message written to the log immediately afterwards
         # cannot appear above the banner when both are going to a pipe.
         print(BANNER, flush=True)
+
+    # Before the lock is taken and before a row is read. This is the cheapest
+    # moment to find out that the run cannot do what was asked of it, and the
+    # only one at which finding out is free.
+    if settings.use_llm:
+        preflight_model(Path(__file__).resolve().parent, args.skip_model_check)
 
     settings.results_dir.mkdir(parents=True, exist_ok=True)
     settings.work_dir.mkdir(parents=True, exist_ok=True)

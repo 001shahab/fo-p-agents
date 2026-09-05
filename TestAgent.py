@@ -74,7 +74,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from runtime import (
     DEFAULT_AZURE_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT,
-    chat_completion_body, retry_chat_body,
+    chat_completion_body, parse_dotenv, retry_chat_body,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -123,25 +123,8 @@ class ModelConfig:
 
 
 def load_dotenv(path: Path) -> Dict[str, str]:
-    """Parse a ``.env`` file into a dictionary."""
-    values: Dict[str, str] = {}
-    if not path.is_file():
-        return values
-    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.lower().startswith("export "):
-            line = line[7:].strip()
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        if key:
-            values[key] = value
-    return values
+    """Read the ``.env`` beside this script, as the agents read it."""
+    return parse_dotenv(path)
 
 
 def _flag(value: Optional[str]) -> bool:

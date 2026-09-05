@@ -510,7 +510,74 @@ The shared service uses the Azure deployment name `openai.eu.gpt-5.6.luna`.
 Direct OpenAI uses `gpt-5.6-luna`. Reasoning effort defaults to `low`.
 
 Real environment variables override `.env`, which is what makes the agents
-usable from a scheduler without a file on disk.
+usable from a scheduler without a file on disk. An **empty** variable does not
+override: an exported name with nothing in it is how a shell remembers that the
+name was mentioned, not an instruction to forget the key in the file. Letting it
+win meant `set OPENAI_API_KEY=` on Windows, or an unset variable in a wrapper
+script, blanked a perfectly good credential — and the run then reported that no
+key could be found while looking straight at one.
+
+### The file does not travel with the repository
+
+`.env` is in `.gitignore` and has never been committed, which is correct: it
+holds a live key. The consequence is that **a fresh clone on another machine has
+no credentials**, and this has to be done by hand once per machine.
+
+That is not a hypothetical. A run on the client's estate took hours, reported
+success, and had no AI content in it at all, because its `.env` had not been
+copied across. Each agent found no key, said so in one line of its own log, and
+carried on: every call site falls back to a deterministic answer, so all the
+columns were present and the only outward sign was that the descriptions were
+noun phrases rather than sentences.
+
+The agents now **refuse to start** in that case rather than warning:
+
+```
+The language model is switched on and no API key was found for the azure
+backend, so there is nothing to authenticate with.
+
+Looked for AZURE_OPENAI_API_KEY, AZURE_API_KEY, OPENAI_API_KEY
+  in /home/user/fo-p-agents/.env
+  and in the environment.
+
+AZURE_ENABLE is on, so the key wanted is the one for the PwC GenAI shared
+service. A .env for that machine reads:
+
+  AZURE_ENABLE=true
+  AZURE_OPENAI_API_KEY=<the shared-service key>
+  AZURE_OPENAI_MODEL=openai.eu.gpt-5.6.luna
+  AZURE_OPENAI_BASE_URL=https://genai-sharedservice-emea.pwcinternal.com/v1/chat/completions
+
+Add the key, or pass --no-llm to run on the local stack alone.
+```
+
+Running without the model is still perfectly reasonable — that is what `--no-llm`
+is for — but it now has to be said out loud rather than arrived at by accident.
+
+On the PwC estate the line most often missing is `AZURE_ENABLE=true`. Without it
+the agents resolve the public OpenAI endpoint, `api.openai.com` is unreachable
+from that network, and every call fails.
+
+### How `.env` is read
+
+Hand-written by design, so that no extra dependency needs approving, and shared
+by all five scripts through `runtime.parse_dotenv` so that a file which
+authenticates one of them cannot fail to authenticate another. Three concessions
+to how the file is written in practice, each of which otherwise fails the same
+way — the file looks correct and a variable in it silently does not exist:
+
+- Read as `utf-8-sig`. An editor on Windows can save with a byte order mark, and
+  the mark would otherwise be read as the first three characters of the first
+  key's name.
+- `export ` and `set ` prefixes are dropped, both of which arrive when lines are
+  copied out of shell notes.
+- An unquoted trailing comment is a comment, as in python-dotenv, so
+  `KEY=abc  # the PwC key` does not send the words after the hash to the endpoint
+  as part of the credential. A `#` with no space before it is a character in the
+  value, which is how a key or password is allowed to contain one.
+
+Later assignments win, matching the shell, which matters because a working `.env`
+on this project defines one key twice.
 
 ---
 
@@ -608,7 +675,7 @@ accepts:
 | Source extracts folder | `./sources` |
 | Item catalogue file or folder for Agent 3 | the largest `*Item*Catalogue*Master*.xls*` found |
 | Let the agents call the language model | yes |
-| Budget for the language model | `$25.00` |
+| Budget for the language model | enough to cover the rows in the input |
 
 The catalogue is asked about explicitly because it is the one way the run fails
 quietly. Given only a source folder, Agent 3 reads it, correctly refuses the
@@ -617,13 +684,40 @@ every single line — which reads as a modelling result rather than as a missing
 file. Naming it up front, and showing which file was found, makes that visible
 before the hours are spent rather than after.
 
-The budget is an alert, not a cap: the agents stop and ask before passing it, so a
-run left unattended pauses rather than either overspending or dying. `0` runs with
-no alert at all. For scale, Agent 1 spent about $7 on 4,546 lines, and the
-sentence repair described below adds to that.
+The budget question is asked against the size of the job rather than in the
+abstract, because the cost follows the row count almost exactly: Agent 1 reads
+every line and accounts for all but a couple of cents of the total. Where the
+input is already on disk its rows are counted and the figure offered covers them:
+
+```
+  Agent 1 reads every line, so the cost follows the row count. On 4,543 lines
+  the four agents spent $7.24 between them, all but two cents of it Agent 1.
+
+  This input holds 107,771 row(s), so expect about $172.
+
+  Reaching the figure stops the run rather than finishing it without the model,
+  so it needs to cover the whole file. Enter 0 for no ceiling.
+Budget for the language model, in dollars (0 for no ceiling)
+  [225.00]:
+```
 
 `--non-interactive` takes every default without asking, which is what `app.py` and
 any scheduled job use.
+
+Before any of that is acted on, the model itself is checked. Nothing has been
+read and no agent has started at the point where this happens, so the check costs
+a second:
+
+```
+06:11:04  INFO    Checking the azure endpoint before starting:
+                  https://genai-sharedservice-emea.pwcinternal.com/v1/chat/completions
+06:11:05  INFO    The model answered, using openai.eu.gpt-5.6.luna on the azure backend.
+```
+
+If it does not answer, the run stops rather than starting, and says what it
+tried. The reason this exists is in [Troubleshooting](#the-run-finished-and-the-descriptions-are-phrases-rather-than-sentences).
+`--skip-model-check` starts anyway, for when the check itself is the thing that
+is wrong.
 
 Where the input comes from is decided in that order of preference: a file named
 with `--input`, then the raw extracts if `--from-sources` or `--sources` says so,
@@ -706,6 +800,21 @@ same settings is not run again; it is reused, and the run says so. Force the wor
 with `--force` (`--force-agents` on Max), or discard everything including the
 joined table with `--no-reuse`.
 
+Editing an agent invalidates its cached output, because the fingerprint digests
+the script rather than reading its version number. So the first run after any
+change to `agent1.py` and friends recomputes — though with the response cache
+intact, the model calls that recomputation needs are answered for nothing.
+
+Outputs that Max wrote are reused too, even though Max does not leave the sidecar
+record this script keeps: the output must name the same input file and have a row
+for each of its rows. One more condition applies there when the model is on. The
+agent's own manifest has to be beside the output and has to say the model was on
+when it was written, because a result produced without it has all of the same
+columns and differs only in what is in them — so it passes the row check and reads
+as finished. A folder of agent CSVs copied from another machine without their
+manifests is refused for exactly that reason, and the run says which file it
+refused and why.
+
 Interrupting with Ctrl-C stops the running agents, records how far the run got,
 and removes the half-written file of the stage that was in progress. The next run
 finds that record and offers to carry on from there or start again:
@@ -768,8 +877,17 @@ a cheap-looking rerun is not mistaken for a cheap analysis:
     Estimated from the published rates, an upper bound rather than an invoice.
 ```
 
-The per-agent spend alert still applies to each agent individually, so one agent
-cannot quietly spend the whole budget.
+The budget applies to each agent individually, so one agent cannot quietly spend
+the whole of it. On the measured run that meant nothing in practice — Agent 1 is
+the only one of the four that reads every line, and it accounted for $7.22 of the
+$7.24 total.
+
+Two things this section reports that are easy to miss. Where an agent had requests
+refused, it says how many and which log explains it, because a run whose calls all
+failed costs nothing and produces exactly the output of a run with the model
+switched off. And where no agent spent anything, it now says that every answer
+came from the response cache — which is the only remaining explanation, since a
+missing key and an unreachable endpoint are both refused before the run starts.
 
 ---
 
@@ -2079,6 +2197,29 @@ cannot reach Hugging Face](#preparing-a-machine-that-cannot-reach-hugging-face).
 The cheapest way to improve quality is to extend the vocabulary, not to enable
 the model.
 
+### What a run actually costs
+
+One measured figure, rather than an estimate: the September 2026 run over 4,543
+lines cost **$7.24** across all four agents, of which $7.22 was Agent 1. That is
+**$0.0016 per line**, and it scales close to linearly because Agent 1 makes about
+one call per line — 1,827 requests and 2,796 cache hits over 4,623 units of work,
+the cache hits being lines that repeat a description already resolved.
+
+| Lines | Expected | Budget `all_agents.py` offers |
+| --- | --- | --- |
+| 4,500 | $7 | $25 |
+| 20,000 | $32 | $40 |
+| 107,771 | $172 | $225 |
+| 500,000 | $800 | $1,000 |
+
+The offered figure is a quarter above the estimate, because the rate came from one
+dataset and the sentence repair fires on the lines that need it rather than on a
+fixed share of them. A repeat rate higher than that dataset's makes the real
+figure lower, not higher.
+
+`all_agents.py` states the expected cost against the chosen budget before the
+first agent starts, and warns when the budget will not cover the file.
+
 ### The spend alert
 
 Answering yes to the language-model question brings up a second question:
@@ -2113,7 +2254,9 @@ Answering `y` authorises one more increment of the same size, so $25 becomes
 $50, then $75, and so on; each step asks again. Answering `n` switches the model
 off and the run **continues to completion** on the local NLP stack, keeping
 everything the model had already produced. Nothing is lost and no output file is
-left half-written — the model tier was always optional.
+left half-written — the model tier was always optional. That is a choice made
+with the position in front of you; the unattended case is different and is
+covered below.
 
 Three details worth knowing:
 
@@ -2122,10 +2265,17 @@ Three details worth knowing:
   rate even though the provider discounts it, which makes the estimate an upper
   bound. It is a guard rail, not an accounting record; the invoice is the
   authority.
-- Under `--non-interactive` there is nobody to ask, so reaching the limit
-  switches the model off and logs a warning. A scheduled job therefore has a
-  hard ceiling rather than an open-ended bill. Set `--llm-spend-limit` to the
-  most that run may spend, or to `0` to remove the ceiling.
+- Under `--non-interactive` there is nobody to ask, so reaching the limit **stops
+  the run**. It used to switch the model off and carry on, which is safe for a
+  person who chose it and knows which half of the output it applies to, and
+  unsafe for a run left alone: the file would have the model's answers for the
+  rows read before the limit and local answers for every row after it, with
+  nothing in it to say where the boundary fell. Since `all_agents.py` starts
+  every agent with `--non-interactive`, that is the path a chained run takes.
+  Set `--llm-spend-limit` to the most the run may spend, or to `0` for no
+  ceiling. Every answer already paid for is written to the response cache before
+  the run stops, so raising the figure and starting again reads them back for
+  nothing and only the remaining rows cost anything.
 - The manifest records `spend_limit_usd`, `spend_limit_extensions` and
   `spend_limit_stopped`, so a run that lost the model part way through is
   distinguishable afterwards from one that had it throughout. That distinction
@@ -2202,15 +2352,47 @@ blunter. Run Agent 2 first.
 **`Fewer than two distinct suppliers were found`** — the supplier column is
 empty. Check that `Supplier_Name` or `Supplier_Id` survived Agent 1.
 
-**`Language-model tier requested but no API key was found`** — `--use-llm` was
-passed but `.env` has no key for the selected backend. Note that
-`AZURE_ENABLE=true` reads `AZURE_OPENAI_API_KEY`, not `OPENAI_API_KEY`.
+**`no API key was found for the ... backend`** — the model is switched on and
+`.env` has no key for the selected backend, so the run refuses to start. See
+[The file does not travel with the repository](#the-file-does-not-travel-with-the-repository).
+Note that `AZURE_ENABLE=true` reads `AZURE_OPENAI_API_KEY`, not `OPENAI_API_KEY`,
+and that an exported-but-empty variable no longer blanks the key in the file.
 
-**`Estimated language-model spend is $... at or above the ... limit`** — the
-spend alert fired during an unattended run and the model was switched off for
-the remainder. The run still completed on the local stack. Raise
-`--llm-spend-limit`, or accept the result: the affected work simply used the
-deterministic path.
+**`the check before the run failed`** — the key is present and the endpoint did
+not accept it. The message distinguishes the cases: `HTTP 401` or `403` means the
+key is not accepted, `HTTP 404` means no deployment of that name exists on this
+endpoint (check `AZURE_OPENAI_MODEL`), and `could not be reached` means the
+network is in the way — on the PwC estate, usually because `AZURE_ENABLE=true` is
+missing and the agents are resolving `api.openai.com`.
+
+**`The language model has spent an estimated $... reaching the $... budget`** —
+an unattended run reached its ceiling and stopped. It stops rather than finishing
+without the model, because a file with the model's answers for its first rows and
+local answers for the rest says nothing about where the boundary fell. Everything
+paid for is in the response cache, so raise `--llm-spend-limit` (or set it to `0`)
+and run the same command again: the answers already bought are read back for
+nothing. `all_agents.py` reports the expected cost against the budget before the
+first agent starts, so this should be visible in the first few seconds rather
+than hours in.
+
+### The run finished and the descriptions are phrases rather than sentences
+
+The symptom of a run that had the model switched on and never actually called it.
+With the model on, `Enriched_Purchase_Description` is a sentence with a verb —
+`Platforms services were purchased from Magnit Global Finland under item
+ZCCFORT000002838`. Without it, the same row reads `FINLAND OY 12 2025 Active
+Attention Q4 SAP FINLAND OY service`: a noun phrase with the supplier name and
+the period still embedded.
+
+Two ways to tell quickly. The summary now names the reason rather than offering
+possibilities, and a run whose calls were refused says so per agent. And on the
+output itself, the share of descriptions containing a verb is close to 100% when
+the model ran and close to zero when it did not.
+
+The causes, in the order they used to happen: no `.env` on that machine, an
+endpoint the network blocks, or a budget reached early in an unattended run. All
+three are now refusals rather than warnings — the first two before the run
+starts, the third at the moment it happens.
 
 **`Reading ... needs openpyxl`** — `pip install openpyxl`, or convert the
 workbook to CSV.
@@ -2295,6 +2477,9 @@ because their inputs and settings were unchanged. The summary marks each one
 ├── agent4.py                          Supplier consolidation
 ├── all_agents.py                      runs all four, returns the input table widened
 ├── max.py                             builds the wide table, then runs all four
+├── runtime.py                         shared by all of the above: reads .env,
+│                                      resolves the model endpoint, quiets the
+│                                      model hub's HTTP probes
 ├── fetch_models.py                    fetch and verify the local models, or bundle them
 ├── lexicon/
 │   └── procurement_lexicon.json       controlled procurement vocabulary
