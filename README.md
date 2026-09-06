@@ -1052,6 +1052,14 @@ Key columns:
 Business keys — supplier, category L1 to L4, business area, division, spend,
 dates — are carried through unchanged for the downstream agents.
 
+`Evidence_Field_Count` counts every field the agent found describing this line
+across all four systems, and it can be large: a line joined on an item number
+picks up every other purchase of that item. All of it feeds the confidence score,
+but only a bounded selection is offered to the model, because a bundle of
+thousands identifies a system rather than a purchase and costs a great deal to
+send — see [What a run actually costs](#what-a-run-actually-costs) for the run
+where it did.
+
 `Country` is the one business key that is decided rather than copied. Fortum
 settled the definition: the delivered-to country, or the company-code country
 where no delivery address was recorded, as on an invoice. The choice is made per
@@ -2217,6 +2225,44 @@ dataset and the sentence repair fires on the lines that need it rather than on a
 fixed share of them. A repeat rate higher than that dataset's makes the real
 figure lower, not higher.
 
+A per-line rate is only meaningful where the work per line is bounded, and there
+is one way this has been got wrong badly enough to be worth recording. Agent 1
+offers the model corroborating descriptions from other systems, gathered by every
+identifier a line shares with another row. A weak identifier gathers a great deal:
+on the full extract one bundle held 17,848 fields and was shared by 36,314 rows,
+and each of those rows sent the whole bundle — roughly 89,000 input tokens, $0.11
+a line rather than $0.004. Two runs stopped on their limit having read less than
+half the file, one at $100 after eight hours and one at $300 after ninety minutes,
+while the table above predicted $172 for the lot. The bundle is now bounded to the
+few most informative fragments, and a bundle above forty is treated as what it is
+— an identifier shared by a table rather than by a purchase — and contributes
+nothing. The full count stays in `Evidence_Field_Count`, which is where a reviewer
+asking how well corroborated a line is should look.
+
+The bound also cut the number of distinct prompts, because lines that differ only
+in the blob attached to them now share one. On the full extract 107,771 lines
+carry 53,673 distinct descriptions, so about half of them are answered from the
+first of their kind.
+
+### Answers paid for before the bound
+
+The prompt is the cache key, so bounding the evidence changed the key of every
+line whose bundle was trimmed, and the answers the two stopped runs had paid for
+would have been bought a second time. They are not. Where a line misses on its
+current key, Agent 1 rebuilds the string it would have sent under the old
+behaviour, looks that up, and on a hit writes the answer back under the new key
+as well:
+
+```
+  Answers carried over : 48,213 from runs made before the evidence was bounded
+```
+
+Rebuilding a discarded prompt costs dictionary lookups rather than translation,
+every phrase in it having been resolved already, and it happens only where the
+current key missed — which after one run is nowhere, because the migration writes
+the entry forward. Nothing has to be passed or enabled; it is skipped entirely
+when the cache is empty.
+
 `all_agents.py` states the expected cost against the chosen budget before the
 first agent starts, and warns when the budget will not cover the file.
 
@@ -2351,6 +2397,24 @@ blunter. Run Agent 2 first.
 
 **`Fewer than two distinct suppliers were found`** — the supplier column is
 empty. Check that `Supplier_Name` or `Supplier_Id` survived Agent 1.
+
+**`reaching the $... budget, and this run has nobody to ask for more`** — the
+figure given at the prompt was spent before the file was read. Under
+`all_agents.py` the agents run non-interactively and cannot ask, so they stop
+rather than finish the remaining lines without the model and leave an output whose
+two halves were made differently.
+
+Nothing is lost. The cache is written before the stop, so the answers already paid
+for are read back for nothing and only the lines still to do cost anything.
+
+Before raising the figure, check the run was not spending it on something it
+should not have been. `Evidence bounded` and `Answers carried over` in the summary
+are the lines to read: the first says how much corroborating text was kept out of
+the prompts, and a run from before that bound existed could spend $0.11 a line
+instead of $0.004. If the summary shows a spend per line far above the table in
+[What a run actually costs](#what-a-run-actually-costs), raise the budget only
+after understanding why, and prefer a figure you have reasoned about to
+`--llm-spend-limit 0`, which has no ceiling at all.
 
 **`no API key was found for the ... backend`** — the model is switched on and
 `.env` has no key for the selected backend, so the run refuses to start. See

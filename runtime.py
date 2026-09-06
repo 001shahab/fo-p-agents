@@ -229,6 +229,15 @@ KEY_VARIABLES: Dict[str, Tuple[str, ...]] = {
 # figure is here so that the cost of a run over the full extract can be stated
 # before it starts, a hundred thousand lines being rather more than anybody
 # should meet by surprise on an invoice.
+#
+# It holds only while the text sent per line is bounded, which is a thing that
+# has to be said because it once was not. Agent 1 used to attach every
+# description sharing any identifier with a line, and on the full extract one
+# such bundle ran to 17,848 fields across 36,314 rows: those lines cost $0.11
+# each rather than $0.004, and two runs stopped on their limit having read less
+# than half the file while this figure predicted $172 for all of it. An estimate
+# per row is only meaningful where the work per row is, so anything that lets
+# the prompt grow with the size of the input invalidates it.
 ESTIMATED_COST_PER_ROW = 0.0016
 
 

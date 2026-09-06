@@ -98,7 +98,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.9.0"
+AGENT_VERSION = "1.10.0"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -282,6 +282,25 @@ DEFAULT_SPEND_LIMIT = 25.00
 # hundred thousand phrases is many hours of round trips, and a log that says
 # nothing for that long is indistinguishable from a hung process.
 MODEL_PROGRESS_SECONDS = 60
+
+# How much corroborating text from other systems is offered to the model
+# alongside a line's own description.
+#
+# The evidence index groups rows by every identifier they share, and a weak
+# identifier collects far more than a purchase. On the September 2026 extract
+# one bundle held 17,848 fields and was shared by 36,314 rows; each of those
+# rows sent the whole bundle, about 89,000 input tokens, and cost $0.11 to
+# describe instead of $0.004. Two runs stopped on their spend limit having read
+# less than half the file, and the limit was the only thing that noticed.
+#
+# A bundle that large identifies a system rather than a transaction, so above
+# EVIDENCE_BUNDLE_LIMIT it corroborates nothing and none of it is offered. Below
+# it the few most informative fragments are, which is all the prompt asks for:
+# it already tells the model to disregard evidence describing a different
+# purchase, and a thousand fragments make that harder, not easier.
+EVIDENCE_PROMPT_FRAGMENTS = 6
+EVIDENCE_PROMPT_CHARS = 600
+EVIDENCE_BUNDLE_LIMIT = 40
 
 
 @dataclass
@@ -538,6 +557,45 @@ def compact_key(value: Any) -> str:
 def tokenise(text: str) -> List[str]:
     """Split into word tokens, keeping digits attached to their word."""
     return _TOKEN.findall(text)
+
+
+def select_prompt_evidence(fragments: Sequence[str],
+                           limit: int = EVIDENCE_PROMPT_FRAGMENTS,
+                           chars: int = EVIDENCE_PROMPT_CHARS,
+                           bundle_limit: int = EVIDENCE_BUNDLE_LIMIT
+                           ) -> Tuple[str, ...]:
+    """Choose the corroborating fragments worth paying to send.
+
+    Returns nothing at all for a bundle above ``bundle_limit``. Such a bundle is
+    the product of an identifier shared by a whole table rather than by a
+    purchase, so no subset of it is evidence about this line, and picking a few
+    arbitrarily would be worse than picking none: the model would treat unrelated
+    lines as corroboration.
+
+    Otherwise the longest fragments win, on the same reasoning as
+    ``_from_fragments``: among texts describing one purchase the fuller one
+    carries the detail. Order is restored afterwards so the prompt is stable
+    across runs, which keeps the cache key stable with it.
+    """
+    if len(fragments) > bundle_limit:
+        return ()
+
+    unique = [fragment for fragment in dict.fromkeys(fragments) if fragment]
+    ranked = sorted(unique, key=lambda item: (-len(tokenise(item)), item))
+
+    # The first fragment goes in whatever its length: one long description was
+    # never what made a prompt expensive, and refusing it would leave a line
+    # whose only corroboration is a full sentence with none at all.
+    chosen: List[str] = []
+    budget = chars
+    for fragment in ranked[:limit]:
+        if chosen and len(fragment) > budget:
+            break
+        chosen.append(fragment)
+        budget -= len(fragment)
+
+    keep = set(chosen)
+    return tuple(fragment for fragment in unique if fragment in keep)
 
 
 # Units that sit next to a number and describe the purchase (wattage, size,
@@ -2650,6 +2708,11 @@ class LanguageModelClient:
         self._cache_dirty = False
         self._omit_temperature = False
         self._reasoning_style = "effort"
+        # Answers bought under a prompt this version no longer sends are still
+        # answers, and they were expensive. Looking for them costs a hash, but
+        # only where there is something to find, so it is settled once here.
+        self.carried_forward = bool(self._cache)
+        self.migrated = 0
 
     # -- cache --------------------------------------------------------------
 
@@ -3253,29 +3316,55 @@ class TranslationEngine:
         return ""
 
     def polish_composed(self, original: str, draft: str, extra: str,
-                        short: str, item_or_service: str) -> Tuple[str, str, str]:
+                        short: str, item_or_service: str,
+                        previous_extra: Optional[Callable[[], str]] = None
+                        ) -> Tuple[str, str, str]:
         """Ask the model to confirm a composed description is English and relevant.
 
         Used for the three published columns. Cached on the original line plus
         the draft, so a second run over the same data costs nothing.
+
+        ``previous_extra`` returns the evidence string this line would have sent
+        before the bundle was bounded, and exists only so that the answers two
+        budget-stopped runs paid for can still be found. Bounding the evidence
+        changed the payload, and the payload is the cache key, so without this
+        every one of those answers would be bought again. It is a callable
+        because rebuilding a discarded prompt is only worth doing where the
+        current key missed, which after one migrating run is nowhere.
         """
         if self.model is None or not self.model.config.enabled:
             return draft, short, item_or_service
         if not draft:
             return draft, short, item_or_service
 
-        payload = json.dumps({
-            "original": original,
-            "extra_evidence": extra,
-            "draft_description": draft,
-            "draft_short": short,
-            "draft_item_or_service": item_or_service,
-        }, ensure_ascii=False)
+        def payload_for(evidence: str) -> str:
+            return json.dumps({
+                "original": original,
+                "extra_evidence": evidence,
+                "draft_description": draft,
+                "draft_short": short,
+                "draft_item_or_service": item_or_service,
+            }, ensure_ascii=False)
+
+        payload = payload_for(extra)
         # The prompt text is not part of the key, so the task name carries the
         # version: without this bump every line already in the cache would keep
         # its old answer and never see the rules added in agent version 1.9.
         cache_key = self.model.cache_key("polish_sentence_v2", payload)
         cached = self.model.cached(cache_key)
+
+        if not cached and previous_extra is not None and self.model.carried_forward:
+            superseded = previous_extra()
+            if superseded != extra:
+                cached = self.model.cached(
+                    self.model.cache_key("polish_sentence_v2", payload_for(superseded)))
+                if cached:
+                    # Written under the current key as well, so the rebuild above
+                    # happens once per line across all future runs rather than
+                    # once per line per run.
+                    self.model.store(cache_key, cached)
+                    self.model.migrated += 1
+
         if cached:
             try:
                 parsed = json.loads(cached)
@@ -4605,14 +4694,35 @@ class Agent1:
             english_fragments.append(result.english_text)
             translations.append(result)
 
+        # Only a bounded selection is paid for. The rest of the bundle still
+        # reaches the confidence score and the Evidence_Field_Count column, which
+        # is where a reviewer asking "how well corroborated is this line" should
+        # look; what it no longer does is travel to the model on every row.
+        offered = select_prompt_evidence(borrowed) if own else ()
+        if own and len(borrowed) > len(offered):
+            self.statistics["evidence_bundles_bounded"] += 1
+            self.statistics["evidence_fields_withheld"] += len(borrowed) - len(offered)
+
         extra_fragments = [self.translator.translate(value).english_text
-                           for value in borrowed] if own else []
+                           for value in offered]
         context_fragments = [self.translator.translate(value).english_text
                              for value in sorted(record.evidence.context)]
 
         description = self.synthesiser.compose(record, english_fragments, context_fragments)
         extra = " | ".join(fragment for fragment in extra_fragments if fragment)
         source = record.primary_text or (own[0] if own else "")
+
+        def superseded_extra() -> str:
+            """The unbounded string this line sent before this version.
+
+            Every phrase here is already resolved and memoised, so this is
+            dictionary lookups and a join rather than translation work.
+            """
+            return " | ".join(
+                fragment for fragment in
+                (self.translator.translate(value).english_text for value in borrowed)
+                if fragment)
+
         # Every line is read by the language model when that tier is on, so the
         # published description is a sentence rather than a leftover fragment.
         if (self.translator.model is not None and self.translator.model.config.enabled
@@ -4620,7 +4730,8 @@ class Agent1:
             polished, short, item = self.translator.polish_composed(
                 source,
                 description.description or source, extra,
-                description.short_description, description.item_or_service)
+                description.short_description, description.item_or_service,
+                previous_extra=superseded_extra if own else None)
             description.description = polished
             description.short_description = short
             description.item_or_service = item or "Unclear"
@@ -4848,6 +4959,7 @@ class Agent1:
             "sentence_repairs_accepted": self.repairs_accepted,
         })
         if self.model is not None:
+            statistics["cache_entries_migrated"] = self.model.migrated
             statistics["token_usage"] = {
                 **self.model.usage.as_dict(),
                 **self.model.guard.as_dict(),
@@ -5191,6 +5303,19 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
         if accepted < attempted:
             print(f"    {attempted - accepted:,} kept the agent's own wording: the "
                   "model's rewrite was not an improvement.")
+
+    bounded = statistics.get("evidence_bundles_bounded", 0)
+    if bounded:
+        withheld = statistics.get("evidence_fields_withheld", 0)
+        print(f"  Evidence bounded     : {bounded:,} line(s), {withheld:,} field(s) "
+              "kept out of the prompt")
+        print("    Corroboration from a shared identifier, counted in "
+              "Evidence_Field_Count but not paid for per row.")
+
+    migrated = statistics.get("cache_entries_migrated", 0)
+    if migrated:
+        print(f"  Answers carried over : {migrated:,} from runs made before the "
+              "evidence was bounded")
 
     methods = [(name.replace("translation_", ""), value)
                for name, value in statistics.items() if name.startswith("translation_")]
