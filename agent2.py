@@ -51,7 +51,7 @@ that are the same thing described differently.
 
     Output
     ------
-    Written to the results folder:
+    Written to the results folder, under --output-prefix, "agent2" by default:
 
         agent2_purchase_groups.csv      one row per input line, group appended
         agent2_purchase_groups.jsonl    the same rows with grouping evidence
@@ -92,7 +92,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent2")
 
 AGENT_NAME = "Agent 2 - AI Purchase Group (Category L5)"
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "1.4.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -217,6 +217,11 @@ class Settings:
 
     write_jsonl: bool = True
     verbose: bool = False
+
+    # Leading part of every output file name. Changing it writes a second set of
+    # results beside an existing one instead of over it, which is how a rerun is
+    # compared against the run a reviewer already has.
+    output_prefix: str = "agent2"
 
     # False under --non-interactive, where nothing may block waiting for input.
     interactive: bool = True
@@ -844,7 +849,92 @@ class SignatureBuilder:
         "supplied", "provide", "provides", "providing", "provided",
         "cover", "covering", "carry", "carried",
         "receive", "received", "receiving", "invoiced", "billed", "charged",
+        "issue", "issued",
     })
+
+    # When a purchase happened, rather than what it was. An enriched sentence
+    # dates itself - "Cleaning services for January 2026", "IT infrastructure
+    # managed services for 2025-Q4" - and the date then splits one purchase
+    # concept into one group per billing period. Fortum's review found cleaning
+    # in twelve groups for twelve months and asked for the month to be ignored.
+    _PERIOD_LEMMAS = frozenset({
+        "january", "february", "march", "april", "may", "june", "july",
+        "august", "september", "october", "november", "december",
+        "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept",
+        "oct", "nov", "dec",
+        "week", "weekly", "month", "monthly", "quarter", "quarterly",
+        "year", "yearly", "annual", "annually", "term",
+    })
+
+    # The legal form of a company, which is left behind when the supplier's
+    # distinctive name is removed and is enough on its own to split a group:
+    # "Device accessory" and "Device accessory oyj" were two of them. Two-letter
+    # forms - oy, ab, as, bv - never reach here, the length filter having already
+    # dropped them.
+    _ENTITY_SUFFIX_LEMMAS = frozenset({
+        "oyj", "abp", "aps", "ltd", "limited", "plc", "llc", "inc",
+        "incorporated", "gmbh", "sarl", "sas", "spa", "srl", "kft", "zoo",
+        "corp", "corporation", "company",
+    })
+
+    # Commercial wrapping around a purchase: how it was priced or presented,
+    # not what it was. Fortum asked for "Extra excavation and backfilling"
+    # rather than "Additional charge for extra excavation and backfilling", and
+    # for the annual-subscription wording to be treated as commercial detail.
+    _QUALIFIER_LEMMAS = frozenset({
+        "additional", "charge", "fee", "continuous", "variable", "according",
+    })
+
+    # An ordinal is part of a period in "the third quarter of 2024" and part of
+    # a purchase in "third party inspection". Only the neighbouring word says
+    # which, so only the neighbouring word is allowed to decide.
+    _ORDINAL_LEMMAS = frozenset({"first", "second", "third", "fourth"})
+
+    # Paperwork, which heads a purchase or merely dates one. "Invoice processing
+    # service" is something Fortum buys. "AWS cloud capacity services for Q3
+    # 2024, covering invoices issued from July through September" is the same
+    # cloud capacity as its neighbours, and named a group of its own for saying
+    # so. A word that opens a description can be the purchase; one that arrives
+    # after the purchase has been named is bookkeeping.
+    _PAPERWORK_LEMMAS = frozenset({"invoice", "invoicing"})
+
+    @classmethod
+    def drop_transaction_words(cls, lemmas: Sequence[str]) -> Tuple[str, ...]:
+        """Reduce lemmas to the purchase concept, dropping the transaction.
+
+        A Category L5 name is meant to be reused across purchases, so what
+        distinguishes one transaction from the next - its month, its billing
+        period, its supplier's legal form, how it was priced - must not reach it.
+        Removed only while something else remains, on the same terms as
+        fulfilment: a line whose only content word is "annual" has nothing better
+        to offer, and belongs in a group rather than nowhere.
+        """
+        kept: List[str] = []
+        for position, lemma in enumerate(lemmas):
+            if (lemma in cls._PERIOD_LEMMAS
+                    or lemma in cls._ENTITY_SUFFIX_LEMMAS
+                    or lemma in cls._QUALIFIER_LEMMAS):
+                continue
+            if lemma in cls._ORDINAL_LEMMAS and cls._beside_period(lemmas, position):
+                continue
+            if position > 0 and lemma in cls._PAPERWORK_LEMMAS:
+                continue
+            kept.append(lemma)
+        if not kept:
+            return tuple(lemmas)
+        return tuple(kept)
+
+    @classmethod
+    def _beside_period(cls, lemmas: Sequence[str], position: int) -> bool:
+        """Whether the word at ``position`` sits next to a period word."""
+        neighbours = [lemmas[index] for index in (position - 1, position + 1)
+                      if 0 <= index < len(lemmas)]
+        return any(neighbour in cls._PERIOD_LEMMAS for neighbour in neighbours)
+
+    @classmethod
+    def concept_lemmas(cls, lemmas: Sequence[str]) -> Tuple[str, ...]:
+        """The reusable purchase concept behind a description."""
+        return cls.drop_transaction_words(cls.drop_fulfilment(lemmas))
 
     @classmethod
     def drop_fulfilment(cls, lemmas: Sequence[str]) -> Tuple[str, ...]:
@@ -903,7 +993,7 @@ class SignatureBuilder:
 
         # Deduplicate while preserving first appearance: a description that
         # repeats a word says no more than one that states it once.
-        result = self.drop_fulfilment(list(dict.fromkeys(lemmas)))
+        result = self.concept_lemmas(list(dict.fromkeys(lemmas)))
         self._cache[key] = result
         return result
 
@@ -1762,7 +1852,8 @@ class PurchaseGroup:
     spend: float = 0.0
     cohesion: float = 0.0
     is_new: bool = True
-    naming_method: str = "consensus"     # consensus | registry | model | fallback
+    # consensus | loose | registry | model | fallback | cap
+    naming_method: str = "consensus"
 
 
 # ===========================================================================
@@ -1798,6 +1889,10 @@ class Agent2:
         self.entries: Dict[Tuple[str, str], DescriptionEntry] = {}
         self.groups: Dict[str, PurchaseGroup] = {}
         self.signature_to_group: Dict[str, str] = {}
+        # One entry per input row, in input order, filled by collect() and read
+        # by the writer. Both need the same signature and neither may derive it
+        # independently.
+        self.row_signatures: List[str] = []
         self.statistics: Counter = Counter()
 
     # -- bucketing ----------------------------------------------------------
@@ -1824,8 +1919,34 @@ class Agent2:
 
     # -- reduction ----------------------------------------------------------
 
+    def _grouping_description(self, row: Dict[str, str]) -> str:
+        """The text a row is grouped on: its description, less its supplier.
+
+        Empty where there is nothing to group on, which the caller treats as a
+        row that cannot join a group.
+        """
+        description = normalise_text(row.get(REQUIRED_COLUMN, ""))
+        if not description or self.lexicon.is_noise(description):
+            return ""
+        if not self.settings.mask_suppliers:
+            return description
+        # Before the signature, so the supplier neither splits a group nor
+        # reaches its name.
+        return self.masker.strip(description, self.masker.supplier_of(row))
+
     def collect(self) -> None:
-        """Reduce the input rows to distinct descriptions per bucket."""
+        """Reduce the input rows to distinct descriptions per bucket.
+
+        The signature of every row is worked out here and kept, because the
+        writer needs the same answer and must not compute it again. It used to:
+        this method removed the supplier before taking the signature and the
+        writer took the signature from the description as it arrived, so every row
+        whose description named its supplier - "Device accessories were purchased
+        from TELIA FINLAND OYJ" - looked up a key that had never been stored and
+        was written out as "Other". That was 86% of lines on the September 2026
+        extract, and it read as a classification failure rather than a lookup
+        that missed. One list, consumed twice, is what stops it recurring.
+        """
         assert self.table is not None
         skipped = 0
 
@@ -1836,24 +1957,16 @@ class Agent2:
                 self.masker.observe(normalise_text(row.get(REQUIRED_COLUMN, "")),
                                     self.masker.supplier_of(row))
 
+        self.row_signatures = []
         for row in self.table.rows:
-            description = normalise_text(row.get(REQUIRED_COLUMN, ""))
-            if not description or self.lexicon.is_noise(description):
-                skipped += 1
-                continue
-
-            if self.settings.mask_suppliers:
-                # Before the signature, so the supplier neither splits a group
-                # nor reaches its name.
-                description = self.masker.strip(
-                    description, self.masker.supplier_of(row))
-
-            bucket = self._category_bucket(row)
-            signature = self.builder.signature(description)
+            description = self._grouping_description(row)
+            signature = self.builder.signature(description) if description else ""
+            self.row_signatures.append(signature)
             if not signature:
                 skipped += 1
                 continue
 
+            bucket = self._category_bucket(row)
             key = (bucket, signature)
             entry = self.entries.get(key)
             if entry is None:
@@ -2023,15 +2136,24 @@ class Agent2:
         descriptions = [member.text for member in members]
         weights = [float(member.row_count) for member in members]
 
-        label, naming_method = "", "consensus"
-        if cohesion_score >= self.settings.min_cohesion:
-            label = self.labeller.label(descriptions, weights)
+        label = self.labeller.label(descriptions, weights)
+        naming_method = "consensus"
 
         if not label:
-            # Either the cluster does not agree with itself or its members carry
-            # no content words. The specification is explicit about where such
-            # lines go.
+            # The members carry no content words, so there is no purchase concept
+            # to be had. Fortum's review keeps exactly these in "Other": "no
+            # usable purchase description is available".
             label, naming_method = OTHER_GROUP_LABEL, "fallback"
+        elif cohesion_score < self.settings.min_cohesion:
+            # A loose cluster, named by a plurality of its members rather than a
+            # majority - the weakest kind of name, but a purchase concept all the
+            # same. Fortum asked for "Other" only where no concept can be
+            # identified, so the group is named and the confidence score, which
+            # weights cohesion at two fifths, is left to say how far to trust it.
+            # Declining to name these put 36,738 lines of the September 2026
+            # extract into "Other" while their own words offered a concept.
+            naming_method = "loose"
+            self.statistics["groups_named_despite_low_cohesion"] += 1
 
         # The identifier is derived from the label and the bucket, so the same
         # group in the same category has the same identifier on any machine and
@@ -2167,18 +2289,18 @@ class Agent2:
     # -- consolidation ------------------------------------------------------
 
     def merge_equivalent_labels(self) -> None:
-        """Fold together groups whose names differ only by a fulfilment word.
+        """Fold together groups naming the same concept in different words.
 
-        Signatures already ignore those words, so this catches the remaining
-        route to a near-duplicate name: a label the model proposed after the
-        groups were formed. The surviving group is the one with the most lines
-        behind it, and it takes the shorter of the two names.
+        Signatures already ignore fulfilment and transaction words, so this
+        catches the remaining route to a near-duplicate name: a label the model
+        proposed after the groups were formed. The surviving group is the one with
+        the most lines behind it, and it takes the shorter of the two names.
         """
         by_key: Dict[Tuple[str, Tuple[str, ...]], List[PurchaseGroup]] = defaultdict(list)
         for group in self.groups.values():
             if group.group_id == OTHER_GROUP_ID:
                 continue
-            key = self.builder.drop_fulfilment(self.builder.lemmas(group.label))
+            key = self.builder.concept_lemmas(self.builder.lemmas(group.label))
             if key:
                 by_key[(group.bucket, key)].append(group)
 
@@ -2259,12 +2381,21 @@ class Agent2:
     def write(self) -> Dict[str, Any]:
         """Write every output file and return the run manifest."""
         assert self.table is not None
+        if len(self.row_signatures) != len(self.table.rows):
+            # zip() would stop at the shorter of the two and lose the remaining
+            # rows without a word, and no row may leave the analysis. Raised
+            # rather than asserted so that -O cannot switch the guard off.
+            raise RuntimeError(
+                f"{len(self.row_signatures)} signature(s) for "
+                f"{len(self.table.rows)} row(s): collect() must run first")
+
         results_dir = self.settings.results_dir
         results_dir.mkdir(parents=True, exist_ok=True)
 
-        rows_path = results_dir / "agent2_purchase_groups.csv"
-        jsonl_path = results_dir / "agent2_purchase_groups.jsonl"
-        directory_path = results_dir / "agent2_group_directory.csv"
+        stem = self.settings.output_prefix
+        rows_path = results_dir / f"{stem}_purchase_groups.csv"
+        jsonl_path = results_dir / f"{stem}_purchase_groups.jsonl"
+        directory_path = results_dir / f"{stem}_group_directory.csv"
 
         appended = ["AI_Purchase_Group_L5", "AI_Purchase_Group_Id",
                     "AI_Purchase_Group_Confidence", "AI_Purchase_Group_Band",
@@ -2284,10 +2415,10 @@ class Agent2:
 
             jsonl_handle = jsonl_path.open("w", encoding="utf-8") if self.settings.write_jsonl else None
             try:
-                for row in self.table.rows:
+                # The signature comes from the list the collector built, never
+                # from a second reading of the description: see collect().
+                for row, signature in zip(self.table.rows, self.row_signatures):
                     output = dict(row)
-                    description = normalise_text(row.get(REQUIRED_COLUMN, ""))
-                    signature = self.builder.signature(description) if description else ""
                     group_id = self.signature_to_group.get(signature, "")
                     group = self.groups.get(group_id)
 
@@ -2389,7 +2520,7 @@ class Agent2:
                        + ([jsonl_path.name] if self.settings.write_jsonl else []),
             "statistics": statistics,
         }
-        (results_dir / "agent2_run_manifest.json").write_text(
+        (results_dir / f"{stem}_run_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return manifest
 
@@ -2531,6 +2662,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="pause and ask once estimated model spend reaches this "
                             f"figure (default {DEFAULT_SPEND_LIMIT:.2f}; 0 disables the alert)")
 
+    parser.add_argument("--output-prefix", metavar="NAME", default="agent2",
+                        help="leading part of the output file names, so a rerun can "
+                             "sit beside an earlier one rather than replace it "
+                             "(default agent2)")
     parser.add_argument("--no-jsonl", action="store_true", help="skip the JSONL export")
     parser.add_argument("--non-interactive", action="store_true",
                         help="never prompt; use the supplied arguments and defaults")
@@ -2643,6 +2778,7 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         max_bucket_size=args.max_bucket_size,
         max_total_groups=args.max_total_groups,
         mask_suppliers=not args.keep_supplier_names,
+        output_prefix=args.output_prefix,
         write_jsonl=not args.no_jsonl,
         verbose=args.verbose,
         interactive=not args.non_interactive,
