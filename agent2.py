@@ -92,7 +92,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent2")
 
 AGENT_NAME = "Agent 2 - AI Purchase Group (Category L5)"
-AGENT_VERSION = "1.4.0"
+AGENT_VERSION = "1.5.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -205,10 +205,17 @@ class Settings:
     bucket_level: str = "auto"          # auto | l4 | l3 | l2 | l1
     max_bucket_size: int = 6000
 
-    # Fortum's ceiling on the number of Category L5 names, counting "Other" as
-    # one of them. Everything below the line is folded into "Other" rather than
-    # dropped, so no row leaves the analysis.
-    max_total_groups: int = 6000
+    # Ceiling on the number of Category L5 names, counting "Other" as one of
+    # them. Everything below the line is folded into "Other" rather than dropped,
+    # so no row leaves the analysis.
+    #
+    # Fortum called 6,000 "a maximum guardrail, not a target", and this sits above
+    # it deliberately. Reading the original description where the enriched one had
+    # nothing recovered some 7,300 lines that used to be unnamed, and those lines
+    # brought real concepts with them; at 6,000 the cap would have folded the
+    # low-spend tail straight back into "Other" and undone the recovery. Pass
+    # --max-total-groups 6000 to hold the original figure.
+    max_total_groups: int = 8000
 
     # Take the supplier's own name out of a description before grouping it. On by
     # default: a category named after a vendor is not a category, and it splits
@@ -400,6 +407,16 @@ def text_similarity(left: str, right: str) -> float:
 # works without modification.
 
 REQUIRED_COLUMN = "Enriched_Purchase_Description"
+
+# Consulted only when the enriched description has nothing to group on. Agent 1
+# translates through a lexicon when the model is unavailable, and a lexicon that
+# does not hold the word drops it: "WE3E744 ubezpieczenie OC AYVENS POLAND" came
+# through as "OC AYVENS POLAND SP AYVENS POLAND SP", losing the one word that
+# said insurance. The original still has it, so it is worth asking rather than
+# writing 7,297 lines off to "Other". Second choice, never first: the enriched
+# text is English and punctuated, and grouping is better on it wherever it says
+# something.
+FALLBACK_COLUMN = "Original_Description"
 
 # Columns consulted when they are present. The development plan lists these as
 # supporting evidence for grouping, and each one that is populated sharpens the
@@ -665,12 +682,15 @@ class SupplierMasker:
                 return value
         return ""
 
-    def strip(self, description: str, supplier: str) -> str:
+    def strip(self, description: str, supplier: str, record: bool = True) -> str:
         """Return the description with the supplier's identity removed.
 
         The original is returned untouched when removal would leave nothing that
         names a purchase, so a line whose description is only its supplier's name
         still groups somewhere rather than being dropped for having no content.
+
+        ``record`` is cleared when a row is being masked a second time, so that
+        the count stays a count of rows.
         """
         identity = self.identity_tokens(supplier)
         if not identity or not description:
@@ -682,7 +702,7 @@ class SupplierMasker:
             return description
 
         removed = len(words) - len(kept)
-        if removed:
+        if removed and record:
             self.masked_rows += 1
             self.masked_tokens += removed
         return " ".join(kept)
@@ -976,6 +996,20 @@ class SignatureBuilder:
         tokens = [token for token in tokenise(key) if not is_code_token(token)]
         tokens = [token for token in tokens if token not in self.stopwords]
 
+        # A two-letter word is usually an identifier rather than a description,
+        # which is why is_code_token has already removed it. But it can also be
+        # the whole purchase: Polish compulsory motor insurance is written "OC"
+        # and nothing else, so once the supplier's name went those lines had no
+        # content at all and fell into "Other". Readmitted only when nothing else
+        # survived, and then exempt from the length filter below on the same
+        # grounds.
+        short_only = False
+        if not tokens:
+            tokens = [token for token in tokenise(key)
+                      if len(token) == 2 and token.isalpha()
+                      and token not in self.stopwords]
+            short_only = bool(tokens)
+
         if self._pipeline is not None:
             try:
                 document = self._pipeline(" ".join(tokens))
@@ -989,7 +1023,8 @@ class SignatureBuilder:
             lemmas = [self._suffix_lemma(token) for token in tokens]
 
         lemmas = [lemma for lemma in lemmas
-                  if lemma and lemma not in self.stopwords and len(lemma) > 2]
+                  if lemma and lemma not in self.stopwords
+                  and (len(lemma) > 2 or short_only)]
 
         # Deduplicate while preserving first appearance: a description that
         # repeats a word says no more than one that states it once.
@@ -1319,22 +1354,37 @@ class GroupLabeller:
             return ""
         return sentence_case(label)
 
-    def is_weak(self, label: str) -> bool:
-        """Whether a label is too vague to be useful as an analysis level.
+    # Words that name no purchase in particular. A group called "Service" tells a
+    # category manager nothing that Category L4 did not already say.
+    GENERIC_WORDS = frozenset({
+        "service", "services", "material", "materials", "equipment",
+        "supply", "supplies", "work", "works", "product", "products",
+        "goods", "item", "items", "other", "various", "general", "misc",
+    })
 
-        A group called "Service" or "Material" tells a category manager nothing
-        they did not already know, so those are candidates for the optional
-        naming pass rather than acceptable answers.
+    def is_weak(self, label: str) -> bool:
+        """Whether a label is too vague, too short or too opaque to be an
+        analysis level, and so a candidate for the optional naming pass.
+
+        Three different ways a name fails a reader. It can be generic, saying only
+        what the category above it said. It can be an identifier rather than a
+        description - "Fwp fwu", "Rmk" - which is what is left when a code is the
+        only thing a line carries. Or it can be a word the procurement vocabulary
+        does not know, which on this data means Agent 1 translated through its
+        lexicon and the lexicon did not hold the word, so the source language
+        survived: "Komunikacyjne nnw" is Polish motor insurance, and nobody
+        reading a spend report would guess that.
         """
         if not label:
             return True
         words = [word for word in tokenise(lookup_key(label)) if word not in self.builder.stopwords]
         if not words:
             return True
-        generic = {"service", "services", "material", "materials", "equipment",
-                   "supply", "supplies", "work", "works", "product", "products",
-                   "goods", "item", "items", "other", "various", "general", "misc"}
-        return all(word in generic for word in words)
+        if all(word in self.GENERIC_WORDS for word in words):
+            return True
+        if all(len(word) <= 3 for word in words):
+            return True
+        return not any(self.lexicon.names_a_purchase(word) for word in words)
 
 
 # ===========================================================================
@@ -1919,20 +1969,33 @@ class Agent2:
 
     # -- reduction ----------------------------------------------------------
 
-    def _grouping_description(self, row: Dict[str, str]) -> str:
-        """The text a row is grouped on: its description, less its supplier.
+    def _grouping_text(self, row: Dict[str, str]) -> Tuple[str, str]:
+        """The text a row is grouped on and the signature it produces.
 
-        Empty where there is nothing to group on, which the caller treats as a
-        row that cannot join a group.
+        The enriched description is asked first and the original only if the
+        enriched one yields nothing, so a row is written off as having no purchase
+        in it only when neither column names one.
         """
-        description = normalise_text(row.get(REQUIRED_COLUMN, ""))
-        if not description or self.lexicon.is_noise(description):
-            return ""
-        if not self.settings.mask_suppliers:
-            return description
-        # Before the signature, so the supplier neither splits a group nor
-        # reaches its name.
-        return self.masker.strip(description, self.masker.supplier_of(row))
+        for column in (REQUIRED_COLUMN, FALLBACK_COLUMN):
+            description = normalise_text(row.get(column, ""))
+            if not description or self.lexicon.is_noise(description):
+                continue
+
+            if self.settings.mask_suppliers:
+                # Before the signature, so the supplier neither splits a group
+                # nor reaches its name. Counted only on the first attempt, or a
+                # row that needed both would be reported as two masked rows.
+                description = self.masker.strip(
+                    description, self.masker.supplier_of(row),
+                    record=column == REQUIRED_COLUMN)
+
+            signature = self.builder.signature(description)
+            if signature:
+                if column is not REQUIRED_COLUMN:
+                    self.statistics["rows_grouped_on_original_description"] += 1
+                return description, signature
+
+        return "", ""
 
     def collect(self) -> None:
         """Reduce the input rows to distinct descriptions per bucket.
@@ -1959,8 +2022,7 @@ class Agent2:
 
         self.row_signatures = []
         for row in self.table.rows:
-            description = self._grouping_description(row)
-            signature = self.builder.signature(description) if description else ""
+            description, signature = self._grouping_text(row)
             self.row_signatures.append(signature)
             if not signature:
                 skipped += 1
@@ -2233,8 +2295,11 @@ class Agent2:
             "2. Use only concepts present in the descriptions given. Never "
             "introduce a material, service or brand that does not appear.\n"
             "3. Name the common purchase, not one specific example of it.\n"
-            "4. Do not use the words 'group', 'category', 'various' or 'other'.\n"
-            "5. If the descriptions have nothing in common, return exactly "
+            "4. Do not use the words 'group', 'category', 'various' or 'other', "
+            "and do not name an individual person: describe the work instead.\n"
+            "5. Capitalise the first word only, leaving acronyms and brand names "
+            "as they are, so that names read alike down a column.\n"
+            "6. If the descriptions have nothing in common, return exactly "
             f'"{OTHER_GROUP_LABEL}".\n'
             'Reply with JSON: {"labels": {"<group_id>": "<label>"}}.'
         )
@@ -2285,6 +2350,126 @@ class Agent2:
                 self.model.store(self.model.cache_key("label", payload), proposed)
                 group.label, group.naming_method = proposed, "model"
                 self.statistics["groups_named_by_model"] += 1
+
+    def unify_synonym_labels(self) -> None:
+        """Ask the model to give one name to groups that are one purchase.
+
+        Two groups in a category can name the same purchase in different words -
+        "Car insurance" and "Vehicle insurance", "Waste handling" and "Waste
+        management" - and no rule can tell, because nothing in the words says so.
+        Only a reader who knows what the words mean can. So the model is asked for
+        a canonical name per group and the groups it names identically are folded
+        together by merge_equivalent_labels, which remains the only place where
+        anything is merged.
+
+        Confined to one category at a time. Category L5 sits below the L1-L4
+        hierarchy, so car insurance bought under "Leased and acquired cars" and
+        under "Financial Services > Insurance" are two different L5 names by
+        design, and merging across those branches would flatten the taxonomy the
+        groups hang from.
+
+        Only groups sharing a word with a neighbour are offered, because two
+        labels with no word in common are not candidates for one name and asking
+        about them would spend money to be told so. It runs after the naming pass
+        for that reason: "Komunikacyjne nnw" shares nothing with "Insurance" until
+        the model has rendered it in English.
+        """
+        if self.model is None or not self.model.config.enabled:
+            return
+
+        by_bucket: Dict[str, List[PurchaseGroup]] = defaultdict(list)
+        for group in self.groups.values():
+            if group.group_id != OTHER_GROUP_ID and group.label:
+                by_bucket[group.bucket].append(group)
+
+        system_prompt = (
+            "You standardise the names of purchase groups within a single "
+            "procurement category, so that one kind of purchase carries one "
+            "name.\n"
+            "Rules:\n"
+            "1. Return a short English noun phrase of two to four words for "
+            "every group you are given.\n"
+            "2. Give two groups exactly the same name when they are the same "
+            "kind of purchase named differently: car insurance and vehicle "
+            "insurance are one purchase, waste handling and waste management "
+            "are one purchase.\n"
+            "3. Give different names when the purchases differ. Never merge a "
+            "service with the material it is performed on, a purchase with its "
+            "maintenance, or an insurance with a lease.\n"
+            "4. Use only concepts present in the group's own label and "
+            "descriptions. Never introduce a material, service or brand that "
+            "does not appear.\n"
+            "5. Keep a brand or product family only where it defines what was "
+            "bought, as in SAP licences.\n"
+            "6. Translate into English anything that is not already English.\n"
+            "7. Do not name an individual person, and do not use the words "
+            "'group', 'category', 'various' or 'other'.\n"
+            "8. Capitalise the first word only, leaving acronyms and brand names "
+            "as they are, so that names read alike down a column.\n"
+            'Reply with JSON: {"names": {"<group_id>": "<name>"}}.'
+        )
+
+        considered = 0
+        for bucket, groups in sorted(by_bucket.items()):
+            candidates = self._synonym_candidates(groups)
+            if len(candidates) < 2:
+                continue
+            considered += len(candidates)
+
+            fingerprint = json.dumps(
+                [bucket] + sorted(group.label for group in candidates),
+                ensure_ascii=False)
+            key = self.model.cache_key("unify", fingerprint)
+            cached = self.model.cached(key)
+            names = json.loads(cached) if cached else None
+
+            if names is None:
+                request = {
+                    "category": bucket,
+                    "groups": [
+                        {
+                            "group_id": group.group_id,
+                            "current_name": group.label,
+                            "descriptions": sorted(set(group.descriptions))[:5],
+                        }
+                        for group in candidates
+                    ],
+                }
+                response = self.model.complete_json(
+                    system_prompt, json.dumps(request, ensure_ascii=False))
+                if not response:
+                    continue
+                names = response.get("names")
+                if not isinstance(names, dict):
+                    continue
+                self.model.store(key, json.dumps(names, ensure_ascii=False))
+
+            for group in candidates:
+                proposed = normalise_text(names.get(group.group_id, ""))
+                if not proposed or self.lexicon.is_noise(proposed):
+                    continue
+                proposed = sentence_case(
+                    " ".join(tokenise(proposed)[: self.settings.max_label_words]))
+                if proposed and proposed != group.label:
+                    group.label = proposed
+                    group.naming_method = "model"
+                    self.statistics["labels_standardised_by_model"] += 1
+
+        if considered:
+            LOGGER.info("Asked %s to standardise %d group name(s) that share "
+                        "wording with a neighbour.",
+                        self.model.config.model, considered)
+
+    def _synonym_candidates(self, groups: List["PurchaseGroup"]) -> List["PurchaseGroup"]:
+        """Groups in one category whose names share a word with another's."""
+        lemmas = {group.group_id: set(self.builder.lemmas(group.label))
+                  for group in groups}
+        shared: Counter = Counter()
+        for group in groups:
+            for lemma in lemmas[group.group_id]:
+                shared[lemma] += 1
+        return [group for group in sorted(groups, key=lambda g: g.group_id)
+                if any(shared[lemma] > 1 for lemma in lemmas[group.group_id])]
 
     # -- consolidation ------------------------------------------------------
 
@@ -2587,6 +2772,7 @@ class Agent2:
         self.collect()
         self.group()
         self.refine_labels()
+        self.unify_synonym_labels()
         self.merge_equivalent_labels()
         self.enforce_group_cap()
         self.commit_registry()
@@ -2648,10 +2834,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help="leave the supplier's own name in the text used "
                                "for grouping and naming; by default it is removed "
                                "so a vendor does not become a category")
-    grouping.add_argument("--max-total-groups", type=int, default=6000,
+    grouping.add_argument("--max-total-groups", type=int, default=8000,
                           help="ceiling on Category L5 names including 'Other'; "
                                "groups below the spend line join 'Other' "
-                               "(default 6000, 0 disables the ceiling)")
+                               "(default 8000, 0 disables the ceiling)")
 
     tiers = parser.add_argument_group("processing tiers")
     tiers.add_argument("--no-embeddings", action="store_true",
@@ -2852,9 +3038,23 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
     if carried:
         print(f"  Reused from registry : {carried:,} description(s) kept their group")
 
+    recovered = statistics.get("rows_grouped_on_original_description", 0)
+    if recovered:
+        print(f"  Read from the original: {recovered:,} line(s) whose enriched "
+              "description said nothing")
+
     named = statistics.get("groups_named_by_model", 0)
     if named:
         print(f"  Named by the model   : {named:,}")
+
+    standardised = statistics.get("labels_standardised_by_model", 0)
+    if standardised:
+        print(f"  Names standardised   : {standardised:,} by the model, so that one "
+              "purchase carries one name")
+
+    folded = statistics.get("groups_merged_by_label", 0)
+    if folded:
+        print(f"  Folded together      : {folded:,} group(s) that named the same purchase")
 
     bands = statistics.get("confidence_bands", {})
     if bands:
