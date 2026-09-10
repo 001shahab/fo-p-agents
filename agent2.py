@@ -92,7 +92,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent2")
 
 AGENT_NAME = "Agent 2 - AI Purchase Group (Category L5)"
-AGENT_VERSION = "1.5.0"
+AGENT_VERSION = "1.6.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -1897,6 +1897,10 @@ class PurchaseGroup:
     label: str
     bucket: str
     signatures: Set[str] = field(default_factory=set)
+    # The (category, signature) pairs this group holds. A group recalled from the
+    # registry can be joined by descriptions from a category other than the one it
+    # was first named in, so its signatures alone do not say which lines are in it.
+    entry_keys: Set[Tuple[str, str]] = field(default_factory=set)
     descriptions: List[str] = field(default_factory=list)
     row_count: int = 0
     spend: float = 0.0
@@ -1938,11 +1942,21 @@ class Agent2:
         self.run_id = ""
         self.entries: Dict[Tuple[str, str], DescriptionEntry] = {}
         self.groups: Dict[str, PurchaseGroup] = {}
-        self.signature_to_group: Dict[str, str] = {}
-        # One entry per input row, in input order, filled by collect() and read
-        # by the writer. Both need the same signature and neither may derive it
-        # independently.
-        self.row_signatures: List[str] = []
+        # Which group holds each (category, signature) pair. Keyed the same way as
+        # self.entries, and for the same reason: one wording can be bought in two
+        # categories, where it is clustered with different neighbours and can be
+        # named well in one and left in "Other" in the other. Keyed on the
+        # signature alone, the two overwrote each other and every line of one
+        # category took the other category's answer - which is how lines whose
+        # group was sitting in the directory came to read "Other".
+        self.group_of_entry: Dict[Tuple[str, str], str] = {}
+        # One (category, signature) pair per input row, in input order, filled by
+        # collect() and read by the writer. Both need the same pair and neither may
+        # derive it independently.
+        self.row_keys: List[Tuple[str, str]] = []
+        # Where a line's own route into its group differs from the group's: see
+        # the writer.
+        self.naming_of_entry: Dict[Tuple[str, str], str] = {}
         self.statistics: Counter = Counter()
 
     # -- bucketing ----------------------------------------------------------
@@ -2020,15 +2034,15 @@ class Agent2:
                 self.masker.observe(normalise_text(row.get(REQUIRED_COLUMN, "")),
                                     self.masker.supplier_of(row))
 
-        self.row_signatures = []
+        self.row_keys = []
         for row in self.table.rows:
             description, signature = self._grouping_text(row)
-            self.row_signatures.append(signature)
+            bucket = self._category_bucket(row)
+            self.row_keys.append((bucket, signature))
             if not signature:
                 skipped += 1
                 continue
 
-            bucket = self._category_bucket(row)
             key = (bucket, signature)
             entry = self.entries.get(key)
             if entry is None:
@@ -2108,7 +2122,15 @@ class Agent2:
         pending: List[DescriptionEntry] = []
         for entry in entries:
             existing = self.registry.lookup(entry.signature)
-            if existing:
+            # "Other" is not an identity to keep stable. A description that landed
+            # there did so because nothing better was found that day, and honouring
+            # that would deny it the second chance a later run - with descriptions
+            # the model has since enriched, or a rule since repaired - would give
+            # it. Registries written before this was understood still hold such
+            # bindings, so they are refused on the way in as well as on the way out.
+            # A group whose label the registry cannot produce is refused for the
+            # same reason: it would be named "Other" by default.
+            if existing and existing != OTHER_GROUP_ID and self.registry.label_of(existing):
                 self._attach_to_group(existing, entry, is_new=False)
                 self.statistics["descriptions_from_registry"] += 1
             else:
@@ -2254,12 +2276,13 @@ class Agent2:
             self.groups[group_id] = group
 
         group.signatures.add(entry.signature)
+        group.entry_keys.add((entry.bucket, entry.signature))
         group.descriptions.append(entry.text)
         group.row_count += entry.row_count
         group.spend += entry.spend
         if not is_new:
             group.is_new = False
-        self.signature_to_group[entry.signature] = group_id
+        self.group_of_entry[(entry.bucket, entry.signature)] = group_id
 
     # -- optional naming pass -----------------------------------------------
 
@@ -2368,11 +2391,15 @@ class Agent2:
         design, and merging across those branches would flatten the taxonomy the
         groups hang from.
 
-        Only groups sharing a word with a neighbour are offered, because two
-        labels with no word in common are not candidates for one name and asking
-        about them would spend money to be told so. It runs after the naming pass
-        for that reason: "Komunikacyjne nnw" shares nothing with "Insurance" until
-        the model has rendered it in English.
+        Every group in the category is offered, not only those sharing a word with
+        a neighbour. Sharing a word looked like a cheap way to find the candidates
+        and is not: "Vehicle leasing" has no word in common with "Leased cars", and
+        the two sat side by side in the directory for exactly that reason. Whether
+        two names mean one thing is the question being asked, so it cannot also be
+        the test for asking it.
+
+        It runs after the naming pass, because "Komunikacyjne nnw" cannot be
+        compared with "Insurance" until the model has rendered it in English.
         """
         if self.model is None or not self.model.config.enabled:
             return
@@ -2411,65 +2438,76 @@ class Agent2:
 
         considered = 0
         for bucket, groups in sorted(by_bucket.items()):
-            candidates = self._synonym_candidates(groups)
-            if len(candidates) < 2:
+            if len(groups) < 2:
                 continue
-            considered += len(candidates)
 
-            fingerprint = json.dumps(
-                [bucket] + sorted(group.label for group in candidates),
-                ensure_ascii=False)
-            key = self.model.cache_key("unify", fingerprint)
-            cached = self.model.cached(key)
-            names = json.loads(cached) if cached else None
-
-            if names is None:
-                request = {
-                    "category": bucket,
-                    "groups": [
-                        {
-                            "group_id": group.group_id,
-                            "current_name": group.label,
-                            "descriptions": sorted(set(group.descriptions))[:5],
-                        }
-                        for group in candidates
-                    ],
-                }
-                response = self.model.complete_json(
-                    system_prompt, json.dumps(request, ensure_ascii=False))
-                if not response:
+            # Sorted by name, so that where a category holds more groups than one
+            # request can carry, near-identical names still travel together. Two
+            # synonyms that sort far apart can end up in separate requests and go
+            # unmerged; that is the price of the batching and it fails safe.
+            ordered = sorted(groups, key=lambda group: (group.label, group.group_id))
+            for start in range(0, len(ordered), self.UNIFY_BATCH):
+                batch = ordered[start:start + self.UNIFY_BATCH]
+                if len(batch) < 2:
                     continue
-                names = response.get("names")
-                if not isinstance(names, dict):
-                    continue
-                self.model.store(key, json.dumps(names, ensure_ascii=False))
-
-            for group in candidates:
-                proposed = normalise_text(names.get(group.group_id, ""))
-                if not proposed or self.lexicon.is_noise(proposed):
-                    continue
-                proposed = sentence_case(
-                    " ".join(tokenise(proposed)[: self.settings.max_label_words]))
-                if proposed and proposed != group.label:
-                    group.label = proposed
-                    group.naming_method = "model"
-                    self.statistics["labels_standardised_by_model"] += 1
+                considered += len(batch)
+                self._unify_batch(bucket, batch, system_prompt)
 
         if considered:
-            LOGGER.info("Asked %s to standardise %d group name(s) that share "
-                        "wording with a neighbour.",
+            LOGGER.info("Asked %s to standardise the names of %d group(s), so that "
+                        "one purchase carries one name.",
                         self.model.config.model, considered)
 
-    def _synonym_candidates(self, groups: List["PurchaseGroup"]) -> List["PurchaseGroup"]:
-        """Groups in one category whose names share a word with another's."""
-        lemmas = {group.group_id: set(self.builder.lemmas(group.label))
-                  for group in groups}
-        shared: Counter = Counter()
-        for group in groups:
-            for lemma in lemmas[group.group_id]:
-                shared[lemma] += 1
-        return [group for group in sorted(groups, key=lambda g: g.group_id)
-                if any(shared[lemma] > 1 for lemma in lemmas[group.group_id])]
+    # Groups offered in a single request. A category rarely holds more; the largest
+    # on the September 2026 extract held 159.
+    UNIFY_BATCH = 60
+
+    def _unify_batch(self, bucket: str, batch: List["PurchaseGroup"],
+                     system_prompt: str) -> None:
+        """Put one batch of a category's groups to the model and take its names."""
+        assert self.model is not None
+        fingerprint = json.dumps([bucket] + sorted(group.label for group in batch),
+                                 ensure_ascii=False)
+        key = self.model.cache_key("unify", fingerprint)
+        cached = self.model.cached(key)
+        names = json.loads(cached) if cached else None
+
+        if names is None:
+            request = {
+                "category": bucket,
+                "groups": [
+                    {
+                        "group_id": group.group_id,
+                        "current_name": group.label,
+                        "descriptions": sorted(set(group.descriptions))[:3],
+                    }
+                    for group in batch
+                ],
+            }
+            response = self.model.complete_json(
+                system_prompt, json.dumps(request, ensure_ascii=False))
+            if not response:
+                return
+            names = response.get("names")
+            if not isinstance(names, dict):
+                return
+            self.model.store(key, json.dumps(names, ensure_ascii=False))
+
+        for group in batch:
+            proposed = normalise_text(names.get(group.group_id, ""))
+            if not proposed or self.lexicon.is_noise(proposed):
+                continue
+            proposed = sentence_case(
+                " ".join(tokenise(proposed)[: self.settings.max_label_words]))
+            # A standardised name that is vaguer than the one it replaces is not
+            # an improvement, and this pass sees good names as well as bad.
+            if not proposed or proposed == group.label:
+                continue
+            if self.labeller.is_weak(proposed) and not self.labeller.is_weak(group.label):
+                continue
+            group.label = proposed
+            group.naming_method = "model"
+            self.statistics["labels_standardised_by_model"] += 1
 
     # -- consolidation ------------------------------------------------------
 
@@ -2498,14 +2536,8 @@ class Agent2:
             for group in members[1:]:
                 if len(group.label) < len(survivor.label):
                     survivor.label = group.label
-                survivor.signatures |= group.signatures
-                survivor.descriptions.extend(group.descriptions)
-                survivor.row_count += group.row_count
-                survivor.spend += group.spend
                 survivor.cohesion = min(survivor.cohesion, group.cohesion)
-                for signature in group.signatures:
-                    self.signature_to_group[signature] = survivor.group_id
-                del self.groups[group.group_id]
+                self._absorb(survivor, group)
                 merged += 1
 
         if merged:
@@ -2514,11 +2546,22 @@ class Agent2:
                         "fulfilment word such as delivery or site use.", merged)
 
     def enforce_group_cap(self) -> None:
-        """Hold the number of Category L5 names at Fortum's ceiling.
+        """Hold the number of Category L5 names at the agreed ceiling.
 
-        Groups are ranked by the spend behind them, so the names that survive
-        are the ones a category manager would act on first. Everything past the
-        ceiling joins "Other", which occupies one of the places itself.
+        Groups are ranked by the spend behind them, so the names that survive are
+        the ones a category manager would act on first. What happens to the rest
+        matters more than which they are: they used to join "Other" wholesale,
+        which threw away a name that had already been earned and put lines with a
+        perfectly good concept - "B2B gas service for RMK" - in the one bucket
+        that says nothing. A reader then asks why those lines are unclassified
+        when a group for them is sitting in the same directory, and the answer,
+        that they fell below a spend line, is not one worth giving.
+
+        So a demoted group is folded into the nearest surviving group in its own
+        category instead, and "Other" is used only where the category has nothing
+        to fold it into. Losing the distinction between "B2B gas service" and "B2B
+        gas service for RMK" is the intended cost of a ceiling; losing the fact
+        that a line bought gas is not.
         """
         cap = self.settings.max_total_groups
         if cap <= 0:
@@ -2530,34 +2573,115 @@ class Agent2:
             return
 
         named.sort(key=lambda g: (-g.spend, -g.row_count, g.label, g.group_id))
-        demoted = named[cap - 1:]
 
+        # Every category keeps its strongest name before spend decides anything
+        # else. Ranking on spend alone lets the categories Fortum spends least in
+        # lose every name they had, and a category with no name left has nothing
+        # for its own groups to fold into, so they all fall through to "Other" -
+        # the outcome this method exists to avoid. The reservation costs one place
+        # per category, and there are far fewer categories than places.
+        survivors: List[PurchaseGroup] = []
+        kept: Set[str] = set()
+        seen_buckets: Set[str] = set()
+        for group in named:
+            if len(survivors) >= cap - 1:
+                break
+            if group.bucket in seen_buckets:
+                continue
+            seen_buckets.add(group.bucket)
+            survivors.append(group)
+            kept.add(group.group_id)
+        for group in named:
+            if len(survivors) >= cap - 1:
+                break
+            if group.group_id not in kept:
+                survivors.append(group)
+                kept.add(group.group_id)
+
+        demoted = [group for group in named if group.group_id not in kept]
+
+        siblings: Dict[str, List[PurchaseGroup]] = defaultdict(list)
+        for group in survivors:
+            siblings[group.bucket].append(group)
+
+        folded_into_sibling = 0
+        rows_into_other = 0
+        for group in demoted:
+            host = self._closest_sibling(group, siblings.get(group.bucket, ()))
+            if host is None:
+                host = self._other_group(group.bucket)
+                rows_into_other += group.row_count
+            else:
+                folded_into_sibling += 1
+            self._absorb(host, group)
+
+        self.statistics["groups_folded_into_sibling"] = folded_into_sibling
+        self.statistics["groups_folded_into_other"] = len(demoted) - folded_into_sibling
+        self.statistics["rows_folded_into_other"] = rows_into_other
+        LOGGER.info(
+            "Category L5 is capped at %d names including 'Other'; of %d group(s) "
+            "below the spend line, %d joined a related group in the same category "
+            "and %d had none to join, taking %d row(s) into 'Other'.",
+            cap, len(demoted), folded_into_sibling,
+            len(demoted) - folded_into_sibling, rows_into_other)
+
+    def _closest_sibling(self, group: PurchaseGroup,
+                         candidates: Iterable[PurchaseGroup]) -> Optional[PurchaseGroup]:
+        """The surviving group in the same category closest to this one.
+
+        Closeness is how much of the two names is the same concept. A group with
+        nothing in common is not a host: it would be as wrong as "Other" and would
+        hide the error rather than report it.
+        """
+        wanted = set(self.builder.concept_lemmas(self.builder.lemmas(group.label)))
+        if not wanted:
+            return None
+
+        best: Optional[PurchaseGroup] = None
+        best_score: Tuple[int, int, str] = (0, 0, "")
+        for candidate in candidates:
+            shared = len(wanted & set(self.builder.concept_lemmas(
+                self.builder.lemmas(candidate.label))))
+            if not shared:
+                continue
+            score = (shared, candidate.row_count, candidate.group_id)
+            if score > best_score:
+                best, best_score = candidate, score
+        return best
+
+    def _other_group(self, bucket: str) -> PurchaseGroup:
+        """The single "Other" group, created on first use."""
         other = self.groups.get(OTHER_GROUP_ID)
         if other is None:
             other = PurchaseGroup(group_id=OTHER_GROUP_ID, label=OTHER_GROUP_LABEL,
-                                  bucket=demoted[0].bucket, is_new=True,
-                                  naming_method="cap")
+                                  bucket=bucket, is_new=True, naming_method="cap")
             self.groups[OTHER_GROUP_ID] = other
+        return other
 
-        for group in demoted:
-            other.signatures |= group.signatures
-            other.descriptions.extend(group.descriptions)
-            other.row_count += group.row_count
-            other.spend += group.spend
-            for signature in group.signatures:
-                self.signature_to_group[signature] = OTHER_GROUP_ID
-            del self.groups[group.group_id]
-
-        self.statistics["groups_folded_into_other"] = len(demoted)
-        LOGGER.info(
-            "Category L5 is capped at %d names including 'Other'; %d group(s) "
-            "below the spend line were folded into 'Other'.", cap, len(demoted))
+    def _absorb(self, host: PurchaseGroup, group: PurchaseGroup) -> None:
+        """Move everything behind one group into another and retire it."""
+        if host.group_id == OTHER_GROUP_ID:
+            for key in group.entry_keys:
+                self.naming_of_entry[key] = "cap"
+        host.signatures |= group.signatures
+        host.entry_keys |= group.entry_keys
+        host.descriptions.extend(group.descriptions)
+        host.row_count += group.row_count
+        host.spend += group.spend
+        for key in group.entry_keys:
+            self.group_of_entry[key] = host.group_id
+        del self.groups[group.group_id]
 
     # -- persistence --------------------------------------------------------
 
     def commit_registry(self) -> None:
-        """Write every group formed in this run back into the registry."""
+        """Write every group formed in this run back into the registry.
+
+        Except "Other", which is deliberately never remembered: see _group_bucket.
+        """
         for group_id in sorted(self.groups):
+            if group_id == OTHER_GROUP_ID:
+                continue
             group = self.groups[group_id]
             self.registry.register(group_id, group.label, group.bucket, group.signatures)
             self.registry.stamp_run(group_id, self.run_id)
@@ -2566,12 +2690,12 @@ class Agent2:
     def write(self) -> Dict[str, Any]:
         """Write every output file and return the run manifest."""
         assert self.table is not None
-        if len(self.row_signatures) != len(self.table.rows):
+        if len(self.row_keys) != len(self.table.rows):
             # zip() would stop at the shorter of the two and lose the remaining
             # rows without a word, and no row may leave the analysis. Raised
             # rather than asserted so that -O cannot switch the guard off.
             raise RuntimeError(
-                f"{len(self.row_signatures)} signature(s) for "
+                f"{len(self.row_keys)} signature(s) for "
                 f"{len(self.table.rows)} row(s): collect() must run first")
 
         results_dir = self.settings.results_dir
@@ -2600,11 +2724,12 @@ class Agent2:
 
             jsonl_handle = jsonl_path.open("w", encoding="utf-8") if self.settings.write_jsonl else None
             try:
-                # The signature comes from the list the collector built, never
-                # from a second reading of the description: see collect().
-                for row, signature in zip(self.table.rows, self.row_signatures):
+                # The category and signature come from the list the collector
+                # built, never from a second reading of the row: see collect().
+                for row, key in zip(self.table.rows, self.row_keys):
+                    signature = key[1]
                     output = dict(row)
-                    group_id = self.signature_to_group.get(signature, "")
+                    group_id = self.group_of_entry.get(key, "")
                     group = self.groups.get(group_id)
 
                     if group is None:
@@ -2624,7 +2749,7 @@ class Agent2:
                             "AI_Purchase_Group_Is_New": "No",
                         })
                     else:
-                        entry = self.entries.get((group.bucket, signature))
+                        entry = self.entries.get(key)
                         confidence, band = self._score(group, entry)
                         grouped_rows += 1
                         band_counts[band] += 1
@@ -2640,7 +2765,13 @@ class Agent2:
                                 self._category_bucket(row)
                                 if group.group_id == OTHER_GROUP_ID else group.bucket),
                             "AI_Purchase_Group_Cohesion": round(group.cohesion, 3),
-                            "AI_Purchase_Group_Naming": group.naming_method,
+                            # Lines in "Other" arrive by different routes and the
+                            # first question asked of them is which one, so each
+                            # keeps its own answer instead of the group's: "cap"
+                            # for a name that lost its place at the ceiling,
+                            # "fallback" for a description with no concept in it.
+                            "AI_Purchase_Group_Naming": self.naming_of_entry.get(
+                                key, group.naming_method),
                             "AI_Purchase_Group_Is_New": "Yes" if group.is_new else "No",
                         })
 
@@ -3055,6 +3186,16 @@ def print_summary(manifest: Dict[str, Any], settings: Settings) -> None:
     folded = statistics.get("groups_merged_by_label", 0)
     if folded:
         print(f"  Folded together      : {folded:,} group(s) that named the same purchase")
+
+    into_sibling = statistics.get("groups_folded_into_sibling", 0)
+    into_other = statistics.get("groups_folded_into_other", 0)
+    if into_sibling or into_other:
+        print(f"  Held to the ceiling  : {into_sibling:,} group(s) joined a related "
+              "group in the same category")
+        if into_other:
+            print(f"                         {into_other:,} had none to join, taking "
+                  f"{statistics.get('rows_folded_into_other', 0):,} line(s) into "
+                  "'Other' - raise --max-total-groups to keep their own names")
 
     bands = statistics.get("confidence_bands", {})
     if bands:
