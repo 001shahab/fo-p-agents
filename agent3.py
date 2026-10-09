@@ -3308,7 +3308,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  python agent3.py\n"
             "      Prompt for each path in turn and run with the defaults.\n\n"
-            "  python agent3.py --non-interactive --input results/agent2_purchase_groups.csv \\\n"
+            "  python agent3.py --non-interactive --input may_dec_results/agent2_purchase_groups.csv \\\n"
             "                   --catalogues './catalogues'\n"
             "      Run unattended against the item catalogues the client sent.\n\n"
             "  python agent3.py --non-interactive --medium-threshold 0.70\n"

@@ -2715,7 +2715,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  python agent4.py\n"
             "      Prompt for each path in turn and run with the defaults.\n\n"
-            "  python agent4.py --non-interactive --input results/agent2_purchase_groups.csv\n"
+            "  python agent4.py --non-interactive --input may_dec_results/agent2_purchase_groups.csv\n"
             "      Run unattended over the six default scope levels.\n\n"
             "  python agent4.py --non-interactive --scopes Category_L2 Division\n"
             "      Restrict the comparison to two levels, which is much faster.\n\n"

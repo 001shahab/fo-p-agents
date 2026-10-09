@@ -121,7 +121,7 @@ starts from stage 1. `--restart` does that on demand.
 Usage
 -----
     python max.py                 # prompts for each path in turn
-    python max.py --non-interactive --sources ./sources --results ./results
+    python max.py --non-interactive --sources ./sources --results ./may_dec_results
     python max.py --non-interactive --no-agents      # stop after stage 3
     python max.py --non-interactive --restart        # ignore an interrupted run
     python max.py --help
@@ -4853,13 +4853,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  python max.py\n"
             "      Prompt for each path in turn and run with the defaults.\n\n"
-            "  python max.py --non-interactive --sources ./sources --results ./results\n"
+            "  python max.py --non-interactive --sources ./sources --results ./may_dec_results\n"
             "      Run unattended with the local reader only.\n\n"
             "  python max.py --non-interactive --use-llm --llm-spend-limit 10\n"
             "      Add the model tier for free text the rules cannot read.\n\n"
             "  python max.py --non-interactive --no-agents\n"
             "      Stop at stage 3, leaving the agents to be run separately.\n\n"
-            "  python max.py --non-interactive --results ./results\n"
+            "  python max.py --non-interactive --results ./may_dec_results\n"
             "      After a run was stopped, carry on from the stage it reached.\n\n"
             "  python max.py --non-interactive --restart\n"
             "      Ignore what an interrupted run finished and rebuild from stage 1.\n"

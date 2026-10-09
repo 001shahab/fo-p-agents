@@ -2933,7 +2933,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  python agent2.py\n"
             "      Prompt for each path in turn and run with the defaults.\n\n"
-            "  python agent2.py --non-interactive --input results/agent1_unified_lines.csv\n"
+            "  python agent2.py --non-interactive --input may_dec_results/agent1_unified_lines.csv\n"
             "      Run unattended against Agent 1's output.\n\n"
             "  python agent2.py --non-interactive --min-groups 15 --max-groups 40\n"
             "      Steer the adaptive threshold towards a narrower group count.\n"

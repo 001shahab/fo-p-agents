@@ -5042,9 +5042,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  python agent1.py\n"
             "      Prompt for each path in turn and run with the defaults.\n\n"
-            "  python agent1.py --non-interactive --sources ./sources --results ./results\n"
+            "  python agent1.py --non-interactive --sources ./sources --results ./may_dec_results\n"
             "      Run unattended with the local NLP stack only.\n\n"
-            "  python agent1.py --non-interactive --input ./results/max_stage3_interpreted.csv --use-llm\n"
+            "  python agent1.py --non-interactive --input ./may_dec_results/max_stage3_interpreted.csv --use-llm\n"
             "      Run against the Stage 3 master table with the language-model tier.\n"
         ),
     )
