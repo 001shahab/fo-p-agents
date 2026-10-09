@@ -46,7 +46,7 @@ python agent3.py
 python agent4.py
 ```
 
-Results land in `results/`. Nothing else is required: the language model is
+Results land in `may_dec_results/`. Nothing else is required: the language model is
 optional, and every agent runs to completion without one.
 
 ---
@@ -596,7 +596,7 @@ python agent4.py
 Every agent also runs unattended, which is what a scheduled job should use:
 
 ```bash
-python agent1.py --non-interactive --sources ./sources --results ./results
+python agent1.py --non-interactive --sources ./sources --results ./may_dec_results
 python agent2.py --non-interactive
 python agent3.py --non-interactive
 python agent4.py --non-interactive
@@ -609,7 +609,7 @@ Common options, available on all four:
 | Option | Effect |
 | --- | --- |
 | `--non-interactive` | never prompt; use arguments and defaults |
-| `--results DIR` | where to write output (default `./results`) |
+| `--results DIR` | where to write output (default `./may_dec_results`) |
 | `--lexicon FILE` | the controlled vocabulary |
 | `--cache DIR` | model response cache (default `./cache`) |
 | `--use-llm` | enable the language-model tier |
@@ -670,7 +670,7 @@ accepts:
 
 | Question | Default |
 | --- | --- |
-| Results folder | `./results` |
+| Results folder | `./may_dec_results` |
 | Use a stage-3 table already in that folder, or start from the extracts | use it, when one is there |
 | Source extracts folder | `./sources` |
 | Item catalogue file or folder for Agent 3 | the largest `*Item*Catalogue*Master*.xls*` found |
@@ -772,7 +772,7 @@ the run says so:
 ### max.py
 
 ```bash
-python max.py --non-interactive --sources ./sources --results ./results
+python max.py --non-interactive --sources ./sources --results ./may_dec_results
 python max.py --no-agents      # stop at stage 3, the joined table only
 ```
 

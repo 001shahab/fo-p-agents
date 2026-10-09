@@ -166,7 +166,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from runtime import (
-    budget_for_rows, chat_endpoint, estimated_model_cost, missing_key_message,
+    DEFAULT_RESULTS_DIR_NAME, budget_for_rows, chat_endpoint,
+    estimated_model_cost, missing_key_message,
     model_environment, parse_dotenv, probe_chat_endpoint, resolve_credentials,
 )
 
@@ -3042,7 +3043,9 @@ def build_parser() -> argparse.ArgumentParser:
     paths.add_argument("--sources", metavar="DIR",
                       help="folder holding the raw source extracts; naming it means "
                            "starting from them rather than from a table already built")
-    paths.add_argument("--results", metavar="DIR", help="folder to write results into")
+    paths.add_argument("--results", metavar="DIR",
+                      help="folder to write results into "
+                           f"(default: {DEFAULT_RESULTS_DIR_NAME})")
     paths.add_argument("--catalogues", metavar="PATH",
                       help="the client's item catalogue for Agent 3, a file or a "
                            "folder (default: the catalogue master in the source folder)")
@@ -3161,7 +3164,8 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
     env = read_dotenv(here / ".env")
 
     source_dir = Path(args.sources) if args.sources else here / "sources"
-    results_dir = Path(args.results) if args.results else here / "results"
+    results_dir = (Path(args.results) if args.results
+                   else here / DEFAULT_RESULTS_DIR_NAME)
     lexicon_path = (Path(args.lexicon) if args.lexicon
                     else here / "lexicon" / "procurement_lexicon.json")
     cache_dir = Path(args.cache) if args.cache else here / "cache"

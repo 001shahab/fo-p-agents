@@ -134,6 +134,17 @@ def load_sentence_transformer(package: Any, name: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Output folder shared by every agent
+# ---------------------------------------------------------------------------
+
+# Where every agent writes unless --results says otherwise. Named for the
+# extract it holds rather than "results", so that one delivery's output cannot
+# be mistaken for or written over by another's. Kept here so that the four
+# agents, Max and the all-agents run cannot drift onto different folders.
+DEFAULT_RESULTS_DIR_NAME = "may_dec_results"
+
+
+# ---------------------------------------------------------------------------
 # Chat model defaults shared by every agent
 # ---------------------------------------------------------------------------
 

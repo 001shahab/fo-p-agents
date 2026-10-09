@@ -89,7 +89,8 @@ from typing import (Any, Callable, Dict, FrozenSet, Iterable, Iterator, List,
 from xml.etree import ElementTree
 
 from runtime import (
-    DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT, SpendLimitReached,
+    DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_RESULTS_DIR_NAME,
+    SpendLimitReached,
     chat_completion_body, chat_endpoint, configure_process_logging,
     load_sentence_transformer, missing_key_message, model_environment, parse_dotenv,
     resolve_credentials, retry_chat_body,
@@ -5051,7 +5052,9 @@ def build_parser() -> argparse.ArgumentParser:
     paths.add_argument("--sources", metavar="DIR", help="folder holding the source data")
     paths.add_argument("--input", metavar="PATH",
                        help="Stage 3 master file (or folder) to enrich; overrides --sources")
-    paths.add_argument("--results", metavar="DIR", help="folder to write results into")
+    paths.add_argument("--results", metavar="DIR",
+                       help="folder to write results into "
+                            f"(default: {DEFAULT_RESULTS_DIR_NAME})")
     paths.add_argument("--lexicon", metavar="FILE", help="controlled vocabulary JSON file")
     paths.add_argument("--cache", metavar="DIR", help="folder for the model response cache")
 
@@ -5147,7 +5150,8 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     """Combine defaults, command-line arguments and prompts into a settings object."""
     here = Path(__file__).resolve().parent
     default_sources = Path(args.input or args.sources) if (args.input or args.sources) else here / "sources"
-    default_results = Path(args.results) if args.results else here / "results"
+    default_results = (Path(args.results) if args.results
+                       else here / DEFAULT_RESULTS_DIR_NAME)
     default_lexicon = Path(args.lexicon) if args.lexicon else here / "lexicon" / "procurement_lexicon.json"
     default_cache = Path(args.cache) if args.cache else here / "cache"
 

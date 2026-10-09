@@ -95,7 +95,8 @@ from typing import (Any, Dict, FrozenSet, Iterable, List, Optional, Sequence,
                     Set, Tuple)
 
 from runtime import (
-    DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT, SpendLimitReached,
+    DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_RESULTS_DIR_NAME,
+    SpendLimitReached,
     chat_completion_body, chat_endpoint, configure_process_logging,
     load_sentence_transformer, missing_key_message, model_environment, parse_dotenv,
     resolve_credentials, retry_chat_body,
@@ -3321,7 +3322,9 @@ def build_parser() -> argparse.ArgumentParser:
     paths.add_argument("--catalogues", metavar="DIR",
                        help="folder holding item catalogues only; use this when the "
                             "catalogues are kept apart from the purchase extracts")
-    paths.add_argument("--results", metavar="DIR", help="folder to write results into")
+    paths.add_argument("--results", metavar="DIR",
+                       help="folder to write results into "
+                            f"(default: {DEFAULT_RESULTS_DIR_NAME})")
     paths.add_argument("--lexicon", metavar="FILE", help="controlled vocabulary JSON file")
     paths.add_argument("--cache", metavar="DIR", help="folder for the model response cache")
 
@@ -3409,7 +3412,8 @@ def ask_amount(question: str, default: float) -> float:
 
 def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     here = Path(__file__).resolve().parent
-    default_results = Path(args.results) if args.results else here / "results"
+    default_results = (Path(args.results) if args.results
+                       else here / DEFAULT_RESULTS_DIR_NAME)
 
     # Agent 2's output is preferred because it carries the purchase group, which
     # makes the candidate list far more readable. Agent 1's output works too.

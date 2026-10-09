@@ -83,7 +83,8 @@ from typing import (Any, Dict, FrozenSet, Iterable, Iterator, List, Optional,
                     Sequence, Set, Tuple)
 
 from runtime import (
-    DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT, SpendLimitReached,
+    DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_RESULTS_DIR_NAME,
+    SpendLimitReached,
     chat_completion_body, chat_endpoint, configure_process_logging,
     load_sentence_transformer, missing_key_message, model_environment, parse_dotenv,
     resolve_credentials, retry_chat_body,
@@ -2940,7 +2941,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     paths = parser.add_argument_group("paths")
     paths.add_argument("--input", metavar="FILE", help="unified table written by Agent 1")
-    paths.add_argument("--results", metavar="DIR", help="folder to write results into")
+    paths.add_argument("--results", metavar="DIR",
+                       help="folder to write results into "
+                            f"(default: {DEFAULT_RESULTS_DIR_NAME})")
     paths.add_argument("--lexicon", metavar="FILE", help="controlled vocabulary JSON file")
     paths.add_argument("--registry", metavar="FILE", help="group registry that keeps labels stable")
     paths.add_argument("--cache", metavar="DIR", help="folder for the model response cache")
@@ -3037,7 +3040,8 @@ def ask_amount(question: str, default: float) -> float:
 
 def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     here = Path(__file__).resolve().parent
-    default_results = Path(args.results) if args.results else here / "results"
+    default_results = (Path(args.results) if args.results
+                       else here / DEFAULT_RESULTS_DIR_NAME)
     default_input = (Path(args.input) if args.input
                      else default_results / "agent1_unified_lines.csv")
     default_lexicon = Path(args.lexicon) if args.lexicon else here / "lexicon" / "procurement_lexicon.json"
