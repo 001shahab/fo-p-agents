@@ -25,7 +25,9 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+LOGGER = logging.getLogger("runtime")
 
 
 _HUB_ENV = {
@@ -142,6 +144,138 @@ def load_sentence_transformer(package: Any, name: str) -> Any:
 # be mistaken for or written over by another's. Kept here so that the four
 # agents, Max and the all-agents run cannot drift onto different folders.
 DEFAULT_RESULTS_DIR_NAME = "may_dec_results"
+
+
+# ---------------------------------------------------------------------------
+# Finding the raw extracts
+# ---------------------------------------------------------------------------
+
+# The folder the extracts are kept in by convention.
+SOURCE_DIR_NAME = "sources"
+
+_EXTRACT_SUFFIXES = {".csv", ".tsv", ".xls", ".xlsx", ".xlsm"}
+
+# Folders beside the scripts that hold something other than a delivery.
+_NOT_SOURCE_DIR_NAMES = {
+    "cache", "lexicon", "static", "feedback", "terminals", "docs", "tests",
+    "node_modules", "__pycache__", ".testruns",
+}
+
+# What a folder of our own output looks like. A results folder is full of CSVs
+# and would otherwise pass for a delivery.
+_OUTPUT_FILE_PREFIXES = ("agent1_", "agent2_", "agent3_", "agent4_", "max_",
+                         "all_agents")
+
+# Fortum deliver the item catalogue with the extracts, so a folder holding one
+# is almost certainly the delivery.
+_CATALOGUE_MASTER_GLOB = "*Item*Catalogue*Master*.xls*"
+
+
+def _extracts_in(folder: Path) -> List[Path]:
+    """The files in a folder that could be an extract, by name alone."""
+    try:
+        entries = sorted(folder.iterdir())
+    except OSError:
+        return []
+    return [path for path in entries
+            if path.is_file()
+            and path.suffix.lower() in _EXTRACT_SUFFIXES
+            and not path.name.startswith((".", "~$"))
+            and not path.name.startswith(_OUTPUT_FILE_PREFIXES)]
+
+
+def _holds_our_output(folder: Path) -> bool:
+    """Whether a folder is one an agent, or Max, has written into.
+
+    Checked one level down as well, because the all-agents run keeps its output
+    in a sub-folder and the folder above it would otherwise look like a delivery.
+    """
+    try:
+        entries = sorted(folder.iterdir())
+    except OSError:
+        return False
+    for path in entries:
+        if path.is_file() and path.name.startswith(_OUTPUT_FILE_PREFIXES):
+            return True
+        if path.is_dir() and any(
+                child.is_file() and child.name.startswith(_OUTPUT_FILE_PREFIXES)
+                for child in _safe_iterdir(path)):
+            return True
+    return False
+
+
+def _safe_iterdir(folder: Path) -> List[Path]:
+    """The entries of a folder, or none where it cannot be read."""
+    try:
+        return sorted(folder.iterdir())
+    except OSError:
+        return []
+
+
+def _looks_like_an_environment(folder: Path) -> bool:
+    """Whether a folder is a virtual environment rather than data."""
+    return ((folder / "pyvenv.cfg").is_file()
+            or (folder / "bin" / "python").exists()
+            or (folder / "Scripts" / "python.exe").exists())
+
+
+def source_candidates(here: Path) -> List[Path]:
+    """Folders beside the scripts that look like a delivery of extracts.
+
+    Best first. "Best" is: the folder holding the item catalogue, then the one
+    holding the most extracts, then the one most recently written to - in that
+    order, because the catalogue is the strongest signal and recency is only a
+    tie-breaker between two deliveries that look equally plausible.
+    """
+    scored = []
+    for folder in _safe_iterdir(here):
+        if (not folder.is_dir() or folder.name.startswith(".")
+                or folder.name in _NOT_SOURCE_DIR_NAMES
+                or _looks_like_an_environment(folder)
+                or _holds_our_output(folder)):
+            continue
+        extracts = _extracts_in(folder)
+        if not extracts:
+            continue
+        has_catalogue = any(folder.glob(_CATALOGUE_MASTER_GLOB))
+        newest = max(path.stat().st_mtime for path in extracts)
+        scored.append((bool(has_catalogue), len(extracts), newest, folder))
+    scored.sort(reverse=True)
+    return [entry[-1] for entry in scored]
+
+
+def find_source_dir(here: Path) -> Path:
+    """The folder to read the raw extracts from when none was named.
+
+    The convention is a folder called "sources", and where there is one it is
+    used without further thought. Where there is not - because the delivery was
+    unzipped into a folder of its own, named after the subset it holds, which is
+    what happens on a machine other than the one the convention was invented on
+    - the best-looking delivery beside the scripts is used instead. Returning
+    the convention's folder when nothing qualifies keeps the error a caller
+    raises about a missing folder true: there really is no delivery to read.
+    """
+    conventional = here / SOURCE_DIR_NAME
+    if conventional.is_dir():
+        return conventional
+    found = source_candidates(here)
+    if not found:
+        return conventional
+    LOGGER.info("No %s folder here, so the extracts are being read from %s.",
+                SOURCE_DIR_NAME, found[0].name)
+    for other in found[1:]:
+        LOGGER.info("  %s also looks like a delivery; name it with --sources to "
+                    "use that one instead.", other.name)
+    return found[0]
+
+
+def describe_source_candidates(here: Path) -> str:
+    """A line for an error message, naming the folders that could be meant."""
+    found = source_candidates(here)
+    if not found:
+        return ""
+    names = ", ".join(folder.name for folder in found)
+    return f"Folders here that hold extracts: {names}"
 
 
 # ---------------------------------------------------------------------------

@@ -167,7 +167,8 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 
 from runtime import (
     DEFAULT_RESULTS_DIR_NAME, budget_for_rows, chat_endpoint,
-    estimated_model_cost, missing_key_message,
+    describe_source_candidates, estimated_model_cost, find_source_dir,
+    missing_key_message,
     model_environment, parse_dotenv, probe_chat_endpoint, resolve_credentials,
 )
 
@@ -1057,10 +1058,16 @@ class InputResolver:
                 f"No purchase table to read and max.py is not in {self.here}, so "
                 f"one cannot be built.\nPoint --input at a CSV file instead.")
         if not self.settings.source_dir.is_dir():
+            # Naming the folders that do hold extracts, because the delivery is
+            # usually sitting right there under the name of the subset it holds,
+            # and a message that only says "sources" is missing sends the reader
+            # looking for a folder that was never going to be there.
+            nearby = describe_source_candidates(self.here)
             raise SystemExit(
                 f"Cannot start from the raw extracts because the source folder does "
                 f"not exist:\n  {self.settings.source_dir}\n"
-                f"Name the right folder with --sources, or point --input at a "
+                + (f"{nearby}\n" if nearby else "")
+                + f"Name the right folder with --sources, or point --input at a "
                 f"purchase table that already exists.")
 
         extracts = [path for path in sorted(self.settings.source_dir.rglob("*"))
@@ -3163,7 +3170,8 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
     here = Path(__file__).resolve().parent
     env = read_dotenv(here / ".env")
 
-    source_dir = Path(args.sources) if args.sources else here / "sources"
+    source_dir = (Path(args.sources) if args.sources
+                  else find_source_dir(here))
     results_dir = (Path(args.results) if args.results
                    else here / DEFAULT_RESULTS_DIR_NAME)
     lexicon_path = (Path(args.lexicon) if args.lexicon

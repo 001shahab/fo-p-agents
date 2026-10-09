@@ -156,8 +156,8 @@ from runtime import (
     DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_RESULTS_DIR_NAME,
     SpendLimitReached,
     chat_completion_body, chat_endpoint, configure_process_logging,
-    missing_key_message, model_environment, parse_dotenv, resolve_credentials,
-    retry_chat_body,
+    find_source_dir, missing_key_message, model_environment, parse_dotenv,
+    resolve_credentials, retry_chat_body,
 )
 
 # --- Optional components ---------------------------------------------------
@@ -4968,7 +4968,8 @@ def ask_amount(question: str, default: float) -> float:
 
 def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     here = Path(__file__).resolve().parent
-    default_sources = Path(args.sources) if args.sources else here / "sources"
+    default_sources = (Path(args.sources) if args.sources
+                       else find_source_dir(here))
     default_results = (Path(args.results) if args.results
                        else here / DEFAULT_RESULTS_DIR_NAME)
     default_lexicon = (Path(args.lexicon) if args.lexicon

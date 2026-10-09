@@ -46,8 +46,11 @@ python agent3.py
 python agent4.py
 ```
 
-Results land in `may_dec_results/`. Nothing else is required: the language model is
-optional, and every agent runs to completion without one.
+Results land in `may_dec_results/`. The extracts are read from `sources/`, or,
+where there is no such folder, from whichever folder beside the scripts holds a
+delivery — the run says which one it chose, and `--sources` settles it. Nothing
+else is required: the language model is optional, and every agent runs to
+completion without one.
 
 ---
 
@@ -672,7 +675,7 @@ accepts:
 | --- | --- |
 | Results folder | `./may_dec_results` |
 | Use a stage-3 table already in that folder, or start from the extracts | use it, when one is there |
-| Source extracts folder | `./sources` |
+| Source extracts folder | `./sources`, or the delivery beside the scripts when there is no such folder |
 | Item catalogue file or folder for Agent 3 | the largest `*Item*Catalogue*Master*.xls*` found |
 | Let the agents call the language model | yes |
 | Budget for the language model | enough to cover the rows in the input |

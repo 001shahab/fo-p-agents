@@ -98,8 +98,8 @@ from runtime import (
     DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_RESULTS_DIR_NAME,
     SpendLimitReached,
     chat_completion_body, chat_endpoint, configure_process_logging,
-    load_sentence_transformer, missing_key_message, model_environment, parse_dotenv,
-    resolve_credentials, retry_chat_body,
+    find_source_dir, load_sentence_transformer, missing_key_message,
+    model_environment, parse_dotenv, resolve_credentials, retry_chat_body,
 )
 
 LOGGER = logging.getLogger("agent3")
@@ -3424,7 +3424,8 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
     else:
         default_input = default_results / "agent1_unified_lines.csv"
 
-    default_reference = Path(args.reference) if args.reference else here / "sources"
+    default_reference = (Path(args.reference) if args.reference
+                         else find_source_dir(here))
     default_lexicon = Path(args.lexicon) if args.lexicon else here / "lexicon" / "procurement_lexicon.json"
     default_cache = Path(args.cache) if args.cache else here / "cache"
 
