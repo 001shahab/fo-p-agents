@@ -181,7 +181,7 @@ except ImportError:
 
 
 AGENT_NAME = "Max - wide procurement dataset builder"
-AGENT_VERSION = "1.4.0"
+AGENT_VERSION = "1.5.0"
 
 # ---------------------------------------------------------------------------
 # The agent interface
@@ -555,6 +555,18 @@ def fold_accents(text: str) -> str:
 def lookup_key(text: str) -> str:
     """Canonical key for vocabulary and cache lookups."""
     return _WHITESPACE.sub(" ", fold_accents(text).lower()).strip()
+
+
+def header_key(text: str) -> str:
+    """Canonical key for extract headers.
+
+    Deliveries re-case, re-space and swap spaces for underscores between
+    extracts. SourceRowId, Source Row Id, SOURCEROWID and DATA_SOURCE for
+    DataSource have all arrived. Stripping separators after folding means
+    those spellings resolve to the same key, so a new extract is recognised
+    without a synonym list that can never stay complete.
+    """
+    return re.sub(r"[^a-z0-9]", "", lookup_key(text))
 
 
 def compact_key(value: Any) -> str:
@@ -1090,7 +1102,9 @@ def read_table_file(path: Path) -> List[Table]:
 # Which file is which is decided from the header signature rather than the file
 # name, so the extracts can be renamed, re-foldered or delivered several at a
 # time without touching this code. Each role names the headers that identify it;
-# a table is assigned the best-scoring role that clears the threshold.
+# a table is assigned the best-scoring role that clears the threshold. Matching
+# is on header_key, so "Spend in EUR" and "SPEND_IN_EUR" count as the same
+# column.
 
 _ROLE_SIGNATURES: Dict[str, Tuple[str, ...]] = {
     "sievo": ("sourcerowid", "datasource", "spend in eur", "po number",
@@ -1110,10 +1124,10 @@ _ROLE_THRESHOLD = 0.34
 
 def classify_table(table: Table) -> Tuple[str, float]:
     """Assign a table to a source role, with the score that earned it."""
-    present = {lookup_key(header) for header in table.headers if header}
+    present = {header_key(header) for header in table.headers if header}
     best_role, best_score = "", 0.0
     for role, signature in _ROLE_SIGNATURES.items():
-        hits = sum(1 for name in signature if name in present)
+        hits = sum(1 for name in signature if header_key(name) in present)
         score = hits / len(signature)
         if score > best_score:
             best_role, best_score = role, score
@@ -1148,15 +1162,16 @@ class ColumnMap:
 
     Extracts get re-cased, re-spaced and occasionally renamed between deliveries,
     so every field is looked up through a list of accepted spellings rather than
-    a single literal. Lookup is on the folded, lower-cased header.
+    a single literal. Lookup is on header_key, so "Spend in EUR" and
+    "SPEND_IN_EUR" resolve to the same field.
     """
 
     def __init__(self, headers: Sequence[str], synonyms: Dict[str, Sequence[str]]) -> None:
-        index = {lookup_key(header): header for header in headers if header}
+        index = {header_key(header): header for header in headers if header}
         self._resolved: Dict[str, str] = {}
         for field_name, candidates in synonyms.items():
             for candidate in candidates:
-                header = index.get(lookup_key(candidate))
+                header = index.get(header_key(candidate))
                 if header:
                     self._resolved[field_name] = header
                     break
