@@ -298,6 +298,12 @@ HEARTBEAT_SECONDS = 60
 # run started here and a run started from agent1.py brake at the same point.
 DEFAULT_SPEND_LIMIT = 25.00
 
+# How every agent's spend guard words the stop it makes under --non-interactive,
+# which is how this script starts them. Their exit code is the same as any other
+# failure's, so this sentence is the only thing that tells a budget reached
+# apart from a run that broke.
+SPEND_LIMIT_STOP_PHRASE = "this run has nobody to ask for more"
+
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -1091,7 +1097,7 @@ class InputResolver:
             arguments.append("--no-jsonl")
         if self.settings.use_llm:
             arguments.append("--use-llm")
-            if self.settings.llm_spend_limit:
+            if self.settings.llm_spend_limit is not None:
                 arguments += ["--llm-spend-limit", f"{self.settings.llm_spend_limit:.2f}"]
 
         LOGGER.info("Building the purchase table with max.py (its own agent stages "
@@ -1209,6 +1215,10 @@ class AgentChain:
         self._live: Dict[str, subprocess.Popen] = {}
         self._live_lock = threading.Lock()
 
+        # Agents 3 and 4 run at once, and two budget questions asked together
+        # would interleave their answers.
+        self._prompt_lock = threading.Lock()
+
     def stop_live_agents(self) -> List[str]:
         """Ask any running agent to stop, and say which ones were asked."""
         with self._live_lock:
@@ -1243,10 +1253,29 @@ class AgentChain:
             arguments.append("--no-jsonl")
         if self.settings.use_llm:
             arguments.append("--use-llm")
-            if self.settings.llm_spend_limit:
+            # Passed whenever it was chosen, zero included. An agent not told a
+            # figure falls back on its own default of $25, so leaving the flag
+            # off for zero turned "no ceiling" into a $25 one.
+            if self.settings.llm_spend_limit is not None:
                 arguments += ["--llm-spend-limit",
                               f"{self.settings.llm_spend_limit:.2f}"]
         return arguments
+
+    def _with_current_budget(self, arguments: Sequence[str]) -> List[str]:
+        """The arguments with the budget as it stands now, which a raise changes."""
+        kept: List[str] = []
+        skip_value = False
+        for argument in arguments:
+            if skip_value:
+                skip_value = False
+                continue
+            if argument == "--llm-spend-limit":
+                skip_value = True
+                continue
+            kept.append(argument)
+        if self.settings.use_llm and self.settings.llm_spend_limit is not None:
+            kept += ["--llm-spend-limit", f"{self.settings.llm_spend_limit:.2f}"]
+        return kept
 
     def _catalogue_arguments(self) -> List[str]:
         """Where Agent 3 should look for the client's item catalogue."""
@@ -1277,11 +1306,15 @@ class AgentChain:
         script = self.here / step.script
         # Paths differ harmlessly between machines and runs, so the settings that
         # matter are recorded rather than the whole command line.
+        # The budget is left out too: it decides whether an agent finishes, not
+        # what it writes, and a raised budget must not throw away an output that
+        # took a day to produce.
         significant = [argument for argument in arguments
                        if argument.startswith("--")
                        and argument not in {"--results", "--lexicon", "--cache",
                                             "--input", "--registry",
-                                            "--catalogues", "--reference"}]
+                                            "--catalogues", "--reference",
+                                            "--llm-spend-limit"}]
         return {
             "input_sha256": digest_of(input_path),
             "script_sha256": digest_of(script),
@@ -1424,7 +1457,14 @@ class AgentChain:
         # which agent was in flight and whose output may be part-written.
         self.journal.began(step.tag or step.name)
 
-        returncode, tail = self._run_process(step, arguments)
+        while True:
+            returncode, tail = self._run_process(step,
+                                                 self._with_current_budget(arguments))
+            if (returncode not in (None, 0) and self._stopped_at_budget(tail)
+                    and self._offer_more_budget(step)):
+                continue
+            break
+
         if returncode is None:
             step.reason = f"did not finish within {self.settings.agent_timeout}s"
             self._say(step, f"TIMED OUT after {human_seconds(step.seconds)}")
@@ -1465,6 +1505,55 @@ class AgentChain:
                          step.output_name, error)
         self.journal.finished(step.tag or step.name, True)
         return step
+
+    # -- reaching the budget -------------------------------------------------
+
+    @staticmethod
+    def _stopped_at_budget(tail: Sequence[str]) -> bool:
+        """Whether an agent's last words say it stopped at the spend limit."""
+        return any(SPEND_LIMIT_STOP_PHRASE in line for line in tail)
+
+    def _offer_more_budget(self, step: AgentStep) -> bool:
+        """Ask for a larger budget after an agent stopped at the old one.
+
+        The agents are started non-interactively, so the one that reaches the
+        figure cannot ask for more itself; it stops, having written every answer
+        it paid for to the response cache. Asking here and starting it again is
+        therefore cheap in money: the restarted agent reads those answers back for
+        nothing and pays only for the lines still to do. Offered only where
+        someone is at the keyboard, because a run left alone must not authorise
+        spend on its own.
+        """
+        if not self.settings.interactive or not sys.stdin.isatty():
+            return False
+
+        current = self.settings.llm_spend_limit or 0.0
+        rows = count_rows(step.input_path) if step.input_path else 0
+        suggested = budget_for_rows(rows, max(DEFAULT_SPEND_LIMIT, current * 2))
+
+        with self._prompt_lock, self._console:
+            print(flush=True)
+            print("=" * 79)
+            print(f"  {step.tag} reached the ${current:,.2f} budget")
+            print("=" * 79)
+            print("  Every answer it paid for is in the response cache, so carrying on")
+            print("  reads those back for nothing and pays only for the lines still to do.")
+            print("  The new figure counts from zero for the same reason.")
+            if rows:
+                print(f"\n  The whole of this {rows:,}-line file is estimated at about "
+                      f"${estimated_model_cost(rows):,.0f};")
+                print("  what is still to do costs less than that.")
+            print()
+            if not ask_yes_no("Raise the budget and carry on", True):
+                return False
+            raised = ask_amount("New budget, in dollars (0 for no ceiling)", suggested)
+            print(flush=True)
+
+        self.settings.llm_spend_limit = raised
+        self._say(step, "starting again with "
+                        + (f"a ${raised:,.2f} budget" if raised else "no budget ceiling")
+                        + "; answers already paid for are read from the cache")
+        return True
 
     # -- watching an agent work ---------------------------------------------
 

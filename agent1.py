@@ -284,6 +284,11 @@ DEFAULT_SPEND_LIMIT = 25.00
 # nothing for that long is indistinguishable from a hung process.
 MODEL_PROGRESS_SECONDS = 60
 
+# How often answers bought from the model are written to disk during a run. A
+# full extract is a day or more of paid requests, and a cache written only at
+# the end loses all of it to a crash, a closed laptop or a Ctrl-C.
+CACHE_SAVE_SECONDS = 600
+
 # How much corroborating text from other systems is offered to the model
 # alongside a line's own description.
 #
@@ -2707,6 +2712,7 @@ class LanguageModelClient:
         self.cache_path = cache_path
         self._cache: Dict[str, str] = self._load_cache()
         self._cache_dirty = False
+        self._cache_saved_at = time.time()
         self._omit_temperature = False
         self._reasoning_style = "effort"
         # Answers bought under a prompt this version no longer sends are still
@@ -2745,9 +2751,15 @@ class LanguageModelClient:
             "backend": self.config.backend,
             "entries": dict(sorted(self._cache.items())),
         }
-        self.cache_path.write_text(
+        # Written beside the cache and swapped in, because a process stopped
+        # half way through rewriting the file in place would leave it unreadable,
+        # and an unreadable cache is loaded as an empty one.
+        partial = self.cache_path.with_name(self.cache_path.name + ".partial")
+        partial.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        partial.replace(self.cache_path)
         self._cache_dirty = False
+        self._cache_saved_at = time.time()
 
     def cache_key(self, task: str, payload: str) -> str:
         """Content address for one unit of work.
@@ -2766,6 +2778,8 @@ class LanguageModelClient:
     def store(self, key: str, value: str) -> None:
         self._cache[key] = value
         self._cache_dirty = True
+        if time.time() - self._cache_saved_at >= CACHE_SAVE_SECONDS:
+            self.save_cache()
 
     # -- transport ----------------------------------------------------------
 
