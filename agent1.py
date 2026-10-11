@@ -77,6 +77,7 @@ import io
 import json
 import logging
 import re
+import signal
 import sys
 import time
 import unicodedata
@@ -2465,6 +2466,7 @@ class NeuralTranslator:
             return {}
 
         results: Dict[str, str] = {}
+        started = announced = time.time()
         for start in range(0, len(texts), self.WINDOW):
             window = list(texts[start:start + self.WINDOW])
             try:
@@ -2477,6 +2479,14 @@ class NeuralTranslator:
                 if translated:
                     results[source_text] = translated
                     self.translated_count += 1
+
+            if time.time() - announced >= MODEL_PROGRESS_SECONDS:
+                announced = time.time()
+                done = min(start + self.WINDOW, len(texts))
+                rate = done / max(0.001, announced - started)
+                LOGGER.info("  offline translation (%s): %d of %d phrase(s), "
+                            "about %s remaining", language, done, len(texts),
+                            human_seconds((len(texts) - done) / rate if rate else 0.0))
         return results
 
 
@@ -4232,6 +4242,52 @@ def score_confidence(record: LineRecord, description: DescriptionResult,
 # Pipeline
 # ===========================================================================
 
+class PassProgress:
+    """Says where the second pass has got to, once a minute.
+
+    The second pass writes every line and asks the model for a description of
+    each one it has not seen before, one request at a time. On a full extract
+    that is a day of work, and before this it printed nothing until the end: a
+    caller watching saw only "still working" for twenty hours and could not tell
+    a run that was nearly done from one that was stuck.
+
+    The estimate of time left comes from the rate so far, so it starts
+    optimistic on a rerun - lines already answered come from the cache and
+    go by quickly - and settles once the pass reaches lines that need the model.
+    """
+
+    def __init__(self, total: int, model: Optional["LanguageModelClient"]) -> None:
+        self.total = total
+        self.model = model
+        self.done = 0
+        self.started = self.announced = time.time()
+        usage = model.usage if model is not None else None
+        self.requests_at_start = usage.requests if usage else 0
+        self.cache_hits_at_start = usage.cache_hits if usage else 0
+
+    def advance(self) -> None:
+        self.done += 1
+        if time.time() - self.announced >= MODEL_PROGRESS_SECONDS:
+            self.report()
+
+    def report(self) -> None:
+        self.announced = time.time()
+        elapsed = max(0.001, self.announced - self.started)
+        rate = self.done / elapsed
+        parts = [f"Pass 2: {self.done:,} of {self.total:,} line(s)"
+                 + (f" ({self.done / self.total:.0%})" if self.total else "")]
+        if self.model is not None:
+            usage = self.model.usage
+            parts.append(f"{usage.requests - self.requests_at_start:,} sent to the "
+                         f"model, {usage.cache_hits - self.cache_hits_at_start:,} "
+                         f"read from cache")
+            parts.append(f"spend ${usage.estimated_cost:,.2f}")
+        if self.total and rate:
+            parts.append(f"about {human_seconds((self.total - self.done) / rate)} left "
+                         f"at this rate")
+        LOGGER.info("  " + "; ".join(parts))
+
+
 class Agent1:
     """Orchestrates the run.
 
@@ -4905,6 +4961,11 @@ class Agent1:
         jsonl_handle = (unified_jsonl_path.open("w", encoding="utf-8")
                         if self.settings.write_jsonl else None)
 
+        progress = PassProgress(
+            sum(count for name, count in self.statistics.items()
+                if name.startswith("rows_read:")),
+            self.model)
+
         try:
             for table, profile, resolver in self.tables:
                 output_path = results_dir / f"agent1_{self._output_stem(table, profile)}.csv"
@@ -4946,6 +5007,8 @@ class Agent1:
                             enriched_count += 1
                             confidence_totals.append(confidence)
                             band_counts[band] += 1
+
+                        progress.advance()
 
                 self.statistics[f"enriched:{profile.name}"] += enriched_count
                 written_files.append(output_path.name)
@@ -5377,17 +5440,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             LOGGER.info("No spend alert set; the model tier will run unmetered.")
 
+    # The pipeline runner stops its agents with SIGTERM. Treated as Ctrl-C it
+    # takes the same path out, which saves the answers already paid for.
+    signal.signal(signal.SIGTERM, _interrupt_on_terminate)
+
+    agent: Optional[Agent1] = None
     try:
-        manifest = Agent1(settings).run()
+        agent = Agent1(settings)
+        manifest = agent.run()
     except SystemExit as error:
+        _keep_model_answers(agent)
         print(f"\n{error}\n", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("\nInterrupted.\n", file=sys.stderr)
+        _keep_model_answers(agent)
+        print("\nInterrupted. Rerun to carry on; answers already received are "
+              "reused from the cache.\n", file=sys.stderr)
         return 130
+    except Exception:
+        _keep_model_answers(agent)
+        raise
 
     print_summary(manifest, settings)
     return 0
+
+
+def _interrupt_on_terminate(signum: int, frame: Any) -> None:
+    raise KeyboardInterrupt
+
+
+def _keep_model_answers(agent: Optional[Agent1]) -> None:
+    """Save the model cache on the way out, whatever stopped the run.
+
+    A second Ctrl-C or SIGTERM during the save would abandon it, so both are
+    ignored until it is written.
+    """
+    if agent is None or agent.model is None:
+        return
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        unsaved = agent.model._cache_dirty
+        agent.model.save_cache()
+        print(f"\nModel cache {'saved' if unsaved else 'already up to date'}: "
+              f"{len(agent.model._cache):,} answer(s) in {agent.model.cache_path}.",
+              file=sys.stderr)
+    except Exception as error:
+        print(f"\nCould not save the model cache: {error}", file=sys.stderr)
 
 
 if __name__ == "__main__":

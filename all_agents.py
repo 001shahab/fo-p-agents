@@ -294,6 +294,9 @@ CATALOGUE_ITEMS_EXPECTED = 10_000
 # and a pipeline that looks hung gets killed by whoever is watching it.
 HEARTBEAT_SECONDS = 60
 
+# Seconds a stopped agent is given to exit cleanly before it is killed.
+STOP_GRACE_SECONDS = 120
+
 # The figure the budget prompt offers. Matches Agent 1's own default so that a
 # run started here and a run started from agent1.py brake at the same point.
 DEFAULT_SPEND_LIMIT = 25.00
@@ -1231,9 +1234,13 @@ class AgentChain:
                     process.terminate()
                 except OSError:
                     continue
+        if stopped:
+            print("  Letting the running agent(s) save their model answers ...", flush=True)
+        # Long enough for Agent 1 to write a cache of several hundred thousand
+        # answers; killed sooner, it loses whatever arrived since its last save.
         for _, process in running:
             try:
-                process.wait(timeout=10)
+                process.wait(timeout=STOP_GRACE_SECONDS)
             except (subprocess.TimeoutExpired, OSError):
                 try:
                     process.kill()
