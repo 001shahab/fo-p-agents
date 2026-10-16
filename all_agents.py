@@ -153,17 +153,20 @@ import argparse
 import csv
 import datetime
 import hashlib
+import io
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence,
+                    TextIO, Tuple)
 
 from runtime import (
     DEFAULT_RESULTS_DIR_NAME, budget_for_rows, chat_endpoint,
@@ -1148,6 +1151,9 @@ class AgentStep:
     # Short tag used to prefix this agent's log lines when several are running.
     tag: str = ""
 
+    # Log file name, when it must not be the script's usual one.
+    log_name: str = ""
+
     # Filled in as the step is decided and carried out.
     input_path: Optional[Path] = None
     output_path: Optional[Path] = None
@@ -1250,10 +1256,10 @@ class AgentChain:
 
     # -- arguments -----------------------------------------------------------
 
-    def _common_arguments(self) -> List[str]:
+    def _common_arguments(self, results_dir: Optional[Path] = None) -> List[str]:
         """Arguments every agent takes, so one run here configures all four."""
         arguments = ["--non-interactive",
-                     "--results", str(self.settings.work_dir),
+                     "--results", str(results_dir or self.settings.work_dir),
                      "--lexicon", str(self.settings.lexicon_path),
                      "--cache", str(self.settings.cache_dir)]
         if not self.settings.write_jsonl:
@@ -1464,13 +1470,7 @@ class AgentChain:
         # which agent was in flight and whose output may be part-written.
         self.journal.began(step.tag or step.name)
 
-        while True:
-            returncode, tail = self._run_process(step,
-                                                 self._with_current_budget(arguments))
-            if (returncode not in (None, 0) and self._stopped_at_budget(tail)
-                    and self._offer_more_budget(step)):
-                continue
-            break
+        returncode, tail = self.run_until_done(step, arguments)
 
         if returncode is None:
             step.reason = f"did not finish within {self.settings.agent_timeout}s"
@@ -1512,6 +1512,17 @@ class AgentChain:
                          step.output_name, error)
         self.journal.finished(step.tag or step.name, True)
         return step
+
+    def run_until_done(self, step: AgentStep,
+                       arguments: Sequence[str]) -> Tuple[Optional[int], List[str]]:
+        """Run an agent, starting it again each time a budget raise is agreed."""
+        while True:
+            returncode, tail = self._run_process(step,
+                                                 self._with_current_budget(arguments))
+            if (returncode not in (None, 0) and self._stopped_at_budget(tail)
+                    and self._offer_more_budget(step)):
+                continue
+            return returncode, tail
 
     # -- reaching the budget -------------------------------------------------
 
@@ -1586,7 +1597,8 @@ class AgentChain:
         """
         script = self.here / step.script
         command = [sys.executable, str(script), *arguments]
-        step.log_path = self.settings.work_dir / f"{Path(step.script).stem}.log"
+        step.log_path = self.settings.work_dir / (step.log_name
+                                                  or f"{Path(step.script).stem}.log")
 
         if step.input_path:
             self._say(step, f"starting, reading {step.input_path.name}")
@@ -1736,29 +1748,91 @@ class AgentChain:
                 "a dataset. Start again with --llm-spend-limit %.0f, or 0 for no "
                 "ceiling, to read every row.", budget_for_rows(rows, budget))
 
+    def new_step(self, script: str) -> AgentStep:
+        """The step for one of the four agents, as the chain runs it."""
+        if script == "agent1.py":
+            return AgentStep("Agent 1 - purchase descriptions", script,
+                             "agent1_unified_lines.csv", tag="Agent 1",
+                             unstamped_reuse=True)
+        if script == "agent2.py":
+            return AgentStep("Agent 2 - purchase groups", script,
+                             "agent2_purchase_groups.csv", tag="Agent 2",
+                             unstamped_reuse=True)
+        if script == "agent3.py":
+            return AgentStep("Agent 3 - standard items", script,
+                             "agent3_standardisation.csv", tag="Agent 3",
+                             unstamped_reuse=True, cache_salt=self._catalogue_salt())
+        if script == "agent4.py":
+            return AgentStep("Agent 4 - supplier consolidation", script,
+                             AGENT4_CONSOLIDATION_NAME, tag="Agent 4")
+        raise ValueError(f"not an agent of the chain: {script}")
+
+    def arguments_for(self, script: str, step_input: Path,
+                      results_dir: Optional[Path] = None) -> List[str]:
+        """The command line the chain gives one agent reading ``step_input``."""
+        arguments = [*self._common_arguments(results_dir), "--input", str(step_input)]
+        lexicon_dir = self.here / "lexicon"
+        if script == "agent2.py":
+            arguments += ["--registry", str(lexicon_dir / "agent2_group_registry.json")]
+        elif script == "agent3.py":
+            arguments += self._catalogue_arguments()
+        elif script == "agent4.py":
+            arguments += ["--registry", str(lexicon_dir / "agent4_supplier_registry.json")]
+        return arguments
+
+    def refresh_reuse_records(self, input_path: Path) -> List[str]:
+        """Record the work folder's outputs as current for the scripts as they are now.
+
+        Used after a targeted update has rewritten some rows in place. Each
+        output then holds what the current agent would produce from its current
+        input, but the record beside it names the script and input it was first
+        made from, so without this the next run would redo all four agents for
+        the sake of the rows that were already brought up to date.
+        """
+        work = self.settings.work_dir
+        chain_inputs = [("agent1.py", input_path),
+                        ("agent2.py", work / "agent1_unified_lines.csv"),
+                        ("agent3.py", work / "agent2_purchase_groups.csv"),
+                        ("agent4.py", work / "agent2_purchase_groups.csv")]
+        refreshed = []
+        for script, step_input in chain_inputs:
+            step = self.new_step(script)
+            output = work / step.output_name
+            if not output.is_file() or not step_input.is_file():
+                continue
+            stamp_path = self._stamp_path(step)
+            try:
+                previous = json.loads(stamp_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                previous = {}
+            rows = previous.get("rows")
+            if not isinstance(rows, int):
+                rows = count_rows(output)
+            want = self._fingerprint(step, step_input, self.arguments_for(script, step_input))
+            stamp_path.write_text(
+                json.dumps({"fingerprint": want,
+                            "written": datetime.datetime.now().isoformat(timespec="seconds"),
+                            "output": step.output_name,
+                            "rows": rows},
+                           indent=2), encoding="utf-8")
+            refreshed.append(step.output_name)
+        return refreshed
+
     def run(self, input_path: Path) -> List[AgentStep]:
         """Run the four agents over the purchase table, in order."""
         self.settings.work_dir.mkdir(parents=True, exist_ok=True)
         self.origin_name = input_path.name
         self.journal.start(input_path, digest_of(input_path), self.settings.use_llm)
         self._report_expected_spend(input_path)
-        common = self._common_arguments()
-        lexicon_dir = self.here / "lexicon"
 
-        agent1 = AgentStep("Agent 1 - purchase descriptions", "agent1.py",
-                           "agent1_unified_lines.csv", tag="Agent 1",
-                           unstamped_reuse=True)
-        self._invoke(agent1, [*common, "--input", str(input_path)], input_path)
+        agent1 = self.new_step("agent1.py")
+        self._invoke(agent1, self.arguments_for("agent1.py", input_path), input_path)
         self.steps.append(agent1)
         if not agent1.ok or not agent1.output_path:
             return self.steps
 
-        agent2 = AgentStep("Agent 2 - purchase groups", "agent2.py",
-                           "agent2_purchase_groups.csv", tag="Agent 2",
-                           unstamped_reuse=True)
-        self._invoke(agent2,
-                     [*common, "--input", str(agent1.output_path),
-                      "--registry", str(lexicon_dir / "agent2_group_registry.json")],
+        agent2 = self.new_step("agent2.py")
+        self._invoke(agent2, self.arguments_for("agent2.py", agent1.output_path),
                      agent1.output_path)
         self.steps.append(agent2)
         if not agent2.ok or not agent2.output_path:
@@ -1773,17 +1847,11 @@ class AgentChain:
         # catalogue before it matches a single line, so on the current master it
         # runs for far longer than Agent 4, and overlapping them costs nothing and
         # saves all of Agent 4.
-        agent3 = AgentStep("Agent 3 - standard items", "agent3.py",
-                           "agent3_standardisation.csv", tag="Agent 3",
-                           unstamped_reuse=True, cache_salt=self._catalogue_salt())
-        agent3_arguments = [*common, "--input", str(agent2.output_path),
-                            *self._catalogue_arguments()]
+        agent3 = self.new_step("agent3.py")
+        agent3_arguments = self.arguments_for("agent3.py", agent2.output_path)
 
-        agent4 = AgentStep("Agent 4 - supplier consolidation", "agent4.py",
-                           AGENT4_CONSOLIDATION_NAME, tag="Agent 4")
-        agent4_arguments = [*common, "--input", str(agent2.output_path),
-                            "--registry",
-                            str(lexicon_dir / "agent4_supplier_registry.json")]
+        agent4 = self.new_step("agent4.py")
+        agent4_arguments = self.arguments_for("agent4.py", agent2.output_path)
 
         # Registered before they run, not after. An interruption reports what was
         # kept from the steps recorded here, and a step appended only on completion
@@ -2575,6 +2643,549 @@ class Merger:
 
 
 # ---------------------------------------------------------------------------
+# Updating a finished run in place
+# ---------------------------------------------------------------------------
+
+# Agent 1's names for what its order-text pass writes and what it changes.
+ORDER_TEXT_FILL_NAME = "agent1_order_text_fill.csv"
+ORDER_TEXT_FILL_MANIFEST = "agent1_order_text_fill_manifest.json"
+ORDER_TEXT_FILL_COLUMNS: Tuple[str, ...] = (
+    "Enriched_Purchase_Description",
+    "Enriched_Description_Short",
+    "Item_Or_Service",
+    "AI_Confidence",
+    "Confidence_Band",
+    "Confidence_Factors",
+)
+ORDER_TEXT_MARKER = ".order_text_update.json"
+ORDER_TEXT_SCRATCH = ".order_text_update"
+PARTIAL_SUFFIX = ".order_text.partial"
+
+
+def _encoding_of(path: Path) -> str:
+    """The encoding a file was written in, byte-order mark included."""
+    with path.open("rb") as handle:
+        return "utf-8-sig" if handle.read(3) == b"\xef\xbb\xbf" else "utf-8"
+
+
+def _raw_records(handle: TextIO) -> Iterator[str]:
+    """A CSV file's records exactly as written, quoted line breaks and all.
+
+    A record ends at a line break outside quotes, and an escaped quote is a
+    doubled one, so an even count of quotes so far marks the end of a record.
+    """
+    pending: List[str] = []
+    quotes = 0
+    for line in handle:
+        pending.append(line)
+        quotes += line.count('"')
+        if quotes % 2 == 0:
+            yield "".join(pending)
+            pending = []
+            quotes = 0
+    if pending:
+        yield "".join(pending)
+
+
+def _format_record(row: Sequence[Any], like: str) -> str:
+    """One CSV record, ending the way the record it replaces ended."""
+    buffer = io.StringIO()
+    csv.writer(buffer, lineterminator="\r\n" if like.endswith("\r\n") else "\n").writerow(row)
+    return buffer.getvalue()
+
+
+def _padded(row: Sequence[str], width: int) -> List[str]:
+    return list(row) + [""] * max(0, width - len(row))
+
+
+def rewrite_csv(path: Path,
+                change: Callable[[int, List[str]], Optional[List[str]]],
+                only: Optional[Callable[[int], bool]] = None) -> Tuple[Path, Dict[int, List[str]]]:
+    """Write a copy of a CSV with some rows replaced and the rest byte for byte.
+
+    ``change`` gets each record's position and parsed row and returns the
+    replacement or None. ``only``, when given, says which positions are worth
+    parsing at all, which on a wide table is most of the time spent. The copy
+    is written beside the file and swapped in by the caller.
+    """
+    encoding = _encoding_of(path)
+    partial = path.with_name(path.name + PARTIAL_SUFFIX)
+    replaced: Dict[int, List[str]] = {}
+    with path.open("r", encoding=encoding, newline="") as source, \
+            partial.open("w", encoding=encoding, newline="") as target:
+        records = _raw_records(source)
+        header = next(records, "")
+        target.write(header)
+        for position, raw in enumerate(records):
+            if only is not None and not only(position):
+                target.write(raw)
+                continue
+            new = change(position, next(csv.reader([raw]), []))
+            if new is None:
+                target.write(raw)
+                continue
+            target.write(_format_record(new, raw))
+            replaced[position] = new
+    return partial, replaced
+
+
+def rewrite_jsonl(path: Path, change: Dict[int, Callable[[str], str]]) -> Path:
+    """Write a copy of a JSON-lines file with the given lines replaced."""
+    partial = path.with_name(path.name + PARTIAL_SUFFIX)
+    with path.open("r", encoding="utf-8", newline="") as source, \
+            partial.open("w", encoding="utf-8", newline="") as target:
+        for position, line in enumerate(source):
+            fix = change.get(position)
+            target.write(fix(line) if fix else line)
+    return partial
+
+
+class OrderTextUpdate:
+    """Describe the lines a finished run left blank, and change nothing else.
+
+    A finished run leaves a line blank when its own text names no purchase -
+    on Sievo's contingent-workforce lines it is a contractor's name and the
+    supplier. Many of those lines belong to an order or invoice that does say
+    what was bought. Rerunning the chain to pick that up would regroup and
+    rematch every line in the table, and change rows nobody asked to change.
+
+    So the update works on the finished files instead. Agent 1 describes only
+    those lines, Agent 3 matches only those lines, and every file is rewritten
+    with those rows replaced and every other row copied byte for byte. Agent 2's
+    groups and Agent 4's supplier findings are kept as they are: both are
+    population-level answers that a partial rerun could only make inconsistent.
+
+    Nothing is swapped in until every file is ready, so a failure or an
+    interruption part way leaves the results exactly as they were.
+    """
+
+    def __init__(self, settings: Settings, chain: AgentChain, input_path: Path) -> None:
+        self.settings = settings
+        self.chain = chain
+        self.input_path = input_path
+        work = settings.work_dir
+        self.marker = work / ORDER_TEXT_MARKER
+        self.scratch = work / ORDER_TEXT_SCRATCH
+        self.lines1 = work / "agent1_unified_lines.csv"
+        self.per_source = work / f"agent1_{input_path.stem}.csv"
+        self.lines2 = work / "agent2_purchase_groups.csv"
+        self.lines3 = work / "agent3_standardisation.csv"
+        self.dataset = settings.results_dir / OUTPUT_CSV
+        self.rewrites: List[Tuple[Path, Path]] = []
+        self.summary: Dict[str, Any] = {}
+
+    # -- whether to ----------------------------------------------------------
+
+    def wanted(self) -> bool:
+        """Whether this run should be the update rather than a full rerun."""
+        if (self.settings.force or not self.settings.reuse
+                or self.settings.input_path or self.settings.from_sources):
+            return False
+        if self.marker.is_file():
+            return False
+        if not all(path.is_file() for path in
+                   (self.lines1, self.lines2, self.lines3, self.dataset)):
+            return False
+        if RunJournal(self.settings.work_dir).previous():
+            return False
+
+        print()
+        print("  A finished run is already in this results folder.")
+        print("  This version can describe the lines it left blank where the order or")
+        print("  invoice they belong to says what was bought. Only those lines change:")
+        print("  every other row in every file stays exactly as it is.")
+        if not self.settings.use_llm:
+            print("  It needs the language model, which this run has switched off, so")
+            print("  the full chain runs instead.")
+            return False
+        if self.settings.interactive:
+            print()
+            return ask_yes_no("Update only those lines", True)
+        print("  Updating only those lines. Use --force for a full rerun instead.")
+        return True
+
+    # -- doing it ------------------------------------------------------------
+
+    def run(self) -> Dict[str, Any]:
+        started = time.time()
+        self._clear_leftovers()
+        self._check_disk_space()
+        self.scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            fills, usage = self._describe()
+            self.summary.update({"lines_described": len(fills), "agent1_usage": usage})
+            if fills:
+                self._rewrite_all(fills)
+                print("\n  Swapping the updated files in ...", flush=True)
+                for partial, path in self.rewrites:
+                    partial.replace(path)
+            self._keep_audit_trail()
+        except BaseException:
+            for partial, _ in self.rewrites:
+                try:
+                    partial.unlink()
+                except OSError:
+                    pass
+            raise
+        finally:
+            shutil.rmtree(self.scratch, ignore_errors=True)
+
+        refreshed = self.chain.refresh_reuse_records(self.input_path) if fills else []
+        self.summary.update({
+            "updated": datetime.datetime.now().isoformat(timespec="seconds"),
+            "files_rewritten": [path.name for _, path in self.rewrites],
+            "reuse_records_refreshed": refreshed,
+            "seconds": round(time.time() - started, 1),
+        })
+        self.marker.write_text(json.dumps(self.summary, indent=2, ensure_ascii=False),
+                               encoding="utf-8")
+        self._note_in_manifest()
+        self._report()
+        return self.summary
+
+    def _clear_leftovers(self) -> None:
+        """Remove what an interrupted update left behind; none of it was swapped in."""
+        shutil.rmtree(self.scratch, ignore_errors=True)
+        for folder in {self.settings.work_dir, self.settings.results_dir}:
+            for stale in folder.glob(f"*{PARTIAL_SUFFIX}"):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+
+    def _targets(self) -> List[Path]:
+        paths = [self.lines1, self.per_source, self.lines2, self.lines3, self.dataset]
+        paths += [path.with_suffix(".jsonl") for path in
+                  (self.lines1, self.lines2, self.lines3, self.dataset)]
+        return [path for path in paths if path.is_file()]
+
+    def _check_disk_space(self) -> None:
+        """Every rewritten file exists twice until the swap, so say so up front."""
+        needed = sum(path.stat().st_size for path in self._targets())
+        free = shutil.disk_usage(self.settings.work_dir).free
+        if free < needed * 1.05:
+            raise SystemExit(
+                f"The update writes a new copy of each results file before replacing "
+                f"it, which needs {needed / 1e9:,.1f} GB free and only "
+                f"{free / 1e9:,.1f} GB is. Nothing has been changed.")
+
+    def _describe(self) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Any]]:
+        """Have Agent 1 describe the blank lines; return its answers by row number."""
+        step = AgentStep("Agent 1 - order and invoice text", "agent1.py",
+                         ORDER_TEXT_FILL_NAME, tag="Agent 1",
+                         log_name="agent1_order_text.log")
+        step.input_path = self.input_path
+        arguments = [*self.chain._common_arguments(self.scratch),
+                     "--input", str(self.input_path),
+                     "--fill-order-text", str(self.lines1)]
+        print("\n  Agent 1 describes the blank lines from their order and invoice "
+              "text.\n", flush=True)
+        returncode, tail = self.chain.run_until_done(step, arguments)
+        if returncode != 0:
+            raise SystemExit(
+                f"Agent 1 could not describe the lines: "
+                f"{tail[-1] if tail else f'exit code {returncode}'}.\n"
+                f"  Nothing has been changed. Its log is {step.log_path}")
+
+        fills: Dict[str, Dict[str, str]] = {}
+        with (self.scratch / ORDER_TEXT_FILL_NAME).open("r", encoding="utf-8",
+                                                        newline="") as handle:
+            for row in csv.DictReader(handle):
+                fills[(row.get(ROW_NUMBER_COLUMN) or "").strip()] = row
+        try:
+            manifest = json.loads((self.scratch / ORDER_TEXT_FILL_MANIFEST)
+                                  .read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        statistics = manifest.get("statistics") or {}
+        self.summary.update({key: statistics.get(key) for key in
+                             ("blank_lines", "lines_with_order_text",
+                              "distinct_questions", "lines_left_unclear",
+                              "confidence_bands")})
+        return fills, statistics.get("token_usage") or {}
+
+    def _rewrite_all(self, fills: Dict[str, Dict[str, str]]) -> None:
+        subset1, subset2 = self._rewrite_agent1_and_agent2(fills)
+        rows3, lines3 = self._match_with_agent3(subset2, len(fills))
+        self._rewrite_agent3(rows3, lines3)
+        self._rewrite_dataset(rows3, subset1, subset2)
+
+    def _say(self, path: Path) -> None:
+        print(f"  Rewriting {path.name} ...", flush=True)
+
+    def _jsonl_fixes(self, positions: Dict[int, List[str]], key_at: int,
+                     fix: Callable[[Dict[str, Any], str], None]) -> Dict[int, Callable[[str], str]]:
+        """Per-line edits for a JSON-lines file kept in step with its CSV.
+
+        Each edited line is checked against the CSV row it shadows before it is
+        touched, so a JSON file in a different order is refused, not corrupted.
+        """
+        def edit_for(key: str) -> Callable[[str], str]:
+            def edit(line: str) -> str:
+                record = json.loads(line)
+                if str(record.get(ROW_NUMBER_COLUMN, "")).strip() != key:
+                    raise SystemExit(
+                        f"A JSON-lines file is not in the same row order as its CSV "
+                        f"(expected row {key}). Nothing has been changed.")
+                fix(record, key)
+                return json.dumps(record, ensure_ascii=False) + "\n"
+            return edit
+        return {position: edit_for(row[key_at].strip())
+                for position, row in positions.items()}
+
+    def _rewrite_agent1_and_agent2(self, fills: Dict[str, Dict[str, str]]
+                                   ) -> Tuple[Path, Path]:
+        """Put Agent 1's new answers into its own files and into Agent 2's."""
+        subsets: List[Path] = []
+        for path in (self.lines1, self.lines2):
+            header = read_header(path)
+            key_at = header.index(ROW_NUMBER_COLUMN)
+            at = {column: header.index(column) for column in ORDER_TEXT_FILL_COLUMNS
+                  if column in header}
+
+            def change(position: int, row: List[str],
+                       header: List[str] = header, key_at: int = key_at,
+                       at: Dict[str, int] = at) -> Optional[List[str]]:
+                fill = fills.get(row[key_at].strip() if key_at < len(row) else "")
+                if fill is None:
+                    return None
+                row = _padded(row, len(header))
+                for column, position_of in at.items():
+                    row[position_of] = fill[column]
+                return row
+
+            self._say(path)
+            partial, replaced = rewrite_csv(path, change)
+            self.rewrites.append((partial, path))
+            if len(replaced) != len(fills):
+                raise SystemExit(
+                    f"{path.name} has {len(replaced):,} of the {len(fills):,} lines Agent 1 "
+                    f"described, so it is not the file those answers were made from. "
+                    f"Nothing has been changed.")
+
+            jsonl = path.with_suffix(".jsonl")
+            if jsonl.is_file():
+                numeric = path == self.lines1
+
+                def fix(record: Dict[str, Any], key: str, numeric: bool = numeric) -> None:
+                    fill = fills[key]
+                    for column in ORDER_TEXT_FILL_COLUMNS:
+                        value: Any = fill[column]
+                        if numeric and column == "AI_Confidence" and value:
+                            value = int(value)
+                        record[column] = value
+                    evidence = record.get("Evidence")
+                    if isinstance(evidence, dict):
+                        evidence["description_basis"] = fill.get("Description_Basis", "")
+                        evidence["used_fragments"] = json.loads(
+                            fill.get("Used_Fragments") or "[]")
+
+                self._say(jsonl)
+                self.rewrites.append((rewrite_jsonl(
+                    jsonl, self._jsonl_fixes(replaced, key_at, fix)), jsonl))
+
+            subset = self.scratch / f"{path.stem}_subset.csv"
+            with subset.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(header)
+                writer.writerows(replaced[position] for position in sorted(replaced))
+            subsets.append(subset)
+
+        self._rewrite_per_source(fills)
+        return subsets[0], subsets[1]
+
+    def _rewrite_per_source(self, fills: Dict[str, Dict[str, str]]) -> None:
+        """Agent 1's copy of the input with its columns appended."""
+        if not self.per_source.is_file():
+            LOGGER.warning("%s is not in %s, so it is left as it is.",
+                           self.per_source.name, self.settings.work_dir)
+            return
+        header = read_header(self.per_source)
+        anchor = "Enriched_Purchase_Description"
+        if anchor not in header:
+            return
+        start = len(header) - 1 - header[::-1].index(anchor)
+        appended = header[start:]
+        if "Row_Id" not in appended:
+            return
+        row_id_at = start + appended.index("Row_Id")
+        at = {column: start + appended.index(column) for column in ORDER_TEXT_FILL_COLUMNS
+              if column in appended}
+        by_row_id = {fill["Row_Id"]: fill for fill in fills.values() if fill.get("Row_Id")}
+
+        def change(position: int, row: List[str]) -> Optional[List[str]]:
+            fill = by_row_id.get(row[row_id_at] if row_id_at < len(row) else "")
+            if fill is None:
+                return None
+            row = _padded(row, len(header))
+            for column, position_of in at.items():
+                row[position_of] = fill[column]
+            return row
+
+        self._say(self.per_source)
+        partial, _ = rewrite_csv(self.per_source, change)
+        self.rewrites.append((partial, self.per_source))
+
+    def _match_with_agent3(self, subset2: Path, expected: int
+                           ) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+        """Run Agent 3 over the updated lines alone and read back its answers."""
+        step = self.chain.new_step("agent3.py")
+        step.log_name = "agent3_order_text.log"
+        step.input_path = subset2
+        folder = self.scratch / "agent3"
+        print(f"\n  Agent 3 matches the {expected:,} updated line(s) against the "
+              f"catalogue.\n", flush=True)
+        returncode, tail = self.chain.run_until_done(
+            step, self.chain.arguments_for("agent3.py", subset2, results_dir=folder))
+        output = folder / step.output_name
+        if returncode != 0 or not output.is_file():
+            raise SystemExit(
+                f"Agent 3 could not match the updated lines: "
+                f"{tail[-1] if tail else f'exit code {returncode}'}.\n"
+                f"  Nothing has been changed. Agent 1's answers are cached, so running "
+                f"again costs nothing for them. Agent 3's log is {step.log_path}")
+
+        header = read_header(output)
+        if header != read_header(self.lines3):
+            raise SystemExit(f"Agent 3 wrote different columns for the updated lines than "
+                             f"{self.lines3.name} has. Nothing has been changed.")
+        key_at = header.index(ROW_NUMBER_COLUMN)
+        rows = {row[key_at].strip(): row for row in stream_rows(output)
+                if key_at < len(row)}
+        if len(rows) != expected:
+            raise SystemExit(f"Agent 3 returned {len(rows):,} of the {expected:,} updated "
+                             f"lines. Nothing has been changed.")
+
+        lines: Dict[str, str] = {}
+        jsonl = output.with_suffix(".jsonl")
+        if jsonl.is_file():
+            with jsonl.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    record = json.loads(line)
+                    lines[str(record.get(ROW_NUMBER_COLUMN, "")).strip()] = line
+        return rows, lines
+
+    def _rewrite_agent3(self, rows3: Dict[str, List[str]], lines3: Dict[str, str]) -> None:
+        header = read_header(self.lines3)
+        key_at = header.index(ROW_NUMBER_COLUMN)
+
+        def change(position: int, row: List[str]) -> Optional[List[str]]:
+            new = rows3.get(row[key_at].strip() if key_at < len(row) else "")
+            return _padded(new, len(header)) if new is not None else None
+
+        self._say(self.lines3)
+        partial, replaced = rewrite_csv(self.lines3, change)
+        self.rewrites.append((partial, self.lines3))
+
+        jsonl = self.lines3.with_suffix(".jsonl")
+        if jsonl.is_file() and lines3:
+            def take(key: str) -> Callable[[str], str]:
+                def edit(line: str) -> str:
+                    record = json.loads(line)
+                    if str(record.get(ROW_NUMBER_COLUMN, "")).strip() != key:
+                        raise SystemExit(
+                            f"{jsonl.name} is not in the same row order as "
+                            f"{self.lines3.name}. Nothing has been changed.")
+                    return lines3[key]
+                return edit
+            self._say(jsonl)
+            self.rewrites.append((rewrite_jsonl(jsonl, {
+                position: take(row[key_at].strip())
+                for position, row in replaced.items()}), jsonl))
+
+    def _rewrite_dataset(self, rows3: Dict[str, List[str]],
+                         subset1: Path, subset2: Path) -> None:
+        """Replace the line-agent block of each updated row; keep the rest of it."""
+        line_header = read_header(self.lines3)
+        keys = sorted(rows3, key=lambda key: int(float(key)))
+        rows = [list(rows3[key]) for key in keys]
+        # As the merge does: a value Agent 3 dropped is taken from Agent 2's
+        # file, then Agent 1's.
+        restore_dropped_values(line_header, rows, [subset2, subset1])
+
+        header = read_header(self.dataset)
+        offset = len(read_header(self.input_path))
+        for position, name in enumerate(line_header):
+            published = header[offset + position] if offset + position < len(header) else ""
+            if published != name and not published.endswith(f"_{name}"):
+                raise SystemExit(
+                    f"{OUTPUT_CSV} does not have the agent columns where the merge put "
+                    f"them ({name!r} expected, {published!r} found). Nothing has been "
+                    f"changed.")
+        key_at = offset + line_header.index(ROW_NUMBER_COLUMN)
+        by_ordinal = {int(float(key)) - HEADER_ROWS: (key, row)
+                      for key, row in zip(keys, rows)}
+
+        def change(position: int, row: List[str]) -> Optional[List[str]]:
+            key, line = by_ordinal[position]
+            if (row[key_at].strip() if key_at < len(row) else "") != key:
+                raise SystemExit(
+                    f"Row {position + HEADER_ROWS} of {OUTPUT_CSV} is not the line "
+                    f"Agent 1 numbered {key}. Nothing has been changed.")
+            row = _padded(row, len(header))
+            for at, value in enumerate(_padded(line, len(line_header))):
+                row[offset + at] = value
+            return row
+
+        self._say(self.dataset)
+        partial, replaced = rewrite_csv(self.dataset, change,
+                                        only=lambda position: position in by_ordinal)
+        self.rewrites.append((partial, self.dataset))
+
+        jsonl = self.dataset.with_suffix(".jsonl")
+        if jsonl.is_file():
+            def write_out(row: List[str]) -> Callable[[str], str]:
+                return lambda line: json.dumps(dict(zip(header, row)),
+                                               ensure_ascii=False) + "\n"
+            self._say(jsonl)
+            self.rewrites.append((rewrite_jsonl(jsonl, {
+                position: write_out(row) for position, row in replaced.items()}), jsonl))
+
+    # -- afterwards ----------------------------------------------------------
+
+    def _keep_audit_trail(self) -> None:
+        """Keep Agent 1's list of what it changed beside the files it changed."""
+        for name in (ORDER_TEXT_FILL_NAME, ORDER_TEXT_FILL_MANIFEST):
+            source = self.scratch / name
+            if source.is_file():
+                shutil.copy2(source, self.settings.work_dir / name)
+
+    def _note_in_manifest(self) -> None:
+        path = self.settings.results_dir / OUTPUT_MANIFEST
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        manifest.setdefault("updates", []).append(
+            {"update": "order_text_descriptions", **self.summary})
+        path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
+                        encoding="utf-8")
+
+    def _report(self) -> None:
+        usage = self.summary.get("agent1_usage") or {}
+        print("\n" + "=" * 79)
+        print("  Updated in place")
+        print("=" * 79)
+        print(f"  Blank lines looked at   : {self.summary.get('blank_lines') or 0:,}")
+        print(f"  With order/invoice text : {self.summary.get('lines_with_order_text') or 0:,}"
+              f" ({self.summary.get('distinct_questions') or 0:,} distinct)")
+        print(f"  Described now           : {self.summary.get('lines_described') or 0:,}")
+        print(f"  Still Unclear           : {self.summary.get('lines_left_unclear') or 0:,}"
+              f" (the order and invoice say nothing about what was bought)")
+        if usage:
+            print(f"  Agent 1 model spend     : "
+                  f"${float(usage.get('estimated_cost_usd') or 0):,.2f}")
+        print(f"  Time                    : {human_seconds(self.summary.get('seconds') or 0)}")
+        if self.summary.get("files_rewritten"):
+            print("  Files updated, only those lines changed:")
+            for name in self.summary["files_rewritten"]:
+                print(f"    {name}")
+            print(f"  The lines changed are listed in {ORDER_TEXT_FILL_NAME}.")
+        print("  Agent 2's groups and Agent 4's supplier findings are unchanged.")
+        print("=" * 79 + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -2602,6 +3213,10 @@ class Runner:
         # Column -> cells put back after a later agent blanked what an earlier one
         # produced. Reported rather than done quietly, because it is a repair.
         self.restored: Dict[str, int] = {}
+
+        # Set when this run updated a finished one in place instead of running
+        # the chain; it reports for itself.
+        self.update: Optional[Dict[str, Any]] = None
 
     def _resume_or_restart(self, input_path: Path) -> None:
         """Deal with a run that was interrupted, before anything reuses its work.
@@ -2696,6 +3311,11 @@ class Runner:
         self._resume_or_restart(self.input.path)
 
         self.chain = AgentChain(self.settings)
+
+        update = OrderTextUpdate(self.settings, self.chain, self.input.path)
+        if update.wanted():
+            self.update = update.run()
+            return 0
         print(f"\n  Model tier           : "
               f"{'on' if self.settings.use_llm else 'off, local stack only'}"
               + (f", alert at ${self.settings.llm_spend_limit:,.2f}"
@@ -3421,7 +4041,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 130
     finally:
         lock.release()
-    print_summary(runner, settings)
+    if runner.update is None:
+        print_summary(runner, settings)
     return code
 
 

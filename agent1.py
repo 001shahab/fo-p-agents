@@ -100,7 +100,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.10.0"
+AGENT_VERSION = "1.11.0"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -257,6 +257,32 @@ PER_SOURCE_COLUMNS: Tuple[str, ...] = (
     "Detected_Language",
     "Row_Id",
 )
+
+# Order and invoice text that can say what a line bought when the line itself
+# names only a contractor and the supplier, as Sievo's contingent-workforce
+# lines do. Max's Stage 3 column names, so only a Stage 3 table offers them.
+ORDER_TEXT_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("PO_Header_Description", "order header"),
+    ("PO_Line_Description", "order line"),
+    ("Invoice_Article_Name", "invoice line"),
+    ("Invoice_Article_Names_All", "invoice lines"),
+    ("Invoice_Free_Text", "invoice note"),
+)
+ORDER_TEXT_LIMIT = 400
+ORDER_TEXT_BATCH = 10
+ORDER_TEXT_BASIS = "order_or_invoice"
+
+# What the order-text pass changes on a line it describes; nothing else moves.
+ORDER_TEXT_FILL_COLUMNS: Tuple[str, ...] = (
+    "Enriched_Purchase_Description",
+    "Enriched_Description_Short",
+    "Item_Or_Service",
+    "AI_Confidence",
+    "Confidence_Band",
+    "Confidence_Factors",
+)
+ORDER_TEXT_FILL_NAME = "agent1_order_text_fill.csv"
+ORDER_TEXT_FILL_MANIFEST = "agent1_order_text_fill_manifest.json"
 
 # Confidence band boundaries. Exposed as constants because Agents 3 and 4 apply
 # the same thresholds to their own scores, and the bands must agree across the
@@ -3438,6 +3464,109 @@ class TranslationEngine:
         self.model.store(cache_key, json.dumps(response, ensure_ascii=False, sort_keys=True))
         return self._take_polish(response, draft, short, item_or_service)
 
+    ORDER_TEXT_PROMPT = (
+        "You say what was bought on purchase lines whose own text names only a "
+        "contractor, the supplier or a reference. For each line you get the "
+        "supplier and the text of the order and invoice the line belongs to. "
+        "That text may cover several lines, so describe the work or goods it "
+        "has in common.\n"
+        "Return JSON: {\"lines\": [{\"id\": ..., \"description\": \"...\", "
+        "\"short_description\": \"...\", \"item_or_service\": "
+        "\"Material|Service|Unclear\"}]}, one entry for every id given.\n"
+        "Rules:\n"
+        "1. description is one English sentence with a verb, 10 to 30 words, "
+        "saying what was bought from the supplier. short_description is an "
+        "English noun phrase of at most twelve words for the same purchase.\n"
+        "2. Use only facts in the texts. Do not guess from the supplier's name "
+        "or its line of business.\n"
+        "3. If the texts name only people, job titles, companies, periods, "
+        "weeks, fees, index increases or reference numbers and say nothing about "
+        "what was bought, return empty description and short_description and "
+        "item_or_service Unclear.\n"
+        "4. Never name an individual person. Describe the work instead.\n"
+        "5. Translate Finnish, Swedish, Polish and German; never copy them. Keep "
+        "place, plant and site names, item numbers and measurements as written."
+    )
+
+    @staticmethod
+    def order_text_payload(supplier: str, evidence: Sequence[Tuple[str, str]]) -> str:
+        """The cache identity of one order-text question.
+
+        The line's own text is left out on purpose. It is a contractor's name on
+        the lines this serves, which would make every line its own question and
+        send personal data for nothing; lines on the same order and invoice ask
+        the same question and get one answer.
+        """
+        return json.dumps({"supplier": supplier,
+                           "texts": [{"field": label, "text": text}
+                                     for label, text in evidence]},
+                          ensure_ascii=False, sort_keys=True)
+
+    def describe_from_order_text(self, questions: Sequence[Tuple[str, Sequence[Tuple[str, str]]]]
+                                 ) -> List[Optional[Dict[str, Any]]]:
+        """Answer order-text questions, from the cache where it can.
+
+        Each question is (supplier, labelled texts). Answers come back in the
+        same order, None where the model gave none. Asked in batches with each
+        answer cached on its own, so a full run asking one line at a time
+        finds what a batched pass already bought.
+        """
+        answers: List[Optional[Dict[str, Any]]] = [None] * len(questions)
+        if self.model is None or not self.model.config.enabled:
+            return answers
+
+        keys = [self.model.cache_key("order_text_v1", self.order_text_payload(*question))
+                for question in questions]
+        outstanding: List[int] = []
+        for index, key in enumerate(keys):
+            cached = self.model.cached(key)
+            if cached:
+                try:
+                    answers[index] = json.loads(cached)
+                    continue
+                except json.JSONDecodeError:
+                    pass
+            outstanding.append(index)
+
+        batches = -(-len(outstanding) // ORDER_TEXT_BATCH)
+        started = announced = time.time()
+        for number, start in enumerate(range(0, len(outstanding), ORDER_TEXT_BATCH), start=1):
+            batch = outstanding[start:start + ORDER_TEXT_BATCH]
+            request = json.dumps({"lines": [
+                {"id": position, **json.loads(self.order_text_payload(*questions[index]))}
+                for position, index in enumerate(batch)]}, ensure_ascii=False)
+            response = self.model.complete_json(self.ORDER_TEXT_PROMPT, request)
+
+            if batches > 1 and time.time() - announced >= MODEL_PROGRESS_SECONDS:
+                announced = time.time()
+                done = min(start + ORDER_TEXT_BATCH, len(outstanding))
+                rate = done / max(0.001, announced - started)
+                LOGGER.info("  order text: %d of %d question(s), batch %d of %d, "
+                            "spend $%.2f, about %s remaining",
+                            done, len(outstanding), number, batches,
+                            self.model.usage.estimated_cost,
+                            human_seconds((len(outstanding) - done) / rate if rate else 0.0))
+
+            lines = (response or {}).get("lines")
+            if not isinstance(lines, list):
+                continue
+            for entry in lines:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    position = int(entry.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if not 0 <= position < len(batch):
+                    continue
+                index = batch[position]
+                answer = {name: normalise_text(entry.get(name))
+                          for name in ("description", "short_description", "item_or_service")}
+                self.model.store(keys[index], json.dumps(answer, ensure_ascii=False,
+                                                         sort_keys=True))
+                answers[index] = answer
+        return answers
+
     def repair_published(self, original: str, description: str, short: str,
                          faults: Sequence[str]
                          ) -> Tuple[str, str, FrozenSet[str]]:
@@ -3858,6 +3987,10 @@ class LineRecord:
     is_duplicate: bool = False
     duplicate_of: str = ""
 
+    # Labelled order and invoice text, offered only if the row's own text names
+    # no purchase. See ``order_text_evidence``.
+    order_text: Tuple[Tuple[str, str], ...] = ()
+
     @property
     def primary_text(self) -> str:
         """The best free-text value this row carries, exactly as supplied."""
@@ -4190,29 +4323,47 @@ def score_confidence(record: LineRecord, description: DescriptionResult,
     a line scored as it did, which is what makes the sample-based validation in
     the development plan practical.
     """
+    return confidence_from(
+        basis=description.basis,
+        coverage=translation.coverage,
+        field_count=len(record.evidence.descriptions) + len(record.evidence.context),
+        system_count=len(record.evidence.systems),
+        specificity=description.specificity,
+        match_tier=record.match_tier,
+        described=bool(description.description),
+    )
+
+
+def confidence_from(basis: str, coverage: float, field_count: int, system_count: int,
+                    specificity: float, match_tier: str,
+                    described: bool) -> Tuple[int, str, Dict[str, float]]:
+    """The score itself, from the measurements ``score_confidence`` takes.
+
+    Separate so that the order-text pass, which works from a finished output
+    rather than a live record, scores a line exactly as a full run would.
+    """
     factors: Dict[str, float] = {}
 
     # How directly the description reflects the line's own text.
-    factors["basis"] = {"description": 1.0, "context": 0.65,
-                        "taxonomy": 0.3, "none": 0.0}.get(description.basis, 0.0)
+    factors["basis"] = {"description": 1.0, "context": 0.65, ORDER_TEXT_BASIS: 0.5,
+                        "taxonomy": 0.3, "none": 0.0}.get(basis, 0.0)
 
     # How much of the source language was actually resolved.
-    factors["translation"] = round(min(1.0, translation.coverage), 3)
+    factors["translation"] = round(min(1.0, coverage), 3)
 
     # How many independent fields contributed. Corroboration across systems is
     # the strongest evidence available that a description is right.
-    field_count = len(record.evidence.descriptions) + len(record.evidence.context)
     factors["evidence"] = round(min(1.0, field_count / 4.0), 3)
 
     # Agreement between source systems, which only a successful match can give.
-    factors["corroboration"] = round(min(1.0, max(0, len(record.evidence.systems) - 1) / 2.0), 3)
+    factors["corroboration"] = round(min(1.0, max(0, system_count - 1) / 2.0), 3)
 
     # How informative the result is.
-    factors["specificity"] = description.specificity
+    factors["specificity"] = specificity
 
     # How reliable the link to the other systems was, if one was used.
     factors["match"] = {"key": 1.0, "fuzzy": 0.75, "semantic": 0.6,
-                        "none": 0.5}.get(record.match_tier, 0.5)
+                        "none": 0.5}.get(match_tier, 0.5)
 
     weights = {
         "basis": 0.28,
@@ -4228,14 +4379,40 @@ def score_confidence(record: LineRecord, description: DescriptionResult,
     # A description built purely from a category is a statement about the
     # category, not about the line, and must not reach the high band however
     # well the other factors score.
-    if description.basis == "taxonomy":
+    if basis == "taxonomy":
         score = min(score, CONFIDENCE_MEDIUM - 1)
-    if not description.description:
+    # Read off the order or invoice the line belongs to, which may cover other
+    # lines too, so it is never as sure as the line's own words.
+    if basis == ORDER_TEXT_BASIS:
+        score = min(score, CONFIDENCE_HIGH - 1)
+        factors["from_order_or_invoice"] = 1.0
+    if not described:
         score = 0
 
     band = ("High" if score >= CONFIDENCE_HIGH
             else "Medium" if score >= CONFIDENCE_MEDIUM else "Low")
     return score, band, factors
+
+
+def order_text_evidence(value_of: Callable[[str], str],
+                        own_text: str) -> Tuple[Tuple[str, str], ...]:
+    """The order and invoice text a line can be described from, if its own fails.
+
+    A value the line's own text already contains adds nothing, and one that
+    another kept value contains is a repeat, so both are dropped. What is left
+    is labelled by where it came from so the model can weigh a line-level field
+    above an invoice-wide one.
+    """
+    own = lookup_key(own_text)
+    kept: List[Tuple[str, str, str]] = []
+    for column, label in ORDER_TEXT_COLUMNS:
+        value = normalise_text(value_of(column))[:ORDER_TEXT_LIMIT].strip()
+        key = lookup_key(value)
+        if not key or key in own or any(key in other for _, _, other in kept):
+            continue
+        kept = [entry for entry in kept if entry[2] not in key]
+        kept.append((label, value, key))
+    return tuple((label, value) for label, value, _ in kept)
 
 
 # ===========================================================================
@@ -4742,6 +4919,30 @@ class Agent1:
         record.matched_systems = tuple(sorted(record.evidence.systems - {profile.name}))
         return record
 
+    def order_text_description(self, answer: Optional[Dict[str, Any]],
+                               evidence: Sequence[Tuple[str, str]]) -> DescriptionResult:
+        """Hold a model's order-text answer to the rules a published line meets."""
+        if not answer:
+            return DescriptionResult()
+        description = self.translator.ensure_english(
+            answer.get("description", ""), published=True)
+        short = self.translator.ensure_english(
+            answer.get("short_description", ""), published=True)
+        if has_non_english(description):
+            description = strip_foreign_words(description)
+            short = strip_foreign_words(short)
+        if not description:
+            return DescriptionResult()
+        item = normalise_text(answer.get("item_or_service")).title()
+        return DescriptionResult(
+            description=description,
+            short_description=short or self.synthesiser._shorten(description),
+            item_or_service=item if item in {"Material", "Service"} else "Unclear",
+            basis=ORDER_TEXT_BASIS,
+            used_fragments=tuple(text for _, text in evidence),
+            specificity=self.synthesiser._specificity(description),
+        )
+
     def build_description(self, record: LineRecord) -> Tuple[DescriptionResult, TranslationResult]:
         """Translate a record's evidence and compose its description."""
         if record.row_type != ROW_TYPE_LINE:
@@ -4839,6 +5040,15 @@ class Agent1:
                 description.description, protected)
             description.short_description = strip_foreign_words(
                 description.short_description, protected)
+        # The line's own text named no purchase, but the order or invoice it
+        # belongs to may. Asked last, so it never displaces the line's own words.
+        if not description.description and record.order_text:
+            supplier = record.business.get("supplier_name", "")
+            answer = self.translator.describe_from_order_text(
+                [(supplier, record.order_text)])[0]
+            from_order = self.order_text_description(answer, record.order_text)
+            if from_order.description:
+                description = from_order
         if not description.description:
             description.short_description = ""
         elif description.description and not description.short_description:
@@ -4973,9 +5183,21 @@ class Agent1:
                     source_writer = csv.writer(source_handle)
                     source_writer.writerow(list(table.headers) + per_source_columns)
 
+                    order_at = ({column: position
+                                 for position, column in enumerate(table.headers)
+                                 if column in dict(ORDER_TEXT_COLUMNS)}
+                                if self.model is not None and self.model.config.enabled
+                                else {})
+
                     enriched_count = 0
                     for row_number, row in table.iter_rows():
                         record = self.enrich_row(profile, resolver, table, row_number, row)
+                        if order_at:
+                            record.order_text = order_text_evidence(
+                                lambda column: (row[order_at[column]]
+                                                if column in order_at
+                                                and order_at[column] < len(row) else ""),
+                                record.primary_text)
                         description, translation = self.build_description(record)
                         confidence, band, factors = score_confidence(record, description, translation)
 
@@ -5090,6 +5312,153 @@ class Agent1:
         self.resolve_language()
         return self.write()
 
+    def fill_from_order_text(self, lines_path: Path) -> Dict[str, Any]:
+        """Describe, from order and invoice text, the lines a finished run left blank.
+
+        Reads the Stage 3 table the run started from and the unified lines it
+        wrote, and asks only about lines with no description that carry order
+        or invoice text. Writes one row per line it could describe; the caller
+        patches the run's files from that, so every other line stays exactly as
+        it was written.
+        """
+        input_path = self.settings.source_dir
+        if not input_path.is_file():
+            raise SystemExit(f"The order-text pass reads the Stage 3 table the run "
+                             f"started from, and this is not a file: {input_path}")
+        if not lines_path.is_file():
+            raise SystemExit(f"No unified lines to fill in: {lines_path}")
+        started = time.time()
+
+        LOGGER.info("Order text: reading %s", input_path.name)
+        evidence_at: Dict[int, Tuple[str, ...]] = {}
+        with input_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle)
+            header = [name.strip() for name in next(reader, [])]
+            at = [(column, header.index(column)) for column, _ in ORDER_TEXT_COLUMNS
+                  if column in header]
+            if not at:
+                raise SystemExit(f"{input_path.name} has none of the order or invoice "
+                                 f"columns ({', '.join(c for c, _ in ORDER_TEXT_COLUMNS)}), "
+                                 f"so there is nothing to describe the lines from.")
+            for ordinal, row in enumerate(reader):
+                values = tuple(row[position] if position < len(row) else ""
+                               for _, position in at)
+                if any(value.strip() for value in values):
+                    evidence_at[ordinal + 2] = values
+        columns = [column for column, _ in at]
+
+        LOGGER.info("Order text: finding blank lines in %s", lines_path.name)
+        targets: List[Tuple[Dict[str, str], Tuple[Tuple[str, str], ...]]] = []
+        blank = 0
+        with lines_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for line in csv.DictReader(handle):
+                if (line.get("Enriched_Purchase_Description") or "").strip():
+                    continue
+                if line.get("Row_Type") != ROW_TYPE_LINE:
+                    continue
+                blank += 1
+                try:
+                    values = evidence_at.get(int(float(line.get("Source_Row_Number") or "")))
+                except ValueError:
+                    values = None
+                if not values:
+                    continue
+                by_column = dict(zip(columns, values))
+                evidence = order_text_evidence(lambda column: by_column.get(column, ""),
+                                               line.get("Original_Description", ""))
+                if evidence:
+                    targets.append((line, evidence))
+
+        questions: Dict[str, Tuple[str, Tuple[Tuple[str, str], ...]]] = {}
+        for line, evidence in targets:
+            supplier = line.get("Supplier_Name", "")
+            questions.setdefault(self.translator.order_text_payload(supplier, evidence),
+                                 (supplier, evidence))
+        LOGGER.info("Order text: %d blank line(s), %d with order or invoice text, "
+                    "%d distinct question(s).", blank, len(targets), len(questions))
+
+        payloads = list(questions)
+        answers = self.translator.describe_from_order_text([questions[p] for p in payloads])
+        described = {payload: self.order_text_description(answer, questions[payload][1])
+                     for payload, answer in zip(payloads, answers)}
+
+        output_path = self.settings.results_dir / ORDER_TEXT_FILL_NAME
+        self.settings.results_dir.mkdir(parents=True, exist_ok=True)
+        filled = 0
+        bands: Counter = Counter()
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["Source_Row_Number", "Row_Id", *ORDER_TEXT_FILL_COLUMNS,
+                             "Description_Basis", "Used_Fragments"])
+            for line, evidence in targets:
+                result = described[self.translator.order_text_payload(
+                    line.get("Supplier_Name", ""), evidence)]
+                if not result.description:
+                    continue
+                confidence, band, factors = confidence_from(
+                    basis=result.basis,
+                    coverage=_as_float(line.get("Translation_Coverage")),
+                    field_count=int(_as_float(line.get("Evidence_Field_Count"))),
+                    system_count=len([name for name in
+                                      (line.get("Evidence_Sources") or "").split(";")
+                                      if name.strip()]),
+                    specificity=result.specificity,
+                    match_tier=line.get("Match_Tier") or "none",
+                    described=True)
+                source = line.get("Original_Description", "")
+                writer.writerow([
+                    line.get("Source_Row_Number", ""), line.get("Row_Id", ""),
+                    restore_source_specifications(
+                        keep_published_english(result.description,
+                                               result.protected_names), source),
+                    restore_source_specifications(
+                        keep_published_english(result.short_description,
+                                               result.protected_names), source),
+                    result.item_or_service or "Unclear",
+                    confidence, band, json.dumps(factors, sort_keys=True),
+                    result.basis,
+                    json.dumps(list(result.used_fragments), ensure_ascii=False),
+                ])
+                filled += 1
+                bands[band] += 1
+
+        if self.model is not None:
+            self.model.save_cache()
+        LOGGER.info("Order text: described %d of %d line(s); %d left Unclear.",
+                    filled, len(targets), len(targets) - filled)
+
+        statistics: Dict[str, Any] = {
+            "blank_lines": blank,
+            "lines_with_order_text": len(targets),
+            "distinct_questions": len(questions),
+            "lines_described": filled,
+            "lines_left_unclear": len(targets) - filled,
+            "confidence_bands": dict(bands),
+            "seconds": round(time.time() - started, 1),
+        }
+        if self.model is not None:
+            statistics["token_usage"] = {**self.model.usage.as_dict(),
+                                         **self.model.guard.as_dict()}
+        manifest = {
+            "agent": AGENT_NAME,
+            "agent_version": AGENT_VERSION,
+            "task": "order_text_fill",
+            "input": str(input_path),
+            "lines": str(lines_path),
+            "output": output_path.name,
+            "statistics": statistics,
+        }
+        (self.settings.results_dir / ORDER_TEXT_FILL_MANIFEST).write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        return manifest
+
+
+def _as_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
 
 # ===========================================================================
 # Command line interface
@@ -5160,6 +5529,11 @@ def build_parser() -> argparse.ArgumentParser:
     output.add_argument("--full-columns", action="store_true",
                         help="append the complete audit trail to the per-source files")
     output.add_argument("--no-jsonl", action="store_true", help="skip the JSONL export")
+    output.add_argument("--fill-order-text", metavar="LINES",
+                        help="instead of a full run, describe from order and invoice "
+                             "text the blank lines in this agent1_unified_lines.csv; "
+                             f"--input is the Stage 3 table it was made from, and "
+                             f"{ORDER_TEXT_FILL_NAME} goes to --results")
 
     parser.add_argument("--non-interactive", action="store_true",
                         help="never prompt; use the supplied arguments and defaults")
@@ -5447,6 +5821,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     agent: Optional[Agent1] = None
     try:
         agent = Agent1(settings)
+        if args.fill_order_text:
+            fill = agent.fill_from_order_text(
+                Path(args.fill_order_text).expanduser().resolve())
+            counts = fill["statistics"]
+            print(f"\n  Lines described from order or invoice text: "
+                  f"{counts['lines_described']:,} of {counts['lines_with_order_text']:,} "
+                  f"({counts['distinct_questions']:,} distinct question(s))")
+            usage = counts.get("token_usage") or {}
+            if usage:
+                print(f"  Model spend: ${float(usage.get('estimated_cost_usd') or 0):,.2f}, "
+                      f"{usage.get('cache_hits', 0):,} answer(s) from cache")
+            print(f"  Written to {settings.results_dir / ORDER_TEXT_FILL_NAME}\n")
+            return 0
         manifest = agent.run()
     except SystemExit as error:
         _keep_model_answers(agent)

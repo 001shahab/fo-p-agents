@@ -839,6 +839,28 @@ that has printed nothing for two hours is treated as hung, which is
 but is off by default, because the earlier fixed six-hour limit killed Agent 1
 mid-run on the full extract and cost the whole chain.
 
+### Filling blank descriptions from order and invoice text, in place
+
+Some lines came out of Agent 1 blank because the line itself names only a
+person, although the order header, PO line or invoice says what was bought.
+Agent 1 1.11.0 reads that text when the line says nothing. On a results folder
+that is already finished, `python all_agents.py` notices those lines and asks:
+
+```
+Update only those lines [Y/n]:
+```
+
+Yes asks the model about those lines only (one question per supplier and text,
+not per line), runs Agent 3 on just them, and rewrites them in Agent 1's,
+Agent 2's and Agent 3's files and in `all_agents_dataset.csv/.jsonl`. Every other
+row stays byte for byte as it was. Agent 2's groups and Agent 4's supplier
+findings are not touched. The lines changed are listed in
+`all_agents/agent1_order_text_fill.csv`. The files are rewritten next to the
+originals and swapped in only at the end, so an interruption leaves the folder
+as it was, and the run needs free disk space about the size of the files.
+The folder is then marked updated, so the next plain run reuses everything.
+`--force` or `--no-reuse` run the whole chain instead.
+
 ### One run at a time in a results folder
 
 Both runners take a lock on the results folder and refuse to start if another run

@@ -181,7 +181,7 @@ except ImportError:
 
 
 AGENT_NAME = "Max - wide procurement dataset builder"
-AGENT_VERSION = "1.5.0"
+AGENT_VERSION = "1.5.1"
 
 # ---------------------------------------------------------------------------
 # The agent interface
@@ -567,6 +567,31 @@ def header_key(text: str) -> str:
     without a synonym list that can never stay complete.
     """
     return re.sub(r"[^a-z0-9]", "", lookup_key(text))
+
+
+# Header tuple -> header_key -> the spelling that table uses. One entry per
+# distinct table layout, which is a handful per run.
+_HEADER_SPELLINGS: Dict[Tuple[str, ...], Dict[str, str]] = {}
+
+
+def field_value(row: Dict[str, str], column: str) -> str:
+    """A row's value for a column, however its extract spelled the header.
+
+    The stage files keep each extract's own headers, so a table built from a
+    delivery that writes DOCUMENT_LINE_DESC has no "Document line desc" column.
+    Reading by the literal name found nothing on every row of such a delivery.
+    """
+    if column in row:
+        return row[column] or ""
+    headers = tuple(row)
+    spellings = _HEADER_SPELLINGS.get(headers)
+    if spellings is None:
+        spellings = {}
+        for name in headers:
+            spellings.setdefault(header_key(name), name)
+        _HEADER_SPELLINGS[headers] = spellings
+    actual = spellings.get(header_key(column))
+    return (row.get(actual) or "") if actual else ""
 
 
 def compact_key(value: Any) -> str:
@@ -3829,7 +3854,7 @@ class AgentPipeline:
             key = ""
             for column in ("Supplier_Name", "Supplier", "ERP supplier name",
                            "Supplier_Id", "ERP supplier number"):
-                token = lookup_key(row.get(column, ""))
+                token = lookup_key(field_value(row, column))
                 if token and token in self.supplier_keys:
                     key = self.supplier_keys[token]
                     break
@@ -4689,7 +4714,7 @@ class Builder:
         used: List[str] = []
         seen: Set[str] = set()
         for column, label, role in TEXT_SOURCE_COLUMNS:
-            value = normalise_text(row.get(column, ""))
+            value = normalise_text(field_value(row, column))
             if not value or is_blank(value):
                 continue
             key = lookup_key(value)
