@@ -861,6 +861,32 @@ as it was, and the run needs free disk space about the size of the files.
 The folder is then marked updated, so the next plain run reuses everything.
 `--force` or `--no-reuse` run the whole chain instead.
 
+### One Agent 4 over several runs
+
+When the data was run in parts, each part's Agent 4 compared suppliers within
+that part only, so a supplier could get a different most similar supplier in
+each. To run Agent 4 once over all of them, name the finished results folders:
+
+```
+python all_agents.py --combine-agent4 jan_apr_results may_dec_results
+```
+
+Agents 1 to 3 do not run. Agent 4 reads every folder's
+`all_agents/agent2_purchase_groups.csv` together, keeping only the columns it
+reads, and its combined output is kept in `combined_agent4/`. In each folder's
+`all_agents_dataset.csv` and `.jsonl` only the `Agent4_` columns are recomputed,
+by the same lookup the merge uses. Every other column is written back as it
+was. Supplier figures such as `Agent4_Supplier_Lines` then cover all the
+folders together. Agent 2 derives a group's id from its category and label, so
+the same group has the same id in every run and the runs compare directly.
+
+The combined Agent 4 files replace each folder's own in `all_agents/`, so a
+later plain run of the folder keeps the combined answer. The folder's own
+files are kept in `all_agents/agent4_own_run/`. Running the command again
+reuses the combined Agent 4 unless `--force` is given. If Agent 4 later runs on
+one folder alone, for example because Agent 2 was rerun, the run warns that
+the combination has to be done again.
+
 ### One run at a time in a results folder
 
 Both runners take a lock on the results folder and refuse to start if another run

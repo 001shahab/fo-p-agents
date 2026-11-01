@@ -143,6 +143,7 @@ Usage
     python3 all_agents.py --no-llm            # local stack only, no model spend
     python3 all_agents.py --force             # rerun the agents, keep the table
     python3 all_agents.py --no-reuse          # rebuild everything from the extracts
+    python3 all_agents.py --combine-agent4 A B  # one Agent 4 over finished runs A and B
 
 Author: Prof. Shahab Anbarjafari
 """
@@ -3186,6 +3187,395 @@ class OrderTextUpdate:
 
 
 # ---------------------------------------------------------------------------
+# One Agent 4 over several finished runs
+# ---------------------------------------------------------------------------
+
+COMBINED_AGENT4_DIR_NAME = "combined_agent4"
+COMBINED_AGENT4_INPUT = "agent4_combined_input.csv"
+COMBINED_AGENT4_MARKER = ".agent4_combined.json"
+COMBINED_PARTIAL_SUFFIX = ".agent4_combined.partial"
+AGENT4_OWN_RUN_DIR = "agent4_own_run"
+AGENT4_OUTPUT_FILES: Tuple[str, ...] = (
+    AGENT4_CONSOLIDATION_NAME, "agent4_supplier_consolidation.jsonl",
+    AGENT4_MASTER_NAME, "agent4_supplier_pairs.csv", AGENT4_MANIFEST_NAME)
+RUN_FOLDER_COLUMN = "Run_Folder"
+
+# The columns Agent 4 reads. It holds its whole input in memory, so the combined
+# table carries these and nothing else.
+AGENT4_INPUT_COLUMNS: Tuple[str, ...] = (
+    SOURCE_FILE_COLUMN, ROW_NUMBER_COLUMN, LINE_SUPPLIER_NAME, LINE_SUPPLIER_ID,
+    "Enriched_Purchase_Description", "AI_Purchase_Group_L5", "AI_Purchase_Group_Id",
+    "Spend_EUR", "Delivered_To_Country", "Delivery_Country", "Ship_To_Country",
+    "Country", "Country_Source", "Business_Area", "Division",
+    "Category_L1", "Category_L2", "Category_L3", "Category_L4",
+    "Item_Or_Service", "Item_Number", "Material_Group_Name", "Source_System")
+
+
+class CombinedAgent4:
+    """Agent 4 run once over several finished runs, its answer written into each.
+
+    Each run's Agent 4 only saw that run's lines, so a supplier could be given a
+    different most similar supplier in each period. Here Agent 4 reads every
+    run's Agent 2 output together, and each run's dataset gets the one answer.
+    Only the Agent 4 columns of the datasets are recomputed, by the same lookup
+    the merge uses; every other column is written back exactly as it was.
+    """
+
+    def __init__(self, settings: Settings, folders: Sequence[Path]) -> None:
+        self.settings = settings
+        self.folders = list(folders)
+        self.chain = AgentChain(settings)
+        self.input = settings.work_dir / COMBINED_AGENT4_INPUT
+        self.rewrites: List[Tuple[Path, Path]] = []
+        self.summary: Dict[str, Any] = {"folders": [str(folder) for folder in self.folders]}
+        self.swapping = False
+
+    @staticmethod
+    def _groups_file(folder: Path) -> Path:
+        return folder / "all_agents" / "agent2_purchase_groups.csv"
+
+    def check(self) -> None:
+        if len(self.folders) < 2:
+            raise SystemExit("--combine-agent4 needs at least two results folders.")
+        if len({folder.resolve() for folder in self.folders}) != len(self.folders):
+            raise SystemExit("--combine-agent4 was given the same folder twice.")
+        for folder in self.folders:
+            missing = [path.name for path in (self._groups_file(folder), folder / OUTPUT_CSV)
+                       if not path.is_file()]
+            if missing:
+                raise SystemExit(f"{folder} is not a finished run: {', '.join(missing)} "
+                                 f"is missing.")
+            if RunJournal(folder / "all_agents").previous():
+                raise SystemExit(f"{folder} holds a run that did not finish. Finish it "
+                                 f"with python all_agents.py --results {folder} first.")
+
+    def explain(self) -> bool:
+        print()
+        print("  Agent 4 runs once over these finished runs together:")
+        for folder in self.folders:
+            print(f"    {folder}")
+        print("  In each run's all_agents_dataset.csv and .jsonl only the Agent4_ columns")
+        print("  change; every other column stays exactly as it is. Agents 1, 2 and 3 do")
+        print("  not run. Each run's own Agent 4 files are kept in")
+        print(f"  all_agents/{AGENT4_OWN_RUN_DIR}/.")
+        if self.settings.interactive:
+            print()
+            return ask_yes_no("Go ahead", True)
+        return True
+
+    # -- doing it ------------------------------------------------------------
+
+    def run(self) -> Dict[str, Any]:
+        started = time.time()
+        self._clear_leftovers()
+        self._check_disk_space()
+        self._write_input()
+        consolidation = self._run_agent4()
+        try:
+            for folder in self.folders:
+                self.summary.setdefault("runs", {})[folder.name] = \
+                    self._rewrite_dataset(folder, consolidation)
+            print("\n  Swapping the updated files in ...", flush=True)
+            self.swapping = True
+            for partial, path in self.rewrites:
+                partial.replace(path)
+        except BaseException:
+            for partial, _ in self.rewrites:
+                try:
+                    partial.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+        for folder in self.folders:
+            self._install_agent4_files(folder)
+        self.summary.update({
+            "updated": datetime.datetime.now().isoformat(timespec="seconds"),
+            "combined_results": str(self.settings.work_dir),
+            "primary_scope": consolidation.primary_scope,
+            "seconds": round(time.time() - started, 1),
+        })
+        for folder in self.folders:
+            (folder / "all_agents" / COMBINED_AGENT4_MARKER).write_text(
+                json.dumps(self.summary, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._note_in_manifest(folder)
+        self._report()
+        return self.summary
+
+    def _clear_leftovers(self) -> None:
+        for folder in [*self.folders, self.settings.work_dir]:
+            for stale in folder.glob(f"*{COMBINED_PARTIAL_SUFFIX}"):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+
+    def _check_disk_space(self) -> None:
+        """Each dataset exists twice until the swap."""
+        for folder in self.folders:
+            needed = sum(path.stat().st_size
+                         for path in (folder / OUTPUT_CSV, folder / OUTPUT_JSONL)
+                         if path.is_file())
+            free = shutil.disk_usage(folder).free
+            if free < needed * 1.05:
+                raise SystemExit(
+                    f"Rewriting the dataset in {folder} needs {needed / 1e9:,.1f} GB free "
+                    f"and only {free / 1e9:,.1f} GB is. Nothing has been changed.")
+
+    def _write_input(self) -> None:
+        """Every run's Agent 2 lines in one table.
+
+        Agent 2 derives a group's id from its category and label, so the same
+        group carries the same id in every run and the runs compare directly.
+        """
+        headers = [read_header(self._groups_file(folder)) for folder in self.folders]
+        present = set().union(*headers)
+        columns = [column for column in AGENT4_INPUT_COLUMNS if column in present]
+        self.settings.work_dir.mkdir(parents=True, exist_ok=True)
+        partial = self.input.with_name(self.input.name + COMBINED_PARTIAL_SUFFIX)
+        lines: Dict[str, int] = {}
+        print(f"\n  Writing {self.input.name} ...", flush=True)
+        with partial.open("w", encoding="utf-8", newline="") as target:
+            writer = csv.writer(target)
+            writer.writerow([RUN_FOLDER_COLUMN, *columns])
+            for folder in self.folders:
+                count = 0
+                with self._groups_file(folder).open("r", encoding="utf-8-sig",
+                                                    newline="") as source:
+                    for row in csv.DictReader(source):
+                        writer.writerow([folder.name,
+                                         *(row.get(column) or "" for column in columns)])
+                        count += 1
+                lines[folder.name] = count
+                print(f"    {folder.name}: {count:,} line(s)", flush=True)
+        partial.replace(self.input)
+        self.summary["lines"] = lines
+
+    def _run_agent4(self) -> SupplierConsolidation:
+        step = self.chain.new_step("agent4.py")
+        self.chain.origin_name = self.input.name
+        print(f"\n  Agent 4 reads all {sum(self.summary['lines'].values()):,} lines "
+              f"together.\n", flush=True)
+        self.chain._invoke(step, self.chain.arguments_for("agent4.py", self.input),
+                           self.input)
+        if not step.ok:
+            raise SystemExit(f"Agent 4 did not finish: {step.reason}. Nothing in the "
+                             f"results folders has been changed. Its log is "
+                             f"{step.log_path or self.settings.work_dir}")
+        self.chain.journal.clear()
+        self.summary["agent4"] = {"reused": step.reused, "seconds": round(step.seconds, 1),
+                                  "rows": step.rows, "usage": step.usage}
+        consolidation = SupplierConsolidation(self.settings.work_dir)
+        if not consolidation.load():
+            raise SystemExit("Agent 4's combined output cannot be attached to lines: "
+                             + " ".join(consolidation.notes)
+                             + " Nothing in the results folders has been changed.")
+        return consolidation
+
+    def _line_block(self, folder: Path, header: Sequence[str],
+                    start: int) -> Tuple[int, List[str]]:
+        """Where the line agents' columns sit in the dataset, and what they are."""
+        for name in ("agent3_standardisation.csv", "agent2_purchase_groups.csv"):
+            path = folder / "all_agents" / name
+            if not path.is_file():
+                continue
+            line_header = read_header(path)
+            base = start - len(line_header)
+            if base >= 0 and all(
+                    header[base + at] == column or header[base + at].endswith(f"_{column}")
+                    for at, column in enumerate(line_header)):
+                return base, line_header
+        raise SystemExit(f"{folder / OUTPUT_CSV} does not have the agent columns where the "
+                         f"merge puts them, so its Agent 4 columns cannot be found safely. "
+                         f"Nothing has been changed.")
+
+    def _rewrite_dataset(self, folder: Path,
+                         consolidation: SupplierConsolidation) -> Dict[str, Any]:
+        """Recompute the Agent 4 columns of one run's dataset, as the merge would."""
+        dataset = folder / OUTPUT_CSV
+        header = read_header(dataset)
+        start = len(header)
+        while start > 0 and header[start - 1].startswith(AGENT4_PREFIX):
+            start -= 1
+        base, line_header = self._line_block(folder, header, start)
+
+        taken = set(header[:start])
+        names: List[str] = []
+        for column in consolidation.columns:
+            name = unique_name(f"{AGENT4_PREFIX}{column}", taken)
+            taken.add(name)
+            names.append(name)
+        new_header = list(header[:start]) + names
+
+        def position(column: str) -> Optional[int]:
+            return base + line_header.index(column) if column in line_header else None
+
+        name_at = position(LINE_SUPPLIER_NAME)
+        id_at = position(LINE_SUPPLIER_ID)
+        scope_at = position(consolidation.primary_scope)
+        key_out = (start + consolidation.columns.index(SUPPLIER_KEY_COLUMN)
+                   if SUPPLIER_KEY_COLUMN in consolidation.columns else None)
+        similar = f"{AGENT4_PREFIX}Most_Similar_Supplier"
+        old_similar = header.index(similar) if similar in header[start:] else None
+        new_similar = new_header.index(similar) if similar in names else None
+
+        jsonl = dataset.with_suffix(".jsonl")
+        partial_csv = dataset.with_name(dataset.name + COMBINED_PARTIAL_SUFFIX)
+        partial_jsonl = jsonl.with_name(jsonl.name + COMBINED_PARTIAL_SUFFIX)
+        encoding = _encoding_of(dataset)
+        counts = {"rows": 0, "with_finding": 0, "agent4_changed": 0,
+                  "most_similar_changed": 0}
+        print(f"  Rewriting the Agent 4 columns of {folder.name}/{dataset.name} ...",
+              flush=True)
+        lines_out = partial_jsonl.open("w", encoding="utf-8") if jsonl.is_file() else None
+        try:
+            with dataset.open("r", encoding=encoding, newline="") as source, \
+                    partial_csv.open("w", encoding=encoding, newline="") as target:
+                reader = csv.reader(source)
+                next(reader, None)
+                writer = csv.writer(target)
+                writer.writerow(new_header)
+                for row in reader:
+                    output = _padded(row[:start], start) + [""] * len(names)
+
+                    def cell(at: Optional[int]) -> str:
+                        return output[at] if at is not None else ""
+
+                    key = consolidation.key_for(cell(name_at), cell(id_at))
+                    if key and key_out is not None:
+                        output[key_out] = key
+                    values = consolidation.values_for(key, cell(scope_at))
+                    if values is not None:
+                        counts["with_finding"] += 1
+                        for at, value in enumerate(values[:len(names)]):
+                            output[start + at] = value
+                    if row[start:] != output[start:]:
+                        counts["agent4_changed"] += 1
+                    if old_similar is not None and new_similar is not None:
+                        before = row[old_similar] if old_similar < len(row) else ""
+                        if normalise(before) != normalise(output[new_similar]):
+                            counts["most_similar_changed"] += 1
+                    writer.writerow(output)
+                    if lines_out is not None:
+                        lines_out.write(json.dumps(dict(zip(new_header, output)),
+                                                   ensure_ascii=False) + "\n")
+                    counts["rows"] += 1
+        finally:
+            if lines_out is not None:
+                lines_out.close()
+        self.rewrites.append((partial_csv, dataset))
+        if lines_out is not None:
+            self.rewrites.append((partial_jsonl, jsonl))
+        return counts
+
+    def _install_agent4_files(self, folder: Path) -> None:
+        """Put the combined Agent 4 files where a later merge of this run reads them.
+
+        The run's own files are kept once, so running this again does not
+        overwrite them with the combined ones.
+        """
+        work = folder / "all_agents"
+        backup = work / AGENT4_OWN_RUN_DIR
+        if not backup.is_dir():
+            backup.mkdir(parents=True)
+            for name in AGENT4_OUTPUT_FILES:
+                if (work / name).is_file():
+                    shutil.copy2(work / name, backup / name)
+        for name in AGENT4_OUTPUT_FILES:
+            source = self.settings.work_dir / name
+            if source.is_file():
+                shutil.copy2(source, work / name)
+
+    def _note_in_manifest(self, folder: Path) -> None:
+        path = folder / OUTPUT_MANIFEST
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        manifest.setdefault("updates", []).append(
+            {"update": "agent4_combined_over_runs", **self.summary})
+        path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
+                        encoding="utf-8")
+
+    def _report(self) -> None:
+        agent4 = self.summary.get("agent4") or {}
+        usage = agent4.get("usage") or {}
+        print("\n" + "=" * 79)
+        print("  Agent 4 run once over all the runs")
+        print("=" * 79)
+        for name, lines in (self.summary.get("lines") or {}).items():
+            counts = (self.summary.get("runs") or {}).get(name) or {}
+            print(f"  {name}")
+            print(f"    Lines                     : {lines:,}")
+            print(f"    With an Agent 4 finding   : {counts.get('with_finding', 0):,}")
+            print(f"    Agent 4 columns changed   : {counts.get('agent4_changed', 0):,}")
+            print(f"    Most similar supplier new : {counts.get('most_similar_changed', 0):,}")
+        if usage:
+            print(f"  Agent 4 model spend       : "
+                  f"${float(usage.get('estimated_cost_usd') or 0):,.2f}")
+        print(f"  Time                      : {human_seconds(self.summary.get('seconds') or 0)}")
+        print(f"  Combined Agent 4 files    : {self.settings.work_dir}")
+        print("  Only the Agent4_ columns of each dataset changed. Each run's own Agent 4")
+        print(f"  files are kept in all_agents/{AGENT4_OWN_RUN_DIR}/.")
+        print("=" * 79 + "\n")
+
+
+def combine_agent4(args: argparse.Namespace) -> int:
+    """``--combine-agent4``: one Agent 4 over several finished runs."""
+    here = Path(__file__).resolve().parent
+    folders = []
+    for name in args.combine_agent4:
+        folder = Path(name).expanduser()
+        if not folder.is_absolute() and not folder.is_dir() and (here / folder).is_dir():
+            folder = here / folder
+        folders.append(folder.resolve())
+    combined = (Path(args.combined_results).expanduser() if args.combined_results
+                else here / COMBINED_AGENT4_DIR_NAME)
+    settings = Settings(
+        source_dir=here,
+        results_dir=combined.resolve(),
+        lexicon_path=(Path(args.lexicon) if args.lexicon
+                      else here / "lexicon" / "procurement_lexicon.json").expanduser().resolve(),
+        cache_dir=(Path(args.cache) if args.cache else here / "cache").expanduser().resolve(),
+        force=args.force,
+        reuse=not args.no_reuse,
+        use_llm=not args.no_llm,
+        llm_spend_limit=spend_limit_from(args, read_dotenv(here / ".env")),
+        agent_timeout=args.agent_timeout,
+        write_jsonl=not args.no_jsonl,
+        interactive=not args.non_interactive,
+    )
+    print(BANNER, flush=True)
+    job = CombinedAgent4(settings, folders)
+    job.check()
+    if not job.explain():
+        print("  Nothing has been changed.")
+        return 0
+    if settings.use_llm:
+        preflight_model(here, args.skip_model_check)
+
+    locks = [ResultsLock(folder) for folder in [*folders, settings.results_dir]]
+    try:
+        for lock in locks:
+            refusal = lock.acquire()
+            if refusal:
+                LOGGER.error("Not starting: %s", refusal)
+                return 1
+        job.run()
+    except KeyboardInterrupt:
+        job.chain.stop_live_agents()
+        if job.swapping:
+            print("\n  Stopped while the files were being swapped in. Run the same "
+                  "command again to finish.")
+        else:
+            print("\n  Stopped. Nothing in the results folders has been changed.")
+        return 130
+    finally:
+        for lock in locks:
+            lock.release()
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -3359,6 +3749,15 @@ class Runner:
         self._judge_alignment(last)
 
         agent4_step = self.chain.agent4_step()
+        combined_marker = self.settings.work_dir / COMBINED_AGENT4_MARKER
+        if agent4_step and agent4_step.ok and not agent4_step.reused \
+                and combined_marker.is_file():
+            note = ("Agent 4 ran again on this folder alone, so its supplier findings "
+                    "no longer cover the other runs it was combined with. Run "
+                    "python all_agents.py --combine-agent4 with those folders again.")
+            LOGGER.warning(note)
+            self.warnings.append(note)
+            combined_marker.unlink(missing_ok=True)
         if agent4_step and agent4_step.ok and agent4_step.output_path:
             self.consolidation = SupplierConsolidation(agent4_step.output_path.parent)
             if not self.consolidation.load():
@@ -3786,6 +4185,14 @@ def build_parser() -> argparse.ArgumentParser:
                        help="rerun all four agents but still read an existing "
                             "stage-3 file as the input")
 
+    combine = parser.add_argument_group("one Agent 4 over several runs")
+    combine.add_argument("--combine-agent4", metavar="DIR", nargs="+",
+                         help="finished results folders to run Agent 4 over together; "
+                              "only the Agent4_ columns of their datasets change")
+    combine.add_argument("--combined-results", metavar="DIR",
+                         help="where the combined Agent 4 run is kept "
+                              f"(default: {COMBINED_AGENT4_DIR_NAME})")
+
     output = parser.add_argument_group("output")
     output.add_argument("--no-jsonl", action="store_true", help="skip the JSONL export")
 
@@ -3882,6 +4289,15 @@ def preflight_model(here: Path, skip_check: bool) -> Dict[str, str]:
     return credentials
 
 
+def spend_limit_from(args: argparse.Namespace, env: Dict[str, str]) -> Optional[float]:
+    if args.llm_spend_limit is not None or not env.get("LLM_SPEND_LIMIT"):
+        return args.llm_spend_limit
+    try:
+        return float(env["LLM_SPEND_LIMIT"])
+    except ValueError:
+        return None
+
+
 def resolve_settings(args: argparse.Namespace) -> Settings:
     here = Path(__file__).resolve().parent
     env = read_dotenv(here / ".env")
@@ -3896,12 +4312,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
     catalogue_dir = Path(args.catalogues) if args.catalogues else None
     input_path = Path(args.input) if args.input else None
 
-    spend_limit = args.llm_spend_limit
-    if spend_limit is None and env.get("LLM_SPEND_LIMIT"):
-        try:
-            spend_limit = float(env["LLM_SPEND_LIMIT"])
-        except ValueError:
-            spend_limit = None
+    spend_limit = spend_limit_from(args, env)
 
     reuse = not args.no_reuse
 
@@ -4009,6 +4420,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s  %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S")
+
+    if args.combine_agent4:
+        return combine_agent4(args)
 
     settings = resolve_settings(args)
     if args.non_interactive:
