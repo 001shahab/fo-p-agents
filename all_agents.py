@@ -3221,18 +3221,27 @@ class CombinedAgent4:
     the merge uses; every other column is written back exactly as it was.
     """
 
-    def __init__(self, settings: Settings, folders: Sequence[Path]) -> None:
+    def __init__(self, settings: Settings, folders: Sequence[Path],
+                 groups_files: Optional[Dict[Path, Path]] = None) -> None:
         self.settings = settings
         self.folders = list(folders)
+        self.groups_files = dict(groups_files or {})
         self.chain = AgentChain(settings)
         self.input = settings.work_dir / COMBINED_AGENT4_INPUT
         self.rewrites: List[Tuple[Path, Path]] = []
-        self.summary: Dict[str, Any] = {"folders": [str(folder) for folder in self.folders]}
+        self.summary: Dict[str, Any] = {
+            "folders": [str(folder) for folder in self.folders],
+            "agent2_files": {folder.name: str(self._groups_file(folder))
+                             for folder in self.folders},
+        }
         self.swapping = False
 
     @staticmethod
-    def _groups_file(folder: Path) -> Path:
+    def _own_groups_file(folder: Path) -> Path:
         return folder / "all_agents" / "agent2_purchase_groups.csv"
+
+    def _groups_file(self, folder: Path) -> Path:
+        return self.groups_files.get(folder) or self._own_groups_file(folder)
 
     def check(self) -> None:
         if len(self.folders) < 2:
@@ -3240,7 +3249,7 @@ class CombinedAgent4:
         if len({folder.resolve() for folder in self.folders}) != len(self.folders):
             raise SystemExit("--combine-agent4 was given the same folder twice.")
         for folder in self.folders:
-            missing = [path.name for path in (self._groups_file(folder), folder / OUTPUT_CSV)
+            missing = [str(path) for path in (self._groups_file(folder), folder / OUTPUT_CSV)
                        if not path.is_file()]
             if missing:
                 raise SystemExit(f"{folder} is not a finished run: {', '.join(missing)} "
@@ -3248,12 +3257,50 @@ class CombinedAgent4:
             if RunJournal(folder / "all_agents").previous():
                 raise SystemExit(f"{folder} holds a run that did not finish. Finish it "
                                  f"with python all_agents.py --results {folder} first.")
+            if folder in self.groups_files:
+                self._check_same_lines(folder)
+
+    def _check_same_lines(self, folder: Path) -> None:
+        """A replacement Agent 2 file must hold the lines of the run it stands in for."""
+        chosen = self._groups_file(folder)
+        header = read_header(chosen)
+        for column in ("AI_Purchase_Group_L5", ROW_NUMBER_COLUMN):
+            if column not in header:
+                raise SystemExit(f"{chosen} has no {column} column, so it is not an "
+                                 f"Agent 2 output. Nothing has been changed.")
+        print(f"\n  Checking that {chosen.name} holds the same lines as {folder.name} ...",
+              flush=True)
+
+        def lines_of(path: Path) -> Dict[str, str]:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                return {(row.get(ROW_NUMBER_COLUMN) or "").strip():
+                        normalise(row.get(LINE_SUPPLIER_NAME))
+                        for row in csv.DictReader(handle)}
+
+        chosen_lines = lines_of(chosen)
+        chosen_rows = count_rows(chosen)
+        own = self._own_groups_file(folder)
+        expected_rows = count_rows(own if own.is_file() else folder / OUTPUT_CSV)
+        if chosen_rows != expected_rows or len(chosen_lines) != chosen_rows:
+            raise SystemExit(f"{chosen} has {chosen_rows:,} line(s) and {folder.name} has "
+                             f"{expected_rows:,}, so it is not an Agent 2 output of that run. "
+                             f"Nothing has been changed.")
+        if own.is_file():
+            own_lines = lines_of(own)
+            differing = sum(1 for key, supplier in own_lines.items()
+                            if chosen_lines.get(key) != supplier)
+            if differing:
+                raise SystemExit(f"{chosen} and {own} disagree on {differing:,} line(s) "
+                                 f"(row number or supplier), so they are not the same "
+                                 f"lines. Nothing has been changed.")
+        print(f"    {chosen_rows:,} line(s), the same as the run's own.", flush=True)
 
     def explain(self) -> bool:
         print()
         print("  Agent 4 runs once over these finished runs together:")
         for folder in self.folders:
             print(f"    {folder}")
+            print(f"      purchase groups from {self._groups_file(folder)}")
         print("  In each run's all_agents_dataset.csv and .jsonl only the Agent4_ columns")
         print("  change; every other column stays exactly as it is. Agents 1, 2 and 3 do")
         print("  not run. Each run's own Agent 4 files are kept in")
@@ -3522,12 +3569,24 @@ class CombinedAgent4:
 def combine_agent4(args: argparse.Namespace) -> int:
     """``--combine-agent4``: one Agent 4 over several finished runs."""
     here = Path(__file__).resolve().parent
-    folders = []
-    for name in args.combine_agent4:
-        folder = Path(name).expanduser()
-        if not folder.is_absolute() and not folder.is_dir() and (here / folder).is_dir():
-            folder = here / folder
-        folders.append(folder.resolve())
+
+    def located(name: str) -> Path:
+        path = Path(name).expanduser()
+        if not path.is_absolute() and not path.exists() and (here / path).exists():
+            path = here / path
+        return path.resolve()
+
+    folders = [located(name) for name in args.combine_agent4]
+    groups_files: Dict[Path, Path] = {}
+    for pair in args.agent2_file or []:
+        folder_name, separator, file_name = pair.partition("=")
+        if not separator or not folder_name or not file_name:
+            raise SystemExit(f"--agent2-file takes FOLDER=FILE, not {pair!r}.")
+        folder = located(folder_name)
+        if folder not in folders:
+            raise SystemExit(f"--agent2-file names {folder_name}, which is not one of the "
+                             f"folders given to --combine-agent4.")
+        groups_files[folder] = located(file_name)
     combined = (Path(args.combined_results).expanduser() if args.combined_results
                 else here / COMBINED_AGENT4_DIR_NAME)
     settings = Settings(
@@ -3545,7 +3604,7 @@ def combine_agent4(args: argparse.Namespace) -> int:
         interactive=not args.non_interactive,
     )
     print(BANNER, flush=True)
-    job = CombinedAgent4(settings, folders)
+    job = CombinedAgent4(settings, folders, groups_files)
     job.check()
     if not job.explain():
         print("  Nothing has been changed.")
@@ -4189,6 +4248,10 @@ def build_parser() -> argparse.ArgumentParser:
     combine.add_argument("--combine-agent4", metavar="DIR", nargs="+",
                          help="finished results folders to run Agent 4 over together; "
                               "only the Agent4_ columns of their datasets change")
+    combine.add_argument("--agent2-file", metavar="FOLDER=FILE", action="append",
+                         help="read that folder's purchase groups from FILE instead of "
+                              "all_agents/agent2_purchase_groups.csv, e.g. a later "
+                              "regrouping; repeatable")
     combine.add_argument("--combined-results", metavar="DIR",
                          help="where the combined Agent 4 run is kept "
                               f"(default: {COMBINED_AGENT4_DIR_NAME})")

@@ -880,6 +880,18 @@ was. Supplier figures such as `Agent4_Supplier_Lines` then cover all the
 folders together. Agent 2 derives a group's id from its category and label, so
 the same group has the same id in every run and the runs compare directly.
 
+When a folder was later regrouped with a newer Agent 2, point Agent 4 at that
+output so every folder is compared on the same grouping logic:
+
+```
+python all_agents.py --combine-agent4 new_results_llm may_dec_results \
+    --agent2-file new_results_llm=new_results_llm/updated_agent2_v3_purchase_groups.csv
+```
+
+The file must hold the same lines as the folder's own Agent 2 output, row
+number and supplier alike, or the run refuses and changes nothing. The groups
+the dataset shows are not changed, only the Agent 4 columns.
+
 The combined Agent 4 files replace each folder's own in `all_agents/`, so a
 later plain run of the folder keeps the combined answer. The folder's own
 files are kept in `all_agents/agent4_own_run/`. Running the command again
