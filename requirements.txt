@@ -21,6 +21,10 @@ pandas>=2.0
 numpy>=1.24
 openpyxl>=3.1
 
+# The slide deck SpendAnalysis.py writes. Without it the workbook and report
+# are still written.
+python-pptx>=0.6.21
+
 # --- Classical NLP ---------------------------------------------------------
 # NLTK supplies the Snowball stemmers (which cover Finnish, Swedish, Norwegian,
 # Danish, German and Dutch), the stop-word lists and the collocation finder

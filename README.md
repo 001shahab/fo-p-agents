@@ -885,7 +885,7 @@ output so every folder is compared on the same grouping logic:
 
 ```
 python all_agents.py --combine-agent4 new_results_llm may_dec_results \
-    --agent2-file new_results_llm=new_results_llm/updated_agent2_v3_purchase_groups.csv
+    --agent2-file new_results_llm=new_results_llm/all_agents/updated_agent2_v3_purchase_groups.csv
 ```
 
 The file must hold the same lines as the folder's own Agent 2 output, row
@@ -898,6 +898,44 @@ files are kept in `all_agents/agent4_own_run/`. Running the command again
 reuses the combined Agent 4 unless `--force` is given. If Agent 4 later runs on
 one folder alone, for example because Agent 2 was rerun, the run warns that
 the combination has to be done again.
+
+Agent 4 before version 1.2.1 read an amount written with a decimal comma and
+three decimals, such as `108705,024`, as 108 million. Its similarity is
+weighted by spend, so a combination made before that fix should be run again.
+The combined Agent 4 is then rerun rather than reused, because the script has
+changed.
+
+### Spend analysis over the twelve months
+
+`SpendAnalysis.py` answers the questions of the spend analytics deck from the
+finished runs: spend transparency, tail spend, standardisation signals,
+catalogue opportunities, and the six questions on preferred suppliers, price
+variance, fragmentation, recurring free-text purchases, channel leakage and
+payment terms, with the value levers.
+
+```
+python SpendAnalysis.py
+```
+
+It reads `all_agents_dataset.csv` of `new_results_llm` and `may_dec_results`
+(or `results/<name>/`), or the files given with `--input`. Where a run has
+`all_agents/updated_agent2_v3_purchase_groups.csv`, those purchase groups are
+used. Run it after `--combine-agent4`, so the supplier findings compare all
+twelve months.
+
+Every figure is computed from the lines. The model judges the buying channel
+for the suppliers with recurring purchases and writes each answer from the
+figures; an answer that quotes a figure the analysis did not produce is
+rejected and replaced by a template. `--no-llm` uses rules and templates only.
+The output in `spend_analysis_results/` is a workbook with every table and
+definition, a slide deck, and the report as Markdown and HTML.
+
+Where the extract does not hold what a question asks for, the nearest evidence
+is used and the report says so: contract references stand in for a preferred
+supplier list (`--preferred-suppliers FILE` gives the real one), and paying
+before the due date stands in for early-payment discounts, which are not in
+the data. `--cost-of-capital`, `--target-payment-days` and
+`--rework-cost-per-document` set the payment and rework assumptions.
 
 ### One run at a time in a results folder
 
@@ -2617,6 +2655,7 @@ because their inputs and settings were unchanged. The summary marks each one
 ├── agent4.py                          Supplier consolidation
 ├── all_agents.py                      runs all four, returns the input table widened
 ├── max.py                             builds the wide table, then runs all four
+├── SpendAnalysis.py                   spend analysis over the finished runs
 ├── runtime.py                         shared by all of the above: reads .env,
 │                                      resolves the model endpoint, quiets the
 │                                      model hub's HTTP probes
@@ -2637,6 +2676,7 @@ sources/                               client data, including the item catalogue
 catalogues/                            an alternative place to keep catalogues for Agent 3
 results/                               generated output
 results/all_agents/                    each agent's own output and log from a runner
+spend_analysis_results/                SpendAnalysis.py's workbook, slides and report
 cache/                                 language-model responses, and Agent 3's
                                        catalogue translations
 lexicon/agent2_group_registry.json     stable group labels

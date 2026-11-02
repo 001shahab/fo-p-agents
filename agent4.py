@@ -115,7 +115,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent4")
 
 AGENT_NAME = "Agent 4 - AI Supplier Consolidation"
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.2.1"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -447,8 +447,12 @@ def parse_amount(value: Any) -> Optional[float]:
         decimal_sep = "," if text.rfind(",") > text.rfind(".") else "."
         text = text.replace("." if decimal_sep == "," else ",", "").replace(decimal_sep, ".")
     elif "," in text:
-        head, _, tail = text.rpartition(",")
-        text = head + tail if (len(tail) == 3 and head) else text.replace(",", ".")
+        # The extracts write a decimal comma and no thousands separator, so a
+        # single comma is the decimal point even with three digits after it:
+        # "108705,024" is 108,705.024 EUR, not 108 million.
+        text = text.replace(",", "") if text.count(",") > 1 else text.replace(",", ".")
+    elif text.count(".") > 1:
+        text = text.replace(".", "")
     try:
         amount = float(text)
     except ValueError:

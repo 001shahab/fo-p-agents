@@ -3532,6 +3532,21 @@ class CombinedAgent4:
             if source.is_file():
                 shutil.copy2(source, work / name)
 
+        # A later plain run of this folder must reuse the combined files rather
+        # than rerun Agent 4 on this run alone, so the record beside them names
+        # the Agent 4 script as it is now and the input that run would give it.
+        step = self.chain.new_step("agent4.py")
+        step_input = work / "agent2_purchase_groups.csv"
+        if step_input.is_file() and (work / step.output_name).is_file():
+            want = self.chain._fingerprint(
+                step, step_input, self.chain.arguments_for("agent4.py", step_input))
+            (work / f".{Path(step.script).stem}.reuse.json").write_text(
+                json.dumps({"fingerprint": want,
+                            "written": datetime.datetime.now().isoformat(timespec="seconds"),
+                            "output": step.output_name,
+                            "rows": count_rows(work / step.output_name)},
+                           indent=2), encoding="utf-8")
+
     def _note_in_manifest(self, folder: Path) -> None:
         path = folder / OUTPUT_MANIFEST
         try:
