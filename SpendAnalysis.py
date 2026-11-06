@@ -76,9 +76,10 @@ from runtime import SpendLimitReached, configure_process_logging, model_environm
 LOGGER = logging.getLogger("spend_analysis")
 
 AGENT_NAME = "Spend Analysis - AI Spend Analytics"
-AGENT_VERSION = "1.2.1"
+AGENT_VERSION = "1.3.0"
 
 DEFAULT_RUN_FOLDERS = ("new_results_llm", "may_dec_results")
+DEFAULT_CATEGORIES_L1 = ("Energy assets", "Indirect Services and Materials")
 DATASET_NAME = "all_agents_dataset.csv"
 COMBINED_DATASET_NAME = "all_agents_combined.csv"
 DATASET_NAMES = (COMBINED_DATASET_NAME, DATASET_NAME)
@@ -324,6 +325,8 @@ class RunInput:
     excluded_subtotal: int = 0
     excluded_duplicate: int = 0
     excluded_overlap: int = 0
+    excluded_category: int = 0
+    excluded_category_spend: float = 0.0
     overlap_periods: Set[str] = field(default_factory=set)
     unparsed_spend: int = 0
     periods: Counter = field(default_factory=Counter)
@@ -547,6 +550,7 @@ class Aggregates:
         self.preferred_spend = 0.0
 
         self.period_owner: Dict[str, str] = {}
+        self.keep_l1 = {norm_text(c) for c in settings.categories_l1}
         self.pay_lines = 0
         self.pay_excluded = 0
         self.term_spend: Counter = Counter()
@@ -575,6 +579,10 @@ class Aggregates:
             run.overlap_periods.add(period)
             return
         amount = parse_amount(get(row, "spend"))
+        if self.keep_l1 and norm_text(get(row, "l1")) not in self.keep_l1:
+            run.excluded_category += 1
+            run.excluded_category_spend += amount or 0.0
+            return
         if amount is None:
             run.unparsed_spend += 1
             amount = 0.0
@@ -849,6 +857,7 @@ class Settings:
     channel_suppliers: int = 400
     early_grace_days: int = 3
     pptx_template: Optional[Path] = None
+    categories_l1: Tuple[str, ...] = DEFAULT_CATEGORIES_L1
 
 
 def top_rows(counter: Counter, total: float, limit: int, lines: Optional[Counter] = None
@@ -2471,6 +2480,12 @@ def read_runs(settings: Settings) -> Tuple[Aggregates, List[RunInput]]:
             for row in reader:
                 data.add(run, row, get, preferred)
         print(f"    {run.lines:,} lines, {run.period}", flush=True)
+        if run.excluded_category:
+            run.notes.append(
+                f"{count(run.excluded_category)} lines ({eur(run.excluded_category_spend)}) "
+                f"outside Category L1 {' and '.join(settings.categories_l1)} were left out.")
+            print(f"    {run.excluded_category:,} lines ({eur(run.excluded_category_spend)}) "
+                  f"in other Category L1 left out", flush=True)
         if run.excluded_overlap:
             owners = sorted({data.period_owner[p] for p in run.overlap_periods})
             run.notes.append(
@@ -2493,6 +2508,7 @@ def overview_rows(data: Aggregates, runs: List[RunInput]) -> List[List[Any]]:
     periods = sorted(p for run in runs for p in run.periods if p)
     rows = [["Period", f"{periods[0]} to {periods[-1]}" if periods else "unknown"],
             ["Months", str(len(set(periods)))],
+            ["Category L1", " and ".join(data.settings.categories_l1) or "All categories"],
             ["Total spend", eur(data.spend)],
             ["Purchase lines", count(data.lines)],
             ["Suppliers", count(len(data.suppliers))],
@@ -2511,6 +2527,9 @@ def coverage_rows(runs: List[RunInput]) -> List[List[Any]]:
                  [run.name, "Duplicate rows left out", run.excluded_duplicate],
                  [run.name, "Rows in months already read from another run, left out",
                   run.excluded_overlap],
+                 [run.name, "Rows in other Category L1, left out", run.excluded_category],
+                 [run.name, "Spend in other Category L1, left out (EUR)",
+                  round(run.excluded_category_spend, 2)],
                  [run.name, "Lines with unreadable spend (counted as 0)", run.unparsed_spend],
                  [run.name, "Purchase groups", str(run.regroup_file or "as in the dataset")],
                  [run.name, "Columns not found", ", ".join(run.missing_fields) or "none"]]
@@ -2561,6 +2580,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="Share of spend held by non-tail suppliers (default 0.80).")
     parser.add_argument("--channel-suppliers", type=int, default=400,
                         help="Suppliers whose buying channel is judged (default 400).")
+    parser.add_argument("--category-l1", nargs="+", metavar="L1",
+                        default=list(DEFAULT_CATEGORIES_L1),
+                        help="Category L1 values to analyse (default: "
+                             f"{' and '.join(DEFAULT_CATEGORIES_L1)}); 'all' analyses every "
+                             "category.")
     parser.add_argument("--pptx-template", metavar="FILE",
                         help="PowerPoint template (.potx or .pptx) whose master, logo and "
                              "footer the slides are placed on, such as the PwC template.")
@@ -2593,7 +2617,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         project_line_eur=args.project_line_eur,
         tail_share=args.tail_share, channel_suppliers=args.channel_suppliers,
         pptx_template=Path(args.pptx_template).expanduser().resolve()
-        if args.pptx_template else None)
+        if args.pptx_template else None,
+        categories_l1=() if [c.casefold() for c in args.category_l1] == ["all"]
+        else tuple(args.category_l1))
     if settings.pptx_template is not None and not settings.pptx_template.is_file():
         raise SystemExit(f"Cannot read the template {settings.pptx_template}.")
 

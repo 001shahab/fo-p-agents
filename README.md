@@ -921,7 +921,11 @@ It reads `all_agents_combined.csv`, or else `all_agents_dataset.csv`, of
 `new_results_llm` and `may_dec_results` (or `results/<name>/`), or the files
 given with `--input`. A file Excel saved with semicolons is read as well. A
 month already read from an earlier run is not read again from a later one, so
-a combined file that repeats January to April does not count it twice. Where a run has
+a combined file that repeats January to April does not count it twice. Only
+Category L1 Energy assets and Indirect Services and Materials are analysed;
+the lines and spend of other categories are counted in the Coverage sheet.
+`--category-l1 L1 ...` names other categories and `--category-l1 all` analyses
+every category. Where a run has
 `all_agents/updated_agent2_v3_purchase_groups.csv`, those purchase groups are
 used. Run it after `--combine-agent4`, so the supplier findings compare all
 twelve months.
