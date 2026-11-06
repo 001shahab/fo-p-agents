@@ -59,11 +59,13 @@ import argparse
 import csv
 import datetime
 import html
+import io
 import json
 import logging
 import math
 import re
 import sys
+import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,7 +76,7 @@ from runtime import SpendLimitReached, configure_process_logging, model_environm
 LOGGER = logging.getLogger("spend_analysis")
 
 AGENT_NAME = "Spend Analysis - AI Spend Analytics"
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
 
 DEFAULT_RUN_FOLDERS = ("new_results_llm", "may_dec_results")
 DATASET_NAME = "all_agents_dataset.csv"
@@ -83,6 +85,15 @@ COMBINED_MARKER = ".agent4_combined.json"
 ORDER_TEXT_MARKER = ".order_text_update.json"
 AGENT4_FIXED_VERSION = (1, 2, 1)
 DEFAULT_OUTPUT_DIR = "spend_analysis_results"
+
+PWC_ORANGE = "D04A02"
+PWC_TANGERINE = "EB8C00"
+PWC_DARK_GREY = "2D2D2D"
+PWC_MID_GREY = "7D7D7D"
+PWC_LIGHT_GREY = "DEDEDE"
+PWC_PALE_GREY = "F2F2F2"
+HEADING_FONT = "Georgia"
+BODY_FONT = "Arial"
 UNCLASSIFIED = "Unclassified"
 
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
@@ -807,6 +818,7 @@ class Settings:
     tail_share: float = 0.80
     channel_suppliers: int = 400
     early_grace_days: int = 3
+    pptx_template: Optional[Path] = None
 
 
 def top_rows(counter: Counter, total: float, limit: int, lines: Optional[Counter] = None
@@ -1094,10 +1106,18 @@ class Analysis:
         s.fact("Suppliers assessed for buying channel", count(len(channels_of)))
         s.fact("Purchase types assessed for buying channel", count(len(self.channels)))
         s.fact("Suppliers needing more than one buying channel", count(mixed))
+        service = by_channel["Service catalogue / predefined request"][3] \
+            if "Service catalogue / predefined request" in by_channel else 0.0
+        material = sum(by_channel[c][3] for c in CATALOGUE_CHANNELS if c in by_channel)
+        s.fact("Recurring spend recommended for a catalogue (service or material)",
+               eur(service + material), True)
+        s.fact("Recurring spend recommended for a service catalogue", eur(service))
+        s.fact("Recurring spend recommended for a material catalogue", eur(material))
         for rank, (channel, entry) in enumerate(
                 sorted(by_channel.items(), key=lambda kv: -kv[1][3])[:4], 1):
-            s.fact(f"Channel #{rank}", f"{channel}: {count(len(entry[0]))} suppliers, "
-                                       f"{eur(entry[3])}")
+            s.fact(f"Recommended channel #{rank}",
+                   f"{channel}: {count(len(entry[0]))} suppliers, {eur(entry[3])} of "
+                   f"recurring spend")
         recurring_of: Counter = Counter()
         for (key, _), verdict in self.channels.items():
             recurring_of[key] += float(verdict.get("spend", 0))
@@ -1153,6 +1173,10 @@ class Analysis:
             "recurrently bought from, so one supplier can need a contract for one type and a "
             "catalogue for another. Recurring leasing, rent, services and subscriptions are "
             "steered to contracts or service catalogues rather than catalogues.",
+            "Recommended channel: the buying channel this analysis recommends for the "
+            "recurring purchases, not the channel they are bought through today. Material "
+            "catalogue covers supplier punch-out, internal catalogue items and vendor-managed "
+            "inventory.",
         ]
         return s
 
@@ -1729,7 +1753,9 @@ NARRATIVE_SYSTEM = (
     "Answer the question from the fact sheet only. Every figure you write must be copied "
     "exactly as it appears in the fact sheet, with its unit; do not compute, round or "
     "invent any other number. The headline must state the main figure that answers the "
-    "question. Be specific: name categories and suppliers from the facts. "
+    "question. Be specific: name categories and suppliers from the facts. A recommended "
+    "channel or suitability is this analysis's recommendation, not how the spend is bought "
+    "today; never describe it as existing coverage. "
     'Answer in JSON only: {"headline": "one sentence answer with its main figure", '
     '"answer": ["3 to 5 bullets"], "what_this_indicates": ["2 to 3 bullets on what to do"]}')
 
@@ -1919,7 +1945,13 @@ def template(section: Section) -> None:
             f"Project billing is set aside: {f['Project billing set aside']}.",
             f"{f['Suppliers needing more than one buying channel']} suppliers need more than "
             f"one buying channel.",
-            *(f[label] for label in ("Channel #1", "Channel #2", "Channel #3") if label in f),
+            f"Recommended for a catalogue: "
+            f"{f['Recurring spend recommended for a catalogue (service or material)']} "
+            f"({f['Recurring spend recommended for a service catalogue']} service, "
+            f"{f['Recurring spend recommended for a material catalogue']} material).",
+            *(f"Recommended: {f[label]}" for label in
+              ("Recommended channel #1", "Recommended channel #2", "Recommended channel #3")
+              if label in f),
         ]
         section.indicates = ["Start with the suppliers rated High suitability; send recurring "
                              "services and fees to contracts or service catalogues."]
@@ -2030,8 +2062,8 @@ def write_xlsx(path: Path, analysis: Analysis, overview: List[List[Any]],
                        "(pip install openpyxl).")
         return False
     book = Workbook()
-    bold = Font(bold=True, color="FFFFFF")
-    fill = PatternFill("solid", fgColor="1F4E79")
+    bold = Font(name=BODY_FONT, bold=True, color="FFFFFF")
+    fill = PatternFill("solid", fgColor=PWC_ORANGE)
     taken: Set[str] = set()
 
     def sheet(title: str, columns: List[str], rows: Iterable[List[Any]], first: bool = False):
@@ -2125,11 +2157,16 @@ def write_html(path: Path, analysis: Analysis, overview: List[List[Any]],
                notes: List[str]) -> None:
     e = html.escape
     parts = ["<!doctype html><html><head><meta charset='utf-8'><title>Spend analysis</title>",
-             "<style>body{font-family:Segoe UI,Arial,sans-serif;max-width:1100px;margin:2em auto;"
-             "color:#1b1b1b}h1,h2{color:#1F4E79}table{border-collapse:collapse;margin:.5em 0}"
-             "td,th{border:1px solid #ccc;padding:4px 8px;font-size:13px}th{background:#1F4E79;"
-             "color:#fff}.kpi{display:inline-block;margin:4px;padding:8px 12px;background:#eef3f8;"
-             "border-radius:6px}.q{color:#555;font-style:italic}</style></head><body>",
+             f"<style>body{{font-family:{BODY_FONT},sans-serif;max-width:1100px;margin:2em auto;"
+             f"color:#{PWC_DARK_GREY}}}h1,h2{{font-family:{HEADING_FONT},serif;font-weight:normal;"
+             f"color:#{PWC_DARK_GREY};border-bottom:3px solid #{PWC_ORANGE};padding-bottom:4px}}"
+             f"table{{border-collapse:collapse;margin:.5em 0}}td,th{{border:1px solid "
+             f"#{PWC_LIGHT_GREY};padding:4px 8px;font-size:13px}}th{{background:#{PWC_ORANGE};"
+             f"color:#fff}}tr:nth-child(odd) td{{background:#{PWC_PALE_GREY}}}"
+             f".kpi{{display:inline-block;margin:4px;padding:8px 12px;background:#{PWC_PALE_GREY};"
+             f"border-left:4px solid #{PWC_ORANGE}}}.kpi b{{color:#{PWC_ORANGE};font-family:"
+             f"{HEADING_FONT},serif;font-size:18px}}.q{{color:#{PWC_MID_GREY};font-style:italic}}"
+             f"</style></head><body>",
              "<h1>Spend analysis - twelve months</h1><ul>"]
     parts += [f"<li><b>{e(str(a))}:</b> {e(str(b))}</li>" for a, b in overview]
     parts.append("</ul>")
@@ -2161,80 +2198,208 @@ def write_html(path: Path, analysis: Analysis, overview: List[List[Any]],
     path.write_text("\n".join(parts), encoding="utf-8")
 
 
-def write_pptx(path: Path, analysis: Analysis, overview: List[List[Any]]) -> bool:
+def open_deck(template: Optional[Path]):
+    """A blank 16:9 deck, or the given PowerPoint template with its slides removed."""
+    from pptx import Presentation
+    from pptx.util import Inches
+    if template is None:
+        deck = Presentation()
+        deck.slide_width, deck.slide_height = Inches(13.333), Inches(7.5)
+        return deck
+    data = template.read_bytes()
+    if template.suffix.lower() == ".potx":
+        source = zipfile.ZipFile(io.BytesIO(data))
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as target:
+            for item in source.infolist():
+                content = source.read(item.filename)
+                if item.filename == "[Content_Types].xml":
+                    content = content.replace(b"presentationml.template.main+xml",
+                                              b"presentationml.presentation.main+xml")
+                target.writestr(item, content)
+        data = buffer.getvalue()
+    deck = Presentation(io.BytesIO(data))
+    slides = deck.slides._sldIdLst
+    for slide_id in list(slides):
+        deck.part.drop_rel(slide_id.rId)
+        slides.remove(slide_id)
+    return deck
+
+
+def write_pptx(path: Path, analysis: Analysis, overview: List[List[Any]],
+               template: Optional[Path] = None) -> bool:
     try:
-        from pptx import Presentation
         from pptx.chart.data import CategoryChartData
         from pptx.dml.color import RGBColor
-        from pptx.enum.chart import XL_CHART_TYPE
-        from pptx.util import Inches, Pt
+        from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION
+        from pptx.enum.shapes import MSO_SHAPE
+        from pptx.enum.text import PP_ALIGN
+        from pptx.util import Emu, Inches, Pt
     except ImportError:
         LOGGER.warning("python-pptx is not installed, so no slides were written "
                        "(pip install python-pptx).")
         return False
-    navy = RGBColor(0x1F, 0x4E, 0x79)
-    deck = Presentation()
-    deck.slide_width, deck.slide_height = Inches(13.333), Inches(7.5)
-    blank = deck.slide_layouts[6]
+    deck = open_deck(template)
+    sx = deck.slide_width / Inches(13.333)
+    sy = deck.slide_height / Inches(7.5)
+    layouts = list(deck.slide_layouts)
+    blank = next((x for x in layouts if "blank" in x.name.lower()),
+                 min(layouts, key=lambda x: len(x.placeholders)))
+    facts = dict((str(a), str(b)) for a, b in overview)
+    period = facts.get("Period", "")
 
-    def text(slide, left, top, width, height, lines, size=14, bold=False, color=None):
-        box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
-        frame = box.text_frame
-        frame.word_wrap = True
-        for at, line in enumerate(lines):
-            paragraph = frame.paragraphs[0] if at == 0 else frame.add_paragraph()
-            paragraph.text = line
-            paragraph.font.size = Pt(size)
-            paragraph.font.bold = bold
-            if color is not None:
-                paragraph.font.color.rgb = color
-        return box
+    def rgb(code: str):
+        return RGBColor.from_string(code)
 
-    slide = deck.slides.add_slide(blank)
-    text(slide, 0.6, 2.2, 12, 1.2, ["Spend analysis - twelve months"], 40, True, navy)
-    text(slide, 0.6, 3.5, 12, 3, [f"{a}: {b}" for a, b in overview], 16)
+    def at(left, top, width, height):
+        return (Emu(int(Inches(left) * sx)), Emu(int(Inches(top) * sy)),
+                Emu(int(Inches(width) * sx)), Emu(int(Inches(height) * sy)))
 
-    for s in analysis.sections:
+    def style(font, size, color=PWC_DARK_GREY, bold=False, face=BODY_FONT):
+        font.name, font.size, font.bold = face, Pt(size), bold
+        font.color.rgb = rgb(color)
+
+    def new_slide():
         slide = deck.slides.add_slide(blank)
-        text(slide, 0.5, 0.3, 12.3, 0.6, [s.title], 26, True, navy)
-        text(slide, 0.5, 0.9, 12.3, 0.9, [s.headline], 16, True)
-        for at, (label, value) in enumerate(s.kpis[:5]):
-            box = slide.shapes.add_shape(1, Inches(0.5), Inches(1.9 + at * 0.95), Inches(3.6),
-                                         Inches(0.85))
-            box.fill.solid()
-            box.fill.fore_color.rgb = RGBColor(0xEE, 0xF3, 0xF8)
-            box.line.fill.background()
-            frame = box.text_frame
-            frame.word_wrap = True
-            frame.paragraphs[0].text = value
-            frame.paragraphs[0].font.size = Pt(18)
-            frame.paragraphs[0].font.bold = True
-            frame.paragraphs[0].font.color.rgb = navy
-            label_line = frame.add_paragraph()
-            label_line.text = label
-            label_line.font.size = Pt(10)
-            label_line.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
+        for placeholder in list(slide.placeholders):
+            placeholder._element.getparent().remove(placeholder._element)
+        return slide
+
+    def rect(slide, left, top, width, height, fill):
+        shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, *at(left, top, width, height))
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = rgb(fill)
+        shape.line.fill.background()
+        shape.shadow.inherit = False
+        return shape
+
+    def write(frame, lines, size, color=PWC_DARK_GREY, bold=False, face=BODY_FONT,
+              bullet=False, align=None):
+        frame.word_wrap = True
+        for n, line in enumerate(lines):
+            paragraph = frame.paragraphs[0] if n == 0 else frame.add_paragraph()
+            if align is not None:
+                paragraph.alignment = align
+            if bullet:
+                mark = paragraph.add_run()
+                mark.text = "\u25A0  "
+                style(mark.font, max(size - 4, 6), PWC_ORANGE)
+            run = paragraph.add_run()
+            run.text = line
+            style(run.font, size, color, bold, face)
+            paragraph.space_after = Pt(round(size * 0.5))
+
+    def text(slide, left, top, width, height, lines, size, **kw):
+        shape = slide.shapes.add_textbox(*at(left, top, width, height))
+        frame = shape.text_frame
+        frame.margin_left = frame.margin_right = 0
+        write(frame, lines, size, **kw)
+        return shape
+
+    def footer(slide, number):
+        if template is not None:
+            return
+        rect(slide, 0.5, 7.0, 12.33, 0.01, PWC_LIGHT_GREY)
+        text(slide, 0.5, 7.05, 9.0, 0.3, [f"Spend analysis | {period}"], 9,
+             color=PWC_MID_GREY)
+        text(slide, 11.33, 7.05, 1.5, 0.3, [str(number)], 9, color=PWC_MID_GREY,
+             align=PP_ALIGN.RIGHT)
+
+    def heading(slide, kicker, title):
+        text(slide, 0.5, 0.35, 12.3, 0.35, [kicker], 12, color=PWC_ORANGE, bold=True)
+        text(slide, 0.5, 0.7, 12.3, 1.1, [title], 22 if len(title) <= 170 else 18,
+             face=HEADING_FONT)
+        rect(slide, 0.5, 1.82, 0.8, 0.05, PWC_ORANGE)
+
+    slide = new_slide()
+    rect(slide, 9.2, 0, 4.133, 7.5, PWC_ORANGE)
+    rect(slide, 9.2, 5.6, 4.133, 0.08, PWC_TANGERINE)
+    text(slide, 9.6, 5.85, 3.4, 1.0, [f"{AGENT_NAME} {AGENT_VERSION}"], 12, color="FFFFFF")
+    text(slide, 0.7, 1.6, 8.0, 1.5, ["Spend analysis"], 44, face=HEADING_FONT)
+    text(slide, 0.7, 2.75, 8.0, 0.6, [f"{facts.get('Months', '')} months of purchase data, "
+                                      f"{period}"], 18,
+         color=PWC_MID_GREY)
+    rect(slide, 0.7, 3.5, 0.8, 0.05, PWC_ORANGE)
+    text(slide, 0.7, 3.8, 8.0, 3.0, [f"{a}: {b}" for a, b in overview], 13)
+
+    slide = new_slide()
+    heading(slide, "Summary", "What the analysis found")
+    table = slide.shapes.add_table(len(analysis.sections) + 1, 2,
+                                   *at(0.5, 2.05, 12.33, 4.8)).table
+    table.horz_banding = table.first_row = False
+    table.columns[0].width = at(0, 0, 3.0, 0)[2]
+    table.columns[1].width = at(0, 0, 9.33, 0)[2]
+    rows = [("Topic", "Answer")] + [(s.title, s.headline) for s in analysis.sections]
+    for r, (topic, answer) in enumerate(rows):
+        table.rows[r].height = at(0, 0, 0, 0.36)[3]
+        for c, value in enumerate((topic, answer)):
+            cell = table.cell(r, c)
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = rgb(PWC_ORANGE if r == 0 else
+                                           PWC_PALE_GREY if r % 2 == 0 else "FFFFFF")
+            cell.margin_top = cell.margin_bottom = Pt(3)
+            cell.text_frame.text = ""
+            write(cell.text_frame, [value], 11 if r == 0 else 10,
+                  color="FFFFFF" if r == 0 else PWC_DARK_GREY, bold=r == 0 or c == 0)
+    footer(slide, 2)
+
+    for number, s in enumerate(analysis.sections, 3):
+        slide = new_slide()
+        heading(slide, s.title, s.headline)
+        for n, (label, value) in enumerate(s.kpis[:5]):
+            top = 2.1 + n * 0.95
+            rect(slide, 0.5, top, 3.6, 0.85, PWC_PALE_GREY)
+            rect(slide, 0.5, top, 0.07, 0.85, PWC_ORANGE)
+            box = text(slide, 0.72, top + 0.08, 3.3, 0.75, [value], 18, color=PWC_ORANGE,
+                       bold=True, face=HEADING_FONT)
+            run = box.text_frame.add_paragraph().add_run()
+            run.text = label
+            style(run.font, 10, PWC_MID_GREY)
         chart_table = next((t for t in s.tables if t.chart and t.rows), None)
         if chart_table is not None:
             category, value = chart_table.chart
             ci, vi = chart_table.columns.index(category), chart_table.columns.index(value)
             rows = [r for r in chart_table.rows if isinstance(r[vi], (int, float))][:8]
+            money = "EUR" in value
             data = CategoryChartData()
             data.categories = [str(r[ci])[:45] for r in reversed(rows)]
-            data.add_series(value, [float(r[vi]) for r in reversed(rows)])
-            frame = slide.shapes.add_chart(XL_CHART_TYPE.BAR_CLUSTERED, Inches(4.4),
-                                           Inches(1.9), Inches(8.4), Inches(3.3), data)
-            chart = frame.chart
+            data.add_series(value, [float(r[vi]) / (1e6 if money else 1)
+                                    for r in reversed(rows)])
+            chart = slide.shapes.add_chart(XL_CHART_TYPE.BAR_CLUSTERED,
+                                           *at(4.4, 2.05, 8.4, 3.2), data).chart
             chart.has_legend = False
             chart.has_title = True
-            chart.chart_title.text_frame.text = f"{value} - {chart_table.name}"
-            chart.chart_title.text_frame.paragraphs[0].font.size = Pt(12)
-            chart.category_axis.tick_labels.font.size = Pt(9)
-            chart.value_axis.tick_labels.font.size = Pt(9)
-            chart.plots[0].series[0].format.fill.solid()
-            chart.plots[0].series[0].format.fill.fore_color.rgb = navy
-        bullets = [f"• {b}" for b in [*s.answer[:3], *s.indicates[:1]]]
-        text(slide, 4.4, 5.3, 8.4, 2.0, bullets, 12)
+            chart.chart_title.text_frame.text = (
+                f"{chart_table.name}: {value.replace(' EUR', '')}"
+                f"{', EUR million' if money else ''}")
+            style(chart.chart_title.text_frame.paragraphs[0].runs[0].font, 11)
+            for axis in (chart.category_axis, chart.value_axis):
+                style(axis.tick_labels.font, 9, PWC_MID_GREY)
+                axis.format.line.color.rgb = rgb(PWC_LIGHT_GREY)
+            chart.value_axis.has_major_gridlines = True
+            chart.value_axis.major_gridlines.format.line.color.rgb = rgb(PWC_LIGHT_GREY)
+            chart.value_axis.tick_labels.number_format = "#,##0.0" if money else "#,##0"
+            chart.value_axis.tick_labels.number_format_is_linked = False
+            plot = chart.plots[0]
+            plot.gap_width = 60
+            plot.has_data_labels = True
+            labels = plot.data_labels
+            labels.number_format = "#,##0.0" if money else "#,##0"
+            labels.number_format_is_linked = False
+            labels.position = XL_LABEL_POSITION.OUTSIDE_END
+            style(labels.font, 9)
+            series = plot.series[0]
+            series.format.fill.solid()
+            series.format.fill.fore_color.rgb = rgb(PWC_ORANGE)
+            text(slide, 4.4, 5.35, 8.4, 1.6, [*s.answer[:3], *s.indicates[:1]], 11,
+                 bullet=True)
+        else:
+            text(slide, 4.4, 2.1, 8.4, 3.2, s.answer[:5], 12, bullet=True)
+            if s.indicates:
+                text(slide, 4.4, 5.3, 8.4, 0.3, ["What this indicates"], 12,
+                     color=PWC_ORANGE, bold=True)
+                text(slide, 4.4, 5.65, 8.4, 1.3, s.indicates[:2], 11, bullet=True)
+        footer(slide, number)
         notes = slide.notes_slide.notes_text_frame
         notes.text = "\n".join([s.question, *s.definitions, *s.caveats])
     deck.save(path)
@@ -2356,6 +2521,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="Share of spend held by non-tail suppliers (default 0.80).")
     parser.add_argument("--channel-suppliers", type=int, default=400,
                         help="Suppliers whose buying channel is judged (default 400).")
+    parser.add_argument("--pptx-template", metavar="FILE",
+                        help="PowerPoint template (.potx or .pptx) whose master, logo and "
+                             "footer the slides are placed on, such as the PwC template.")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
 
@@ -2383,7 +2551,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rework_cost=args.rework_cost_per_document, recurrence_min=args.recurrence_min,
         recurrence_months=args.recurrence_months, recurrence_documents=args.recurrence_invoices,
         project_line_eur=args.project_line_eur,
-        tail_share=args.tail_share, channel_suppliers=args.channel_suppliers)
+        tail_share=args.tail_share, channel_suppliers=args.channel_suppliers,
+        pptx_template=Path(args.pptx_template).expanduser().resolve()
+        if args.pptx_template else None)
+    if settings.pptx_template is not None and not settings.pptx_template.is_file():
+        raise SystemExit(f"Cannot read the template {settings.pptx_template}.")
 
     print(f"\n{AGENT_NAME} {AGENT_VERSION}\n", flush=True)
     if settings.use_llm:
@@ -2415,7 +2587,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if write_xlsx(xlsx, analysis, overview, coverage):
         outputs["workbook"] = xlsx.name
     pptx = settings.results_dir / "spend_analysis.pptx"
-    if write_pptx(pptx, analysis, overview):
+    if write_pptx(pptx, analysis, overview, settings.pptx_template):
         outputs["slides"] = pptx.name
     md = settings.results_dir / "spend_analysis_report.md"
     write_markdown(md, analysis, overview, notes)

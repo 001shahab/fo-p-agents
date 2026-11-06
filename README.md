@@ -928,7 +928,12 @@ for the suppliers with recurring purchases and writes each answer from the
 figures; an answer that quotes a figure the analysis did not produce is
 rejected and replaced by a template. `--no-llm` uses rules and templates only.
 The output in `spend_analysis_results/` is a workbook with every table and
-definition, a slide deck, and the report as Markdown and HTML.
+definition, a slide deck, and the report as Markdown and HTML. They use the PwC
+colours (orange `#D04A02`, tangerine and greys) with Georgia headings and Arial
+text; the deck has a cover, a summary of every answer, and one slide per
+question with its key figures, chart and speaker notes. `--pptx-template FILE`
+places the slides on a PowerPoint template (`.potx` or `.pptx`), such as the
+official PwC template, so its master, logo and footer are used.
 
 Where the extract does not hold what a question asks for, the nearest evidence
 is used and the report says so: contract references stand in for a preferred
