@@ -76,10 +76,12 @@ from runtime import SpendLimitReached, configure_process_logging, model_environm
 LOGGER = logging.getLogger("spend_analysis")
 
 AGENT_NAME = "Spend Analysis - AI Spend Analytics"
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.2.1"
 
 DEFAULT_RUN_FOLDERS = ("new_results_llm", "may_dec_results")
 DATASET_NAME = "all_agents_dataset.csv"
+COMBINED_DATASET_NAME = "all_agents_combined.csv"
+DATASET_NAMES = (COMBINED_DATASET_NAME, DATASET_NAME)
 REGROUPED_NAME = "updated_agent2_v3_purchase_groups.csv"
 COMBINED_MARKER = ".agent4_combined.json"
 ORDER_TEXT_MARKER = ".order_text_update.json"
@@ -321,6 +323,8 @@ class RunInput:
     regroup_hits: int = 0
     excluded_subtotal: int = 0
     excluded_duplicate: int = 0
+    excluded_overlap: int = 0
+    overlap_periods: Set[str] = field(default_factory=set)
     unparsed_spend: int = 0
     periods: Counter = field(default_factory=Counter)
     missing_fields: List[str] = field(default_factory=list)
@@ -338,14 +342,36 @@ class RunInput:
 def default_inputs(here: Path) -> List[Path]:
     found = []
     for name in DEFAULT_RUN_FOLDERS:
-        for folder in (here / name, here / "results" / name):
-            if (folder / DATASET_NAME).is_file():
-                found.append(folder / DATASET_NAME)
-                break
+        candidates = [folder / dataset for folder in (here / name, here / "results" / name)
+                      for dataset in DATASET_NAMES]
+        chosen = next((path for path in candidates if path.is_file()), None)
+        if chosen is not None:
+            found.append(chosen)
         else:
-            LOGGER.warning("No %s found for %s (looked in %s and %s).", DATASET_NAME, name,
-                           here / name, here / "results" / name)
+            LOGGER.warning("No %s found for %s (looked in %s and %s).",
+                           " or ".join(DATASET_NAMES), name, here / name,
+                           here / "results" / name)
     return found
+
+
+def dataset_rows(handle) -> Iterable[List[str]]:
+    """Rows of a dataset, also when Excel saved it with semicolons.
+
+    Excel in a European locale saves a comma file it opened as one column as
+    one quoted cell per row followed by semicolons; each cell is unwrapped.
+    """
+    first = handle.readline()
+    handle.seek(0)
+    head = first.rstrip("\r\n").lstrip("\ufeff")
+    body = head.rstrip(";")
+    if body != head and ";" not in body and "," in body:
+        for record in csv.reader(handle, delimiter=";"):
+            if record and record[0]:
+                yield next(csv.reader(io.StringIO(record[0])), [])
+    elif head.count(";") > head.count(","):
+        yield from csv.reader(handle, delimiter=";")
+    else:
+        yield from csv.reader(handle)
 
 
 def prepare_input(path: Path, keep_groups: bool) -> RunInput:
@@ -520,6 +546,7 @@ class Aggregates:
         self.contract_lines = 0
         self.preferred_spend = 0.0
 
+        self.period_owner: Dict[str, str] = {}
         self.pay_lines = 0
         self.pay_excluded = 0
         self.term_spend: Counter = Counter()
@@ -537,18 +564,21 @@ class Aggregates:
         if get(row, "duplicate").casefold() == "yes":
             run.excluded_duplicate += 1
             return
-        amount = parse_amount(get(row, "spend"))
-        if amount is None:
-            run.unparsed_spend += 1
-            amount = 0.0
-        run.lines += 1
-
         year, month = get(row, "year"), get(row, "month")
         posting = parse_date(get(row, "posting_date"))
         if year.isdigit() and month.isdigit():
             period = f"{int(year):04d}-{int(month):02d}"
         else:
             period = posting.strftime("%Y-%m") if posting else ""
+        if period and self.period_owner.setdefault(period, run.name) != run.name:
+            run.excluded_overlap += 1
+            run.overlap_periods.add(period)
+            return
+        amount = parse_amount(get(row, "spend"))
+        if amount is None:
+            run.unparsed_spend += 1
+            amount = 0.0
+        run.lines += 1
         run.periods[period] += 1
 
         name = get(row, "supplier_name") or "(no supplier)"
@@ -2431,8 +2461,8 @@ def read_runs(settings: Settings) -> Tuple[Aggregates, List[RunInput]]:
         runs.append(run)
         print(f"  Reading {run.name}/{path.name} ...", flush=True)
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.reader(handle)
-            header = next(reader, [])
+            reader = iter(dataset_rows(handle))
+            header = [cell.lstrip("\ufeff").strip() for cell in next(reader, [])]
             columns = Columns(header)
             run.missing_fields = columns.missing()
             if not columns.at["spend"]:
@@ -2441,6 +2471,14 @@ def read_runs(settings: Settings) -> Tuple[Aggregates, List[RunInput]]:
             for row in reader:
                 data.add(run, row, get, preferred)
         print(f"    {run.lines:,} lines, {run.period}", flush=True)
+        if run.excluded_overlap:
+            owners = sorted({data.period_owner[p] for p in run.overlap_periods})
+            run.notes.append(
+                f"{count(run.excluded_overlap)} lines in {', '.join(sorted(run.overlap_periods))} "
+                f"were left out because those months were already read from "
+                f"{', '.join(owners)}, so no month is counted twice.")
+            print(f"    {run.excluded_overlap:,} lines left out: their months were already "
+                  f"read from {', '.join(owners)}", flush=True)
         if run.regrouped and run.lines:
             coverage = run.regroup_hits / run.lines
             run.notes.append(f"Purchase groups from {REGROUPED_NAME} on "
@@ -2471,6 +2509,8 @@ def coverage_rows(runs: List[RunInput]) -> List[List[Any]]:
                  [run.name, "Lines analysed", run.lines],
                  [run.name, "Subtotal rows left out", run.excluded_subtotal],
                  [run.name, "Duplicate rows left out", run.excluded_duplicate],
+                 [run.name, "Rows in months already read from another run, left out",
+                  run.excluded_overlap],
                  [run.name, "Lines with unreadable spend (counted as 0)", run.unparsed_spend],
                  [run.name, "Purchase groups", str(run.regroup_file or "as in the dataset")],
                  [run.name, "Columns not found", ", ".join(run.missing_fields) or "none"]]

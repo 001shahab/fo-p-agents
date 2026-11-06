@@ -917,8 +917,11 @@ payment terms, with the value levers.
 python SpendAnalysis.py
 ```
 
-It reads `all_agents_dataset.csv` of `new_results_llm` and `may_dec_results`
-(or `results/<name>/`), or the files given with `--input`. Where a run has
+It reads `all_agents_combined.csv`, or else `all_agents_dataset.csv`, of
+`new_results_llm` and `may_dec_results` (or `results/<name>/`), or the files
+given with `--input`. A file Excel saved with semicolons is read as well. A
+month already read from an earlier run is not read again from a later one, so
+a combined file that repeats January to April does not count it twice. Where a run has
 `all_agents/updated_agent2_v3_purchase_groups.csv`, those purchase groups are
 used. Run it after `--combine-agent4`, so the supplier findings compare all
 twelve months.
