@@ -74,7 +74,7 @@ from runtime import SpendLimitReached, configure_process_logging, model_environm
 LOGGER = logging.getLogger("spend_analysis")
 
 AGENT_NAME = "Spend Analysis - AI Spend Analytics"
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 
 DEFAULT_RUN_FOLDERS = ("new_results_llm", "may_dec_results")
 DATASET_NAME = "all_agents_dataset.csv"
@@ -135,6 +135,7 @@ FIELDS: Dict[str, Tuple[str, ...]] = {
     "a4_band": ("Agent4_Similarity_Band",),
     "a4_similar": ("Agent4_Most_Similar_Supplier",),
     "a4_similar_key": ("Agent4_Most_Similar_Supplier_Key",),
+    "a4_same_country": ("Agent4_Same_Country",),
     "a4_similarity": ("Agent4_Similarity_Percent",),
     "a4_supplier_spend": ("Agent4_Supplier_Spend_EUR",),
     "a4_addressable": ("Agent4_Addressable_Spend_EUR",),
@@ -160,6 +161,13 @@ CHANNEL_INSTRUMENT = {
     "Vendor-managed inventory": "Framework agreement with VMI",
 }
 SUITABILITY = ("High", "Medium", "Low")
+CATALOGUE_CHANNELS = {"Supplier catalogue / punch-out", "Internal catalogue item",
+                      "Vendor-managed inventory"}
+PROJECT_WORDS = re.compile(
+    r"\b(project\w*|projekt\w*|reconstruct\w*|construct\w*|moderni[sz]\w*|retrofit\w*|"
+    r"refurbish\w*|renovat\w*|upgrad\w*|turn ?key|epc|commissioning|erection|"
+    r"replacement of|new build|extension of|milestone\w*|instal+ment\w*|"
+    r"advance payment|progress payment)\b", re.I)
 CONTRACT_WORDS = re.compile(
     r"\b(leas\w*|rent\w*|lease|subscription\w*|licen[cs]\w*|fee|fees|insurance|"
     r"utilit\w*|electricity|telecom\w*|mobile|broadband|maintenance agreement|"
@@ -218,6 +226,34 @@ def parse_date(value: Any) -> Optional[datetime.date]:
 def norm_text(value: Any) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
     return text.strip(" .;:,-")
+
+
+LEGAL_WORDS = {
+    "oy", "oyj", "ab", "abp", "as", "asa", "a/s", "aps", "gmbh", "ag", "kg", "sp", "z", "o.o",
+    "o.o.", "s.a", "s.a.", "sa", "s", "a", "ltd", "limited", "inc", "llc", "plc", "nv", "bv",
+    "srl", "spa", "uab", "sia", "ou", "kft", "co", "corp", "corporation", "company", "group",
+    "holding", "holdings", "the", "and", "&", "ky", "tmi", "ehf", "hf"}
+COUNTRY_WORDS = {
+    "finland", "suomi", "sweden", "sverige", "norway", "norge", "denmark", "danmark",
+    "poland", "polska", "polsko", "estonia", "eesti", "latvia", "latvija", "lithuania",
+    "lietuva", "germany", "deutschland", "uk", "nordic", "nordics", "baltic", "baltics",
+    "international", "europe", "emea", "india", "netherlands", "nederland"}
+
+
+def name_core(name: str) -> Tuple[str, ...]:
+    """A supplier name without its legal form and country, for spotting one group."""
+    words = re.findall(r"[\w&/.]+", str(name or "").casefold())
+    core = [w.strip(".") for w in words]
+    return tuple(w for w in core if w and w not in LEGAL_WORDS and w not in COUNTRY_WORDS
+                 and not w.isdigit())
+
+
+def same_group(left: str, right: str) -> bool:
+    """Whether two supplier names are entities of the same company group."""
+    a, b = name_core(left), name_core(right)
+    if not a or not b or a[0] != b[0]:
+        return False
+    return a == b or set(a) <= set(b) or set(b) <= set(a)
 
 
 def has_po(value: str) -> bool:
@@ -312,7 +348,7 @@ def prepare_input(path: Path, keep_groups: bool) -> RunInput:
                     run.regrouped[number] = ((row.get("AI_Purchase_Group_L5") or "").strip(),
                                              (row.get("AI_Purchase_Group_Id") or "").strip())
         run.regroup_file = regroup
-    if (path.parent / COMBINED_MARKER).is_file():
+    if (run.work / COMBINED_MARKER).is_file():
         run.notes.append("Agent 4 was run once over all runs together (--combine-agent4).")
     else:
         run.notes.append("Agent 4 was run on this run alone; its most similar suppliers "
@@ -328,7 +364,7 @@ def prepare_input(path: Path, keep_groups: bool) -> RunInput:
             f"similarity is weighted by spend, so rerun --combine-agent4 for corrected "
             f"supplier findings. Spend figures here are read from the lines and are not "
             f"affected.")
-    if (path.parent / ORDER_TEXT_MARKER).is_file():
+    if (run.work / ORDER_TEXT_MARKER).is_file():
         run.notes.append("Blank descriptions were filled from order and invoice text.")
     return run
 
@@ -393,6 +429,16 @@ class Combo:
     kinds: Counter = field(default_factory=Counter)
     l2: Counter = field(default_factory=Counter)
     group: Counter = field(default_factory=Counter)
+    months: Set[str] = field(default_factory=set)
+    documents: Set[str] = field(default_factory=set)
+
+    @property
+    def average(self) -> float:
+        return self.spend / self.lines if self.lines else 0.0
+
+    @property
+    def purchase_type(self) -> str:
+        return self.group.most_common(1)[0][0] if self.group else self.text
 
 
 @dataclass
@@ -580,6 +626,9 @@ class Aggregates:
                 combo.group[group_label] += 1
             if item_type.casefold() == "freetext":
                 combo.freetext += 1
+            if period:
+                combo.months.add(period)
+            combo.documents.add(document)
 
         # Agent 4, one finding per supplier and category
         if get(row, "a4_band") or get(row, "a4_potential"):
@@ -590,6 +639,7 @@ class Aggregates:
                     "similar": get(row, "a4_similar"),
                     "similar_key": get(row, "a4_similar_key"),
                     "similarity": get(row, "a4_similarity"),
+                    "same_country": get(row, "a4_same_country"),
                     "supplier_spend": get(row, "a4_supplier_spend"),
                     "addressable": get(row, "a4_addressable"),
                 }
@@ -751,6 +801,9 @@ class Settings:
     target_days: int = 60
     rework_cost: float = 0.0
     recurrence_min: int = 6
+    recurrence_months: int = 3
+    recurrence_documents: int = 3
+    project_line_eur: float = 100000.0
     tail_share: float = 0.80
     channel_suppliers: int = 400
     early_grace_days: int = 3
@@ -775,12 +828,14 @@ class Analysis:
         self.settings = settings
         self.runs = runs
         self.sections: List[Section] = []
-        self.channels: Dict[str, Dict[str, str]] = {}
+        self.channels: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.levers: List[List[Any]] = []
         self.figures: Dict[str, float] = {}
         self.preferred_given = settings.preferred_file is not None
         self._tail: Optional[Set[str]] = None
         self._recurring: Optional[List[Combo]] = None
+        self.projects: List[Combo] = []
+        self.sporadic: List[Combo] = []
 
     # -- shared --------------------------------------------------------------
 
@@ -798,13 +853,34 @@ class Analysis:
             self._tail = {k for k in self.data.suppliers if k not in head}
         return self._tail
 
+    def is_project(self, combo: Combo) -> bool:
+        """Instalments on one project rather than a purchase made again and again."""
+        average = combo.average
+        return (average >= self.settings.project_line_eur
+                or (average >= self.settings.project_line_eur / 5
+                    and bool(PROJECT_WORDS.search(combo.text))))
+
     def recurring(self) -> List[Combo]:
         if self._recurring is None:
-            self._recurring = sorted(
-                (c for c in self.data.combos.values()
-                 if c.lines >= self.settings.recurrence_min),
-                key=lambda c: -c.spend)
+            st = self.settings
+            recurring = []
+            for combo in self.data.combos.values():
+                if combo.lines < st.recurrence_min:
+                    continue
+                if self.is_project(combo):
+                    self.projects.append(combo)
+                elif (len(combo.months) < st.recurrence_months
+                      or len(combo.documents) < st.recurrence_documents):
+                    self.sporadic.append(combo)
+                else:
+                    recurring.append(combo)
+            self.projects.sort(key=lambda c: -c.spend)
+            self.sporadic.sort(key=lambda c: -c.spend)
+            self._recurring = sorted(recurring, key=lambda c: -c.spend)
         return self._recurring
+
+    def channel_of(self, combo: Combo) -> Dict[str, Any]:
+        return self.channels.get((combo.supplier, combo.purchase_type), {})
 
     def name_of(self, key: str) -> str:
         supplier = self.data.suppliers.get(key)
@@ -947,7 +1023,10 @@ class Analysis:
         high = Counter()
         high_spend = Counter()
         for (key, l2), finding in d.a4.items():
-            if finding["band"].casefold() == "high":
+            if (finding["band"].casefold() == "high"
+                    and finding["potential"].casefold() == "high"
+                    and finding["same_country"].casefold() == "yes"
+                    and not same_group(self.name_of(key), finding["similar"])):
                 high[l2] += 1
                 high_spend[l2] += d.supplier_l2.get((key, l2), 0.0)
         s.fact("New catalogue candidates (Agent 3)", count(len(candidates)), True)
@@ -976,76 +1055,104 @@ class Analysis:
             "New catalogue candidates: Agent 3's Catalogue_Candidate = Yes, counted once per "
             "description across runs.",
             "Potential catalogue match: Agent 3's Potential_Standard_Match = Yes.",
-            "High-similarity signal: a supplier and L2 that Agent 4 rates High similarity to "
-            "another supplier.",
+            "High-similarity signal: a supplier and L2 that Agent 4 rates High similarity and "
+            "High consolidation potential to a supplier in the same country, leaving out "
+            "entities of the same company group.",
         ]
         return s
 
     def catalogue(self) -> Section:
         d = self.data
-        n = self.settings.recurrence_min
+        st = self.settings
+        n = st.recurrence_min
         s = Section("catalogue", "Catalogue opportunities",
                     "Can catalogue opportunities be identified from the data?")
         repeats = sum(v for v in d.desc_lines.values() if v >= n)
         recurring = self.recurring()
         suppliers = {c.supplier for c in recurring}
-        by_channel: Dict[str, List[float]] = defaultdict(lambda: [0, 0, 0, 0.0])
+        by_channel: Dict[str, List[Any]] = defaultdict(lambda: [set(), 0, 0, 0.0])
         for c in recurring:
-            channel = self.channels.get(c.supplier, {}).get("channel", "Not assessed")
-            entry = by_channel[channel]
+            entry = by_channel[self.channel_of(c).get("channel", "Not assessed")]
+            entry[0].add(c.supplier)
             entry[1] += 1
             entry[2] += c.lines
             entry[3] += c.spend
-        for channel, entry in by_channel.items():
-            entry[0] = len({c.supplier for c in recurring
-                            if self.channels.get(c.supplier, {}).get("channel",
-                                                                     "Not assessed") == channel})
+        channels_of: Dict[str, Set[str]] = defaultdict(set)
+        for (key, _), verdict in self.channels.items():
+            channels_of[key].add(verdict["channel"])
+        mixed = sum(1 for found in channels_of.values() if len(found) > 1)
         s.fact("Minimum repeats", str(n))
         s.fact("Lines whose AI description repeats", count(repeats), True)
         s.fact("Recurring supplier-description combinations", count(len(recurring)), True)
         s.fact("Suppliers with recurring combinations", count(len(suppliers)), True)
         s.fact("Spend in recurring combinations", eur(sum(c.spend for c in recurring)), True)
-        s.fact("Suppliers assessed for buying channel", count(len(self.channels)))
+        s.fact("Project billing set aside", f"{count(len(self.projects))} combinations, "
+                                            f"{eur(sum(c.spend for c in self.projects))}")
+        s.fact("Repeats within too few months or invoices set aside",
+               f"{count(len(self.sporadic))} combinations, "
+               f"{eur(sum(c.spend for c in self.sporadic))}")
+        s.fact("Suppliers assessed for buying channel", count(len(channels_of)))
+        s.fact("Purchase types assessed for buying channel", count(len(self.channels)))
+        s.fact("Suppliers needing more than one buying channel", count(mixed))
         for rank, (channel, entry) in enumerate(
                 sorted(by_channel.items(), key=lambda kv: -kv[1][3])[:4], 1):
-            s.fact(f"Channel #{rank}", f"{channel}: {count(entry[0])} suppliers, "
+            s.fact(f"Channel #{rank}", f"{channel}: {count(len(entry[0]))} suppliers, "
                                        f"{eur(entry[3])}")
+        recurring_of: Counter = Counter()
+        for (key, _), verdict in self.channels.items():
+            recurring_of[key] += float(verdict.get("spend", 0))
         rows = []
-        for key, verdict in sorted(self.channels.items(),
-                                   key=lambda kv: -float(kv[1].get("spend", 0))):
-            rows.append([self.name_of(key), verdict.get("l2", ""), verdict.get("combos", 0),
-                         verdict.get("lines", 0), round(float(verdict.get("spend", 0)), 2),
+        for (key, _), verdict in sorted(self.channels.items(),
+                                        key=lambda kv: (-recurring_of[kv[0][0]], kv[0][0],
+                                                        -float(kv[1].get("spend", 0)))):
+            rows.append([self.name_of(key), verdict["type"], verdict.get("l2", ""),
+                         verdict.get("combos", 0), verdict.get("lines", 0),
+                         round(float(verdict.get("spend", 0)), 2),
                          verdict.get("examples", ""), verdict.get("suitability", ""),
                          verdict.get("channel", ""), verdict.get("rationale", ""),
                          verdict.get("source", "")])
         s.tables.append(Table(
-            "Supplier buying channels", ["Supplier", "Main category L2", "Recurring combinations",
-                                         "Recurring lines", "Recurring spend EUR",
-                                         "Recurring purchases", "Catalogue suitability",
-                                         "Preferred buying channel", "Rationale",
-                                         "Assessed by"], rows))
+            "Supplier buying channels", ["Supplier", "Purchase type", "Main category L2",
+                                         "Recurring combinations", "Recurring lines",
+                                         "Recurring spend EUR", "Recurring purchases",
+                                         "Catalogue suitability", "Preferred buying channel",
+                                         "Rationale", "Assessed by"], rows))
         s.tables.append(Table(
             "Recurring by channel", ["Preferred buying channel", "Suppliers", "Combinations",
                                      "Lines", "Spend EUR"],
-            [[k, int(v[0]), int(v[1]), int(v[2]), round(v[3], 2)]
+            [[k, len(v[0]), int(v[1]), int(v[2]), round(v[3], 2)]
              for k, v in sorted(by_channel.items(), key=lambda kv: -kv[1][3])],
             chart=("Preferred buying channel", "Spend EUR")))
         s.tables.append(Table(
-            "Recurring combinations", ["Supplier", "Purchase description", "Lines", "Spend EUR",
-                                       "Free-text lines", "Material or service", "Category L2",
+            "Recurring combinations", ["Supplier", "Purchase description", "Lines", "Months",
+                                       "Invoices", "Spend EUR", "Free-text lines",
+                                       "Material or service", "Category L2",
                                        "AI purchase group", "Preferred buying channel"],
-            [[self.name_of(c.supplier), c.text, c.lines, round(c.spend, 2), c.freetext,
-              c.kinds.most_common(1)[0][0], c.l2.most_common(1)[0][0],
-              c.group.most_common(1)[0][0] if c.group else "",
-              self.channels.get(c.supplier, {}).get("channel", "")] for c in recurring]))
+            [[self.name_of(c.supplier), c.text, c.lines, len(c.months), len(c.documents),
+              round(c.spend, 2), c.freetext, c.kinds.most_common(1)[0][0],
+              c.l2.most_common(1)[0][0], c.group.most_common(1)[0][0] if c.group else "",
+              self.channel_of(c).get("channel", "")] for c in recurring]))
+        s.tables.append(Table(
+            "Project billing", ["Supplier", "Purchase description", "Lines", "Months",
+                                "Invoices", "Average line EUR", "Spend EUR", "Category L2"],
+            [[self.name_of(c.supplier), c.text, c.lines, len(c.months), len(c.documents),
+              round(c.average, 2), round(c.spend, 2), c.l2.most_common(1)[0][0]]
+             for c in self.projects]))
         s.definitions += [
             f"AI description repeat: a line whose short AI description occurs at least {n} "
             f"times. Lines on standard items and lines without a clear description are left "
             f"out.",
             f"Recurring combination: one supplier and one AI description with at least {n} "
-            f"lines.",
-            "Recurring leasing, rent, services and subscriptions are steered to contracts or "
-            "service catalogues rather than catalogues.",
+            f"lines, bought in at least {st.recurrence_months} different months on at least "
+            f"{st.recurrence_documents} different invoices.",
+            f"Project billing: instalments of one project rather than repeat purchases - an "
+            f"average line of {eur(st.project_line_eur)} or more, or "
+            f"{eur(st.project_line_eur / 5)} or more with project wording such as "
+            f"reconstruction or modernisation. Set aside and listed separately.",
+            "Buying channel: judged for each purchase type (AI purchase group) a supplier is "
+            "recurrently bought from, so one supplier can need a contract for one type and a "
+            "catalogue for another. Recurring leasing, rent, services and subscriptions are "
+            "steered to contracts or service catalogues rather than catalogues.",
         ]
         return s
 
@@ -1195,6 +1302,8 @@ class Analysis:
         addressable_total = 0.0
         by_l2: Dict[str, List[float]] = defaultdict(lambda: [0, 0.0, 0.0])
         moves = []
+        group_moves = 0
+        group_spend = 0.0
         assessed = 0.0
         for (key, l2), finding in d.a4.items():
             spend = d.supplier_l2.get((key, l2), 0.0)
@@ -1213,12 +1322,19 @@ class Analysis:
             entry[2] += movable
             addressable_total += movable
             if potential == "High" and partner > spend:
-                realistic += movable
-                entry[1] += movable
-                moves.append([self.name_of(key), l2, round(spend, 2),
-                              finding["similar"] or self.name_of(finding["similar_key"]),
-                              round(partner, 2), finding["similarity"], round(movable, 2)])
-        moves.sort(key=lambda r: -r[6])
+                target = finding["similar"] or self.name_of(finding["similar_key"])
+                one_group = same_group(self.name_of(key), target)
+                if one_group:
+                    group_moves += 1
+                    group_spend += movable
+                else:
+                    realistic += movable
+                    entry[1] += movable
+                moves.append([self.name_of(key), l2, round(spend, 2), target,
+                              round(partner, 2), finding["similarity"], round(movable, 2),
+                              "Yes" if one_group else "No"])
+        moves.sort(key=lambda r: (r[7] == "Yes", -r[6]))
+        real_moves = [m for m in moves if m[7] == "No"]
         self.figures["consolidatable_high"] = realistic
         self.figures["consolidatable_high_medium"] = addressable_total
         s.fact("Fragmented AI purchase groups", count(len(rows)), True)
@@ -1226,14 +1342,14 @@ class Analysis:
         s.fact("Spend assessed by Agent 4", eur(assessed))
         s.fact("Realistically consolidatable spend", eur(realistic), True)
         s.fact("Realistically consolidatable share of spend", pct(realistic, d.spend), True)
-        s.fact("Supplier moves behind it", count(len(moves)))
-        s.fact("Upper bound (all High and Medium overlap)", eur(addressable_total))
-        s.fact("Upper bound share of spend", pct(addressable_total, d.spend))
+        s.fact("Supplier moves behind it", count(len(real_moves)))
+        s.fact("Moves between entities of one supplier group, left out",
+               f"{count(group_moves)} moves, {eur(group_spend)}")
         l2_rows = sorted(([l2, int(v[0]), round(v[1], 2), round(v[2], 2)]
                           for l2, v in by_l2.items()), key=lambda r: -r[2])
         for rank, row in enumerate(sorted(l2_rows, key=lambda r: -r[2])[:3], 1):
             s.fact(f"Consolidation category #{rank}", f"{row[0]}: {eur(row[2])} realistic")
-        for rank, row in enumerate(moves[:3], 1):
+        for rank, row in enumerate(real_moves[:3], 1):
             s.fact(f"Largest move #{rank}", f"{row[0]} to {row[3]} in {row[1]}: {eur(row[6])}")
         l2_rows.sort(key=lambda r: -r[2])
         s.tables.append(Table(
@@ -1243,7 +1359,7 @@ class Analysis:
         s.tables.append(Table(
             "Consolidation moves", ["Supplier", "Category L2", "Supplier spend EUR",
                                     "Move to", "Partner spend EUR", "Similarity %",
-                                    "Movable spend EUR"], moves))
+                                    "Movable spend EUR", "Same supplier group"], moves))
         s.tables.append(Table(
             "Fragmented groups", ["AI purchase group", "Category L2", "Suppliers",
                                   "Largest supplier share %", "HHI", "Business areas",
@@ -1258,8 +1374,12 @@ class Analysis:
             "Realistic: movable spend of suppliers Agent 4 rates High potential, counted only "
             "when the most similar supplier is the larger of the two in that L2, so each "
             "pair is counted once and in the direction volume would move.",
-            "Upper bound: movable spend of every supplier rated High or Medium, in both "
-            "directions.",
+            "A move between two entities of one company group (the same name apart from "
+            "legal form and country, such as a Finnish and a Swedish subsidiary) is a vendor "
+            "master question rather than consolidation. Such moves are listed with Same "
+            "supplier group = Yes and left out of the realistic figure.",
+            "The upper bound column counts every supplier rated High or Medium, in both "
+            "directions; it is a ceiling, not an estimate.",
         ]
         return s
 
@@ -1271,7 +1391,7 @@ class Analysis:
         by_instrument: Dict[str, List[float]] = defaultdict(lambda: [0, 0, 0.0])
         suppliers_by_instrument: Dict[str, Set[str]] = defaultdict(set)
         for c in recurring:
-            channel = self.channels.get(c.supplier, {}).get("channel", "")
+            channel = self.channel_of(c).get("channel", "")
             instrument = CHANNEL_INSTRUMENT.get(channel, "Not assessed")
             entry = by_instrument[instrument]
             entry[1] += c.lines
@@ -1282,21 +1402,21 @@ class Analysis:
         freetext = [c for c in recurring if c.freetext]
         recurring_spend = sum(c.spend for c in recurring)
         suitable = sum(c.spend for c in recurring
-                       if self.channels.get(c.supplier, {}).get("suitability") in {"High",
-                                                                                   "Medium"})
+                       if self.channel_of(c).get("suitability") in {"High", "Medium"}
+                       and self.channel_of(c).get("channel") in CATALOGUE_CHANNELS)
         self.figures["standardisation_spend"] = suitable
         s.fact("Recurring non-catalogue spend", eur(recurring_spend), True)
         s.fact("Recurring combinations marked free text", count(len(freetext)))
         s.fact("Spend in recurring combinations marked free text",
                eur(sum(c.spend for c in freetext)))
-        s.fact("Recurring spend rated High or Medium catalogue suitability", eur(suitable), True)
+        s.fact("Recurring spend suited to a catalogue or standard item", eur(suitable), True)
         for rank, (instrument, entry) in enumerate(
                 sorted(by_instrument.items(), key=lambda kv: -kv[1][2])[:4], 1):
             s.fact(f"Convert to #{rank}", f"{instrument}: {eur(entry[2])}, "
                                           f"{count(entry[0])} suppliers", rank <= 2)
         examples = []
         for c in recurring[:5]:
-            channel = self.channels.get(c.supplier, {}).get("channel", "")
+            channel = self.channel_of(c).get("channel", "")
             examples.append(f"{self.name_of(c.supplier)} - {c.text[:70]}: {eur(c.spend)}, "
                             f"{count(c.lines)} lines, {CHANNEL_INSTRUMENT.get(channel, '')}")
         for rank, example in enumerate(examples, 1):
@@ -1312,7 +1432,8 @@ class Analysis:
             "purchases. Item_Type marks free text explicitly on only part of the lines, so "
             "every non-catalogue recurring purchase is included and the explicitly marked "
             "ones are counted separately.",
-            "The instrument follows the preferred buying channel judged for the supplier: "
+            "The instrument follows the preferred buying channel judged for the purchase "
+            "type: "
             "supplier catalogue to catalogue, internal catalogue item to standard item, "
             "contract or predefined request to framework agreement, service catalogue to "
             "service catalogue or framework.",
@@ -1511,8 +1632,9 @@ class Analysis:
             "Supplier consolidation base: realistically consolidatable spend (see Supplier "
             "fragmentation and consolidation).",
             "Compliance base: off-channel spend.",
-            "Standardisation base: recurring spend at suppliers rated High or Medium "
-            "catalogue suitability.",
+            "Standardisation base: recurring spend rated High or Medium catalogue "
+            "suitability and sent to a catalogue, catalogue item or vendor-managed "
+            "inventory.",
             "Payment terms: low moves each supplier by up to 15 days, high to the target.",
             "The levers overlap (the same spend can be consolidated and harmonised), so "
             "the total is not additive.",
@@ -1522,32 +1644,37 @@ class Analysis:
     # -- buying channels -----------------------------------------------------
 
     def channel_payloads(self) -> List[Dict[str, Any]]:
-        by_supplier: Dict[str, List[Combo]] = defaultdict(list)
+        """Each supplier's recurring purchases, gathered by purchase type."""
+        by_supplier: Dict[str, Dict[str, List[Combo]]] = defaultdict(lambda: defaultdict(list))
         for combo in self.recurring():
-            by_supplier[combo.supplier].append(combo)
-        ranked = sorted(by_supplier.items(), key=lambda kv: -sum(c.spend for c in kv[1]))
+            by_supplier[combo.supplier][combo.purchase_type].append(combo)
+        ranked = sorted(by_supplier.items(),
+                        key=lambda kv: -sum(c.spend for cs in kv[1].values() for c in cs))
         payloads = []
-        for key, combos in ranked[:self.settings.channel_suppliers]:
+        for key, types in ranked[:self.settings.channel_suppliers]:
             supplier = self.data.suppliers[key]
-            kinds = Counter()
-            for c in combos:
-                kinds.update(c.kinds)
-            top = sorted(combos, key=lambda c: -c.spend)[:8]
-            payloads.append({
-                "id": key,
-                "supplier": supplier.name,
-                "category_l2": supplier.main_l2,
-                "combos": len(combos),
-                "lines": sum(c.lines for c in combos),
-                "spend": round(sum(c.spend for c in combos), 2),
-                "material_lines": kinds.get("Material", 0),
-                "service_lines": kinds.get("Service", 0),
-                "freetext_lines": sum(c.freetext for c in combos),
-                "recurring_purchases": [
-                    {"description": c.text[:160], "lines": c.lines,
-                     "spend_eur": round(c.spend), "group": c.group.most_common(1)[0][0]
-                     if c.group else ""} for c in top],
-            })
+            entries = []
+            for at, (label, combos) in enumerate(
+                    sorted(types.items(), key=lambda kv: -sum(c.spend for c in kv[1])), 1):
+                kinds = Counter()
+                months: Set[str] = set()
+                for c in combos:
+                    kinds.update(c.kinds)
+                    months |= c.months
+                top = sorted(combos, key=lambda c: -c.spend)
+                entries.append({
+                    "type_id": f"t{at}",
+                    "purchase_type": label,
+                    "examples": [c.text[:140] for c in top[:3]],
+                    "lines": sum(c.lines for c in combos),
+                    "months_bought": len(months),
+                    "material_lines": kinds.get("Material", 0),
+                    "service_lines": kinds.get("Service", 0),
+                    "_combos": len(combos),
+                    "_spend": round(sum(c.spend for c in combos), 2),
+                })
+            payloads.append({"id": key, "supplier": supplier.name,
+                             "category_l2": supplier.main_l2, "purchase_types": entries})
         return payloads
 
 
@@ -1560,24 +1687,23 @@ def quantile(values: Sequence[float], q: float) -> float:
     return values[lower] + (values[upper] - values[lower]) * (position - lower)
 
 
-def rule_channel(payload: Dict[str, Any]) -> Dict[str, str]:
-    text = " ".join(p["description"] for p in payload["recurring_purchases"])
-    material, service = payload["material_lines"], payload["service_lines"]
+def rule_channel(entry: Dict[str, Any]) -> Dict[str, str]:
+    text = " ".join([entry["purchase_type"], *entry["examples"]])
+    material, service = entry["material_lines"], entry["service_lines"]
     if CONTRACT_WORDS.search(text):
         return {"suitability": "Low", "channel": "Contract / predefined request",
                 "rationale": "Recurring leasing, rent, fees or subscriptions belong under a "
                              "contract rather than in a catalogue."}
     if service > material:
         return {"suitability": "Medium", "channel": "Service catalogue / predefined request",
-                "rationale": "Mostly recurring services, which suit a predefined request or "
+                "rationale": "Recurring services, which suit a predefined request or "
                              "service catalogue."}
-    if payload["combos"] >= 3:
+    if entry["_combos"] >= 3:
         return {"suitability": "High", "channel": "Supplier catalogue / punch-out",
-                "rationale": "Several repeat-bought materials from one supplier suit a "
-                             "supplier catalogue or punch-out."}
+                "rationale": "Several repeat-bought materials of one type suit a supplier "
+                             "catalogue or punch-out."}
     return {"suitability": "Medium", "channel": "Internal catalogue item",
-            "rationale": "A few repeat-bought materials that can be set up as catalogue "
-                         "items."}
+            "rationale": "A repeat-bought material that can be set up as a catalogue item."}
 
 
 # ---------------------------------------------------------------------------
@@ -1586,23 +1712,30 @@ def rule_channel(payload: Dict[str, Any]) -> Dict[str, str]:
 
 CHANNEL_SYSTEM = (
     "You are a senior procurement category manager at a Nordic energy utility. For each "
-    "supplier you are given its recurring purchases (same description bought repeatedly, "
-    "outside any catalogue). Judge how suitable they are for a catalogue and the best "
-    "buying channel. Leasing, rent, subscriptions, licences, fees and recurring services "
-    "belong under contracts or service catalogues, not catalogues. Answer in JSON only: "
-    '{"suppliers": [{"id": "...", "catalogue_suitability": "High|Medium|Low", '
+    "supplier you are given its recurring purchases (bought repeatedly over several months, "
+    "outside any catalogue), gathered by purchase type. Judge, for each purchase type on "
+    "its own, how suitable it is for a catalogue and the best buying channel: one "
+    "supplier often needs different channels, for example telephone subscriptions "
+    "under a contract and device accessories from a catalogue. Leasing, rent, "
+    "subscriptions, licences, fees and recurring services belong under contracts or "
+    "service catalogues, not catalogues. Answer in JSON only: "
+    '{"suppliers": [{"id": "...", "purchase_types": [{"type_id": "t1", '
+    '"catalogue_suitability": "High|Medium|Low", '
     '"preferred_channel": one of ' + json.dumps(list(CHANNELS)) + ', '
-    '"rationale": "one sentence naming what is bought"}]}')
+    '"rationale": "one sentence naming what is bought"}]}]}')
 
 NARRATIVE_SYSTEM = (
     "You are a procurement spend analyst writing for Fortum's procurement leadership. "
     "Answer the question from the fact sheet only. Every figure you write must be copied "
     "exactly as it appears in the fact sheet, with its unit; do not compute, round or "
-    "invent any other number. Be specific: name categories and suppliers from the facts. "
-    'Answer in JSON only: {"headline": "one sentence answer", "answer": ["3 to 5 bullets"], '
-    '"what_this_indicates": ["2 to 3 bullets on what to do"]}')
+    "invent any other number. The headline must state the main figure that answers the "
+    "question. Be specific: name categories and suppliers from the facts. "
+    'Answer in JSON only: {"headline": "one sentence answer with its main figure", '
+    '"answer": ["3 to 5 bullets"], "what_this_indicates": ["2 to 3 bullets on what to do"]}')
 
 NUMBER = re.compile(r"\d[\d,.]*\d|\d")
+SMALL_NUMBERS = {str(n) for n in range(0, 13)}
+MODEL_TYPES = 8
 
 
 def number_tokens(text: str) -> Set[str]:
@@ -1644,36 +1777,48 @@ class ModelWriter:
             self.client.store(key, json.dumps(answer, ensure_ascii=False))
         return answer
 
-    def classify(self, payloads: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
-        verdicts: Dict[str, Dict[str, str]] = {}
+    def classify(self, payloads: List[Dict[str, Any]]
+                 ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        verdicts: Dict[Tuple[str, str], Dict[str, Any]] = {}
         if payloads:
-            print(f"  Judging buying channels for {len(payloads):,} suppliers "
+            types = sum(len(p["purchase_types"]) for p in payloads)
+            print(f"  Judging buying channels for {types:,} purchase types of "
+                  f"{len(payloads):,} suppliers "
                   f"{'with the model' if self.client else 'by rule'} ...", flush=True)
-        for start in range(0, len(payloads), 10):
-            batch = payloads[start:start + 10]
-            answers: Dict[str, Dict[str, Any]] = {}
-            reply = self._ask("channel", CHANNEL_SYSTEM, {"suppliers": [
-                {k: v for k, v in p.items() if k != "spend"} for p in batch]})
+        size = 5
+        for start in range(0, len(payloads), size):
+            batch = payloads[start:start + size]
+            sent = [{"id": p["id"], "supplier": p["supplier"],
+                     "category_l2": p["category_l2"],
+                     "purchase_types": [{k: v for k, v in e.items() if not k.startswith("_")}
+                                        for e in p["purchase_types"][:MODEL_TYPES]]}
+                    for p in batch]
+            reply = self._ask("channel_by_type", CHANNEL_SYSTEM, {"suppliers": sent})
+            answers: Dict[Tuple[str, str], Dict[str, Any]] = {}
             for item in (reply or {}).get("suppliers", []) or []:
-                if isinstance(item, dict) and item.get("id"):
-                    answers[str(item["id"])] = item
+                if not isinstance(item, dict):
+                    continue
+                for judged in item.get("purchase_types", []) or []:
+                    if isinstance(judged, dict):
+                        answers[(str(item.get("id")), str(judged.get("type_id")))] = judged
             for payload in batch:
-                item = answers.get(payload["id"], {})
-                suitability = str(item.get("catalogue_suitability", "")).title()
-                channel = str(item.get("preferred_channel", ""))
-                rationale = str(item.get("rationale", "")).strip()
-                if suitability in SUITABILITY and channel in CHANNELS and rationale:
-                    verdict = {"suitability": suitability, "channel": channel,
-                               "rationale": rationale, "source": "model"}
-                else:
-                    verdict = {**rule_channel(payload), "source": "rules"}
-                verdict.update({
-                    "l2": payload["category_l2"], "combos": payload["combos"],
-                    "lines": payload["lines"], "spend": payload["spend"],
-                    "examples": "; ".join(p["description"][:60]
-                                          for p in payload["recurring_purchases"][:3])})
-                verdicts[payload["id"]] = verdict
-            if self.client is not None and (start // 10) % 5 == 4:
+                for entry in payload["purchase_types"]:
+                    item = answers.get((payload["id"], entry["type_id"]), {})
+                    suitability = str(item.get("catalogue_suitability", "")).title()
+                    channel = str(item.get("preferred_channel", ""))
+                    rationale = str(item.get("rationale", "")).strip()
+                    if suitability in SUITABILITY and channel in CHANNELS and rationale:
+                        verdict = {"suitability": suitability, "channel": channel,
+                                   "rationale": rationale, "source": "model"}
+                    else:
+                        verdict = {**rule_channel(entry), "source": "rules"}
+                    verdict.update({
+                        "supplier": payload["id"], "type": entry["purchase_type"],
+                        "l2": payload["category_l2"], "combos": entry["_combos"],
+                        "lines": entry["lines"], "spend": entry["_spend"],
+                        "examples": "; ".join(x[:60] for x in entry["examples"])})
+                    verdicts[(payload["id"], entry["purchase_type"])] = verdict
+            if self.client is not None and (start // size) % 10 == 9:
                 self.client.save_cache()
         return verdicts
 
@@ -1684,9 +1829,10 @@ class ModelWriter:
         payload = {"question": section.question, "topic": section.title,
                    "facts": section.facts, "definitions": section.definitions}
         allowed = set()
-        for value in [*section.facts.values(), *section.definitions, section.question]:
+        for value in [*section.facts, *section.facts.values(), *section.definitions,
+                      section.question]:
             allowed |= number_tokens(value)
-        allowed |= {str(n) for n in range(0, 13)}
+        allowed |= SMALL_NUMBERS
         for attempt in range(2):
             reply = self._ask(f"narrative{attempt}", NARRATIVE_SYSTEM, payload)
             if not isinstance(reply, dict):
@@ -1698,16 +1844,19 @@ class ModelWriter:
             if not headline or not answer:
                 return
             stray = number_tokens(" ".join([headline, *answer, *indicates])) - allowed
-            if not stray:
+            figure = bool(number_tokens(headline) & allowed - SMALL_NUMBERS)
+            if not stray and figure:
                 section.headline, section.answer, section.indicates = headline, answer, indicates
                 section.written_by = "model"
                 return
-            LOGGER.info("The answer to %s used figures not in its facts (%s)%s.",
-                        section.title, ", ".join(sorted(stray)[:5]),
+            problem = (f"used figures that are not in the fact sheet: "
+                       f"{', '.join(sorted(stray)[:10])}" if stray
+                       else "has a headline that states no figure from the fact sheet")
+            LOGGER.info("The answer to %s %s%s.", section.title, problem,
                         "; asking again" if attempt == 0 else "; using the template")
-            payload = {**payload, "note": "Your previous answer used figures that are not in "
-                                          "the fact sheet: " + ", ".join(sorted(stray)[:10])
-                                          + ". Use only figures exactly as written there."}
+            payload = {**payload, "note": f"Your previous answer {problem}. Use only figures "
+                                          f"exactly as written there, and put the main one "
+                                          f"in the headline."}
 
     def usage(self) -> Dict[str, Any]:
         return self.client.usage.as_dict() if self.client is not None else {}
@@ -1767,6 +1916,9 @@ def template(section: Section) -> None:
         section.answer = [
             f"{f['Lines whose AI description repeats']} lines repeat an AI description at least "
             f"{f['Minimum repeats']} times.",
+            f"Project billing is set aside: {f['Project billing set aside']}.",
+            f"{f['Suppliers needing more than one buying channel']} suppliers need more than "
+            f"one buying channel.",
             *(f[label] for label in ("Channel #1", "Channel #2", "Channel #3") if label in f),
         ]
         section.indicates = ["Start with the suppliers rated High suitability; send recurring "
@@ -1804,15 +1956,18 @@ def template(section: Section) -> None:
         section.answer = [
             f"{f['Fragmented AI purchase groups']} purchase groups are fragmented, with "
             f"{f['Spend in fragmented groups']} of spend.",
-            f"The upper bound, counting every High and Medium overlap, is "
-            f"{f['Upper bound (all High and Medium overlap)']}.",
+            f"It rests on {f['Supplier moves behind it']} moves from a smaller supplier to a "
+            f"larger, similar one; moves within one supplier group are left out "
+            f"({f['Moves between entities of one supplier group, left out']}).",
             *(f[label] for label in ("Consolidation category #1", "Largest move #1")
               if label in f),
         ]
         section.indicates = ["Tender the fragmented groups with the most suppliers first."]
     elif k == "q4":
-        section.headline = (f"{f['Recurring spend rated High or Medium catalogue suitability']} of "
-                            f"recurring purchases suit a catalogue, standard item or framework.")
+        section.headline = (f"{f['Recurring spend suited to a catalogue or standard item']} of "
+                            f"the {f['Recurring non-catalogue spend']} of recurring purchases "
+                            f"suits a catalogue or standard item; the rest belongs under "
+                            f"framework agreements and service catalogues.")
         section.answer = [f.get(label, "") for label in ("Convert to #1", "Convert to #2",
                                                          "Convert to #3") if label in f]
         section.answer.insert(0, f"Recurring non-catalogue spend is "
@@ -2189,6 +2344,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                              "not costed).")
     parser.add_argument("--recurrence-min", type=int, default=6,
                         help="Lines for a purchase to count as recurring (default 6).")
+    parser.add_argument("--recurrence-months", type=int, default=3,
+                        help="Different months a recurring purchase is bought in (default 3).")
+    parser.add_argument("--recurrence-invoices", type=int, default=3,
+                        help="Different invoices a recurring purchase is billed on "
+                             "(default 3).")
+    parser.add_argument("--project-line-eur", type=float, default=100000.0,
+                        help="Average line value from which repeats are treated as project "
+                             "billing (default 100000).")
     parser.add_argument("--tail-share", type=float, default=0.80,
                         help="Share of spend held by non-tail suppliers (default 0.80).")
     parser.add_argument("--channel-suppliers", type=int, default=400,
@@ -2218,6 +2381,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.preferred_suppliers else None,
         cost_of_capital=args.cost_of_capital, target_days=args.target_payment_days,
         rework_cost=args.rework_cost_per_document, recurrence_min=args.recurrence_min,
+        recurrence_months=args.recurrence_months, recurrence_documents=args.recurrence_invoices,
+        project_line_eur=args.project_line_eur,
         tail_share=args.tail_share, channel_suppliers=args.channel_suppliers)
 
     print(f"\n{AGENT_NAME} {AGENT_VERSION}\n", flush=True)

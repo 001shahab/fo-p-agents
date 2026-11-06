@@ -937,6 +937,18 @@ before the due date stands in for early-payment discounts, which are not in
 the data. `--cost-of-capital`, `--target-payment-days` and
 `--rework-cost-per-document` set the payment and rework assumptions.
 
+A purchase counts as recurring when one supplier is billed for it at least six
+times, in at least three months and on at least three invoices. Instalments on
+one project (an average line of €100k, or €20k with words such as
+reconstruction or modernisation) are listed separately as project billing
+rather than as catalogue or framework candidates; `--recurrence-months`,
+`--recurrence-invoices` and `--project-line-eur` change these thresholds. The
+buying channel is judged for each type of purchase a supplier is used for, so a
+telecom operator's subscriptions can go under a contract and its accessories to
+a catalogue. A consolidation move between two entities of one company group,
+such as its Finnish and Swedish subsidiaries, is listed but left out of the
+realistic consolidation figure.
+
 ### One run at a time in a results folder
 
 Both runners take a lock on the results folder and refuse to start if another run
