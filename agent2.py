@@ -49,6 +49,15 @@ that are the same thing described differently.
     permanently, even as new data arrives and new groups form around it. Without
     that, next quarter's report would rename half the analysis.
 
+    Tender scopes
+    -------------
+    With --tender-scopes the agent groups differently, and this is what the
+    final dataset is built on. The model is shown what is bought in a Sievo
+    category and splits it into the scopes a buyer would put into one request
+    for quotation; every purchase in the category is then placed in one. A
+    scope sits inside one category, needs at least three lines, and is never
+    formed from a line that has no description. See TenderScopeGrouper.
+
     Output
     ------
     Written to the results folder, under --output-prefix, "agent2" by default:
@@ -68,6 +77,7 @@ Author:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import hashlib
 import json
@@ -75,11 +85,13 @@ import logging
 import math
 import re
 import sys
+import threading
+import time
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import (Any, Dict, FrozenSet, Iterable, Iterator, List, Optional,
+from typing import (Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Optional,
                     Sequence, Set, Tuple)
 
 from runtime import (
@@ -93,7 +105,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent2")
 
 AGENT_NAME = "Agent 2 - AI Purchase Group (Category L5)"
-AGENT_VERSION = "1.6.0"
+AGENT_VERSION = "2.0.0"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -233,6 +245,17 @@ class Settings:
 
     # False under --non-interactive, where nothing may block waiting for input.
     interactive: bool = True
+
+    # Group into tender scopes below the Sievo category instead of clustering
+    # wordings: see TenderScopeGrouper.
+    tender_scopes: bool = False
+    # Most scopes one category may be split into.
+    max_scopes: int = 20
+    # Give a line with no description the scope its supplier's described lines
+    # in the same category mostly have, marked so that it can be told apart.
+    infer_from_supplier: bool = True
+    # Model requests in flight at once in tender mode.
+    workers: int = 3
 
     model: ModelConfig = field(default_factory=ModelConfig)
 
@@ -1705,6 +1728,9 @@ class LanguageModelClient:
         self._cache_dirty = False
         self._omit_temperature = False
         self._reasoning_style = "effort"
+        # Tender mode sends a few requests at once. The count of what has been
+        # spent, and the question asked when the budget is reached, are shared.
+        self._accounting = threading.Lock()
 
     def _load_cache(self) -> Dict[str, str]:
         if not self.cache_path.is_file():
@@ -1805,17 +1831,18 @@ class LanguageModelClient:
         response = self._post(body)
         if response is None:
             return None
-        self.usage.record(response.get("usage") or {})
-        # Checked after every response, so a limit reached mid-batch takes
-        # effect on the next call rather than at the end of the phase.
-        try:
-            self.guard.review()
-        except SpendLimitReached:
-            # The cache is otherwise written once, when the run finishes. Without
-            # this, a run stopped by the budget discards every answer it paid
-            # for and the next attempt buys them a second time.
-            self.save_cache()
-            raise
+        with self._accounting:
+            self.usage.record(response.get("usage") or {})
+            # Checked after every response, so a limit reached mid-batch takes
+            # effect on the next call rather than at the end of the phase.
+            try:
+                self.guard.review()
+            except SpendLimitReached:
+                # The cache is otherwise written once, when the run finishes.
+                # Without this, a run stopped by the budget discards every answer
+                # it paid for and the next attempt buys them a second time.
+                self.save_cache()
+                raise
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
@@ -2912,6 +2939,681 @@ class Agent2:
 
 
 # ===========================================================================
+# Tender scopes
+# ===========================================================================
+#
+# The second way this agent groups, and the one the final dataset is built on.
+#
+# Clustering wordings gives a group for every wording that differs enough from
+# its neighbours, and on the twelve-month extract that came to 7,539 names: a
+# third of them holding one line, three quarters of them one supplier, and
+# many named after a single member ("Four svenstol chair black leather").
+# Fortum's reviewers asked for the level a buyer works at: what would go into
+# one request for quotation. That is a question about the category, not about
+# the wording, so here the model is shown what is bought in a Sievo category
+# and asked to split it into a handful of scopes, and every purchase in the
+# category is then placed in one of them.
+#
+# Three rules follow from the review and are not left to the model:
+#
+# * A scope lives inside one category, so the result is a true level below it.
+# * A line with no description does not help define a scope. Its original text
+#   is a supplier name and an invoice number, which is how groups called
+#   "Invoice" and "Tarjous abb" came about.
+# * A scope too small to tender is not a scope. It joins "Other".
+
+NOT_DESCRIBED_LABEL = "Not described"
+NOT_DESCRIBED_ID = "G-UNDESCRIBED"
+
+TENDER_DEFINE_TASK = "tender_scopes_define_v1"
+TENDER_ASSIGN_TASK = "tender_scopes_assign_v1"
+
+# Purchases shown to the model when it defines a category's scopes, and placed
+# per request afterwards. Both are sized so that an answer is a few hundred
+# tokens: the answer is a number per purchase, not a sentence.
+TENDER_DEFINE_SAMPLE = 150
+TENDER_ASSIGN_BATCH = 120
+TENDER_TEXT_LIMIT = 90
+TENDER_ATTEMPTS = 3
+
+# A scope with fewer lines than this across the whole extract is not something
+# anyone tenders. Fortum's review counted the single-line groups against the
+# old result, and this is what keeps them from coming back.
+TENDER_MINIMUM_LINES = 3
+
+# How far a supplier's described lines in a category must agree before its
+# undescribed lines there are given the same scope.
+SUPPLIER_PATTERN_SHARE = 0.6
+SUPPLIER_PATTERN_LINES = 2
+
+_VAGUE_SCOPE_NAMES = frozenset({
+    "other", "others", "miscellaneous", "misc", "various", "general", "unknown",
+    "unclear", "n a", "na", "none", "not described", "uncategorised",
+    "uncategorized", "other purchases", "other services", "other materials",
+    "miscellaneous purchases", "miscellaneous services", "miscellaneous materials",
+})
+
+TENDER_DEFINE_PROMPT = """You organise a utility company's purchase lines for its procurement team.
+
+You are given one purchasing category and the purchases recorded in it. Split the category into tender scopes and place every purchase in one.
+
+A tender scope is a set of purchases a buyer would put into one request for quotation, which one kind of supplier could quote for. It sits one level below the category. Good scopes: "Scaffolding services", "Valves and actuators", "Workwear and protective clothing", "Office furniture", "Electrical installation work".
+
+Rules for the scopes:
+- Name the kind of purchase in two to five English words, in sentence case.
+- Never name a supplier, brand, person, place, site, project, invoice, order, quantity, size or date.
+- Never name one product. "Flame resistant shirt" and "Winter gloves" both belong to "Workwear and protective clothing"; "Four black leather chairs" belongs to "Office furniture".
+- Scopes must not overlap, and no two may mean the same thing.
+- Use as few scopes as the purchases need. If everything in the category is one kind of purchase, give one scope.
+- Do not use "Other", "Miscellaneous", "General" or "Various" as a scope.
+
+Rules for placing purchases:
+- Give each purchase the number of the scope it belongs to, counting from 1 in the order you list the scopes.
+- Give 0 when the text names no purchase (only a reference, a period, a person, an invoice) or fits none of the scopes.
+- Place every purchase you were given.
+
+Answer with JSON only, in this shape:
+{"scopes": ["First scope", "Second scope"], "assign": {"1": 2, "2": 1, "3": 0}}"""
+
+TENDER_ASSIGN_PROMPT = """You organise a utility company's purchase lines for its procurement team.
+
+You are given one purchasing category, the tender scopes it has been split into, and purchases recorded in it. Place each purchase in the scope a buyer would tender it under.
+
+- Give each purchase the number of its scope.
+- Give 0 when the text names no purchase (only a reference, a period, a person, an invoice) or fits none of the scopes. Do not force a purchase into a scope it does not belong to.
+- Place every purchase you were given.
+
+Answer with JSON only, in this shape:
+{"assign": {"1": 2, "2": 1, "3": 0}}"""
+
+
+def tender_scope_ceiling(units: int, ceiling: int) -> int:
+    """How many scopes a category may be split into, given what is bought in it.
+
+    A category with six different purchases cannot have eight scopes, and one
+    with four thousand needs more than six. The steps keep the average scope
+    large enough to be worth tendering.
+    """
+    if units <= 6:
+        allowed = 3
+    elif units <= 40:
+        allowed = 6
+    elif units <= 150:
+        allowed = 8
+    elif units <= 600:
+        allowed = 12
+    elif units <= 1500:
+        allowed = 16
+    else:
+        allowed = 20
+    return max(1, min(allowed, ceiling))
+
+
+@dataclass
+class TenderUnit:
+    """One purchase as the model sees it: a wording inside a category."""
+
+    bucket: str
+    signature: str
+    lines: int = 0
+    spend: float = 0.0
+    texts: Counter = field(default_factory=Counter)
+    scope: str = ""
+    naming: str = ""
+
+    @property
+    def text(self) -> str:
+        """The commonest wording, shortest first among equals."""
+        if not self.texts:
+            return self.signature.replace("|", " ")
+        best = min(self.texts.items(), key=lambda item: (-item[1], len(item[0]), item[0]))
+        return best[0]
+
+
+@dataclass
+class TenderScope:
+    """A group as it will be written: a named scope inside one category."""
+
+    group_id: str
+    label: str
+    bucket: str
+    naming: str
+    lines: int = 0
+    described_lines: int = 0
+    spend: float = 0.0
+    suppliers: Set[str] = field(default_factory=set)
+    examples: Counter = field(default_factory=Counter)
+
+
+class TenderScopeGrouper:
+    """Groups purchase lines into tender scopes below their Sievo category."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.lexicon = Lexicon.load(settings.lexicon_path)
+        self.builder = SignatureBuilder()
+        self.masker = SupplierMasker(self.lexicon)
+        self.model: Optional[LanguageModelClient] = None
+        if settings.model.enabled:
+            self.model = LanguageModelClient(
+                settings.model, settings.cache_dir / "agent2_model_cache.json",
+                interactive=settings.interactive)
+
+        self.table: Optional[InputTable] = None
+        self.run_id = ""
+        self.units: Dict[Tuple[str, str], TenderUnit] = {}
+        # One entry per input row, in input order: its category, the signature of
+        # its description ("" when it has none) and its supplier.
+        self.row_keys: List[Tuple[str, str, str]] = []
+        self.scope_names: Dict[str, List[str]] = {}
+        self.pattern: Dict[Tuple[str, str], Tuple[str, float]] = {}
+        self.statistics: Counter = Counter()
+        self._lock = threading.Lock()
+        self._answers_since_save = 0
+        self._signatures: Dict[str, str] = {}
+
+    # -- reading ------------------------------------------------------------
+
+    def _bucket(self, row: Dict[str, str]) -> str:
+        levels = [normalise_text(row.get(column, "")) for column in CATEGORY_COLUMNS]
+        populated = [value for value in levels
+                     if value and not self.lexicon.is_noise(value)]
+        return " > ".join(populated) if populated else "Uncategorised"
+
+    @staticmethod
+    def _descriptions(row: Dict[str, str]) -> Tuple[str, str]:
+        return (normalise_text(row.get("Enriched_Description_Short", "")),
+                normalise_text(row.get(REQUIRED_COLUMN, "")))
+
+    def _signature(self, text: str) -> str:
+        found = self._signatures.get(text)
+        if found is None:
+            found = self.builder.signature(text)
+            self._signatures[text] = found
+        return found
+
+    def collect(self) -> None:
+        """Reduce the rows to the distinct purchases of each category.
+
+        Only Agent 1's description is read. A row without one is counted and
+        set aside: its original text is not consulted, because that text is
+        what produced groups named after invoices and order references.
+        """
+        assert self.table is not None
+        rows = self.table.rows
+        if self.settings.mask_suppliers:
+            for row in rows:
+                short, full = self._descriptions(row)
+                self.masker.observe(full or short, self.masker.supplier_of(row))
+
+        for row in rows:
+            bucket = self._bucket(row)
+            supplier = self.masker.supplier_of(row)
+            supplier_key = lookup_key(supplier)
+            short, full = self._descriptions(row)
+            signature = ""
+            shown = ""
+            # The short description first: it is Agent 1's own reduction to the
+            # thing bought, without the sentence around it.
+            for description in (short, full):
+                if not description or self.lexicon.is_noise(description):
+                    continue
+                if self.settings.mask_suppliers:
+                    description = self.masker.strip(description, supplier, record=False)
+                signature = self._signature(description)
+                if signature:
+                    shown = description
+                    break
+            self.row_keys.append((bucket, signature, supplier_key))
+            if not signature:
+                self.statistics["rows_without_description"] += 1
+                continue
+
+            unit = self.units.get((bucket, signature))
+            if unit is None:
+                unit = TenderUnit(bucket=bucket, signature=signature)
+                self.units[(bucket, signature)] = unit
+            unit.lines += 1
+            unit.spend += parse_amount(row.get("Spend_EUR", "")) or 0.0
+            if len(unit.texts) < 12 or shown in unit.texts:
+                unit.texts[shown] += 1
+            self.statistics["rows_described"] += 1
+
+        self.statistics["categories"] = len({bucket for bucket, _, _ in self.row_keys})
+        self.statistics["distinct_purchases"] = len(self.units)
+        self.run_id = stable_hash(
+            str(self.settings.input_path), str(len(rows)), AGENT_VERSION,
+            "tender", str(len(self.units)))
+        LOGGER.info("%d row(s): %d with a description, %d without. %d distinct "
+                    "purchase(s) in %d categor(ies).", len(rows),
+                    self.statistics["rows_described"],
+                    self.statistics["rows_without_description"],
+                    len(self.units), self.statistics["categories"])
+
+    # -- the model ----------------------------------------------------------
+
+    def _ask(self, task: str, system_prompt: str, user_prompt: str) -> Optional[Dict[str, Any]]:
+        """One answer from the model, from the cache when it has been paid for."""
+        if self.model is None:
+            return None
+        key = self.model.cache_key(task, user_prompt)
+        with self._lock:
+            cached = self.model.cached(key)
+        if cached is not None:
+            try:
+                parsed = json.loads(cached)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+
+        for attempt in range(TENDER_ATTEMPTS):
+            if not self.model.config.enabled:
+                return None
+            answer = self.model.complete_json(system_prompt, user_prompt)
+            if isinstance(answer, dict) and isinstance(answer.get("assign"), dict):
+                with self._lock:
+                    self.model.store(key, json.dumps(answer, ensure_ascii=False))
+                    self._answers_since_save += 1
+                    done = self.model.usage.requests
+                    if self._answers_since_save >= 25:
+                        self.model.save_cache()
+                        self._answers_since_save = 0
+                        LOGGER.info("  %d model request(s) so far, about $%.2f.",
+                                    done, self.model.usage.estimated_cost)
+                return answer
+            with self._lock:
+                self.statistics["model_answers_refused"] += 1
+            time.sleep(2.0 * (attempt + 1))
+        return None
+
+    @staticmethod
+    def _listing(units: Sequence[TenderUnit]) -> str:
+        lines = []
+        for number, unit in enumerate(units, start=1):
+            text = unit.text[:TENDER_TEXT_LIMIT].replace("|", "/")
+            lines.append(f"{number} | {text} | {unit.lines} | {unit.spend:,.0f}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _clean_scope_name(name: Any) -> str:
+        text = normalise_text(name).strip(" .;:,-\"'")
+        if not text or lookup_key(text) in _VAGUE_SCOPE_NAMES:
+            return ""
+        words = text.split()
+        if len(words) > 7:
+            return ""
+        return sentence_case(" ".join(words))
+
+    def _apply(self, units: Sequence[TenderUnit], names: Sequence[str],
+               assign: Dict[str, Any], naming: str) -> List[TenderUnit]:
+        """Record the model's placements; return the purchases it left out."""
+        unplaced: List[TenderUnit] = []
+        for number, unit in enumerate(units, start=1):
+            value = assign.get(str(number))
+            try:
+                chosen = int(value)
+            except (TypeError, ValueError):
+                unplaced.append(unit)
+                continue
+            if chosen == 0:
+                unit.scope, unit.naming = OTHER_GROUP_LABEL, "no scope"
+            elif 1 <= chosen <= len(names) and names[chosen - 1]:
+                unit.scope, unit.naming = names[chosen - 1], naming
+            else:
+                unplaced.append(unit)
+        return unplaced
+
+    def _define(self, bucket: str, units: List[TenderUnit]) -> List[TenderUnit]:
+        """Split one category into scopes; return the purchases still to place."""
+        leaf = sentence_case(bucket.split(" > ")[-1])
+        described_lines = sum(unit.lines for unit in units)
+        if len(units) == 1 or described_lines < TENDER_MINIMUM_LINES:
+            # Nothing to split. The category is its own scope.
+            for unit in units:
+                unit.scope, unit.naming = leaf, "category"
+            self.scope_names[bucket] = [leaf]
+            return []
+
+        by_spend = sorted(units, key=lambda unit: (-abs(unit.spend), -unit.lines, unit.signature))
+        sample = by_spend[:TENDER_DEFINE_SAMPLE * 2 // 3]
+        chosen = {id(unit) for unit in sample}
+        for unit in sorted(units, key=lambda unit: (-unit.lines, unit.signature)):
+            if len(sample) >= TENDER_DEFINE_SAMPLE:
+                break
+            if id(unit) not in chosen:
+                sample.append(unit)
+                chosen.add(id(unit))
+        rest = [unit for unit in by_spend if id(unit) not in chosen]
+
+        ceiling = tender_scope_ceiling(len(units), self.settings.max_scopes)
+        prompt = (f"Category: {bucket}\n"
+                  f"At most {ceiling} scopes.\n"
+                  f"Purchases (number | description | lines | spend in EUR):\n"
+                  f"{self._listing(sample)}")
+        answer = self._ask(TENDER_DEFINE_TASK, TENDER_DEFINE_PROMPT, prompt)
+        raw = answer.get("scopes") if answer else None
+        names = [self._clean_scope_name(name) for name in raw] if isinstance(raw, list) else []
+        names = names[:ceiling]
+        # Two spellings of one name are one scope.
+        first_seen: Dict[str, str] = {}
+        for position, name in enumerate(names):
+            if not name:
+                continue
+            key = self._signature(name) or lookup_key(name)
+            names[position] = first_seen.setdefault(key, name)
+
+        if not any(names):
+            for unit in units:
+                unit.scope, unit.naming = leaf, "category"
+            self.scope_names[bucket] = [leaf]
+            with self._lock:
+                self.statistics["categories_not_split"] += 1
+            return []
+
+        self.scope_names[bucket] = list(dict.fromkeys(name for name in names if name))
+        unplaced = self._apply(sample, names, answer.get("assign") or {}, "model")
+        return rest + unplaced
+
+    def _assign(self, bucket: str, batch: List[TenderUnit]) -> None:
+        names = self.scope_names.get(bucket) or []
+        scopes = "\n".join(f"{number}. {name}" for number, name in enumerate(names, start=1))
+        prompt = (f"Category: {bucket}\n"
+                  f"Scopes:\n{scopes}\n"
+                  f"Purchases (number | description | lines | spend in EUR):\n"
+                  f"{self._listing(batch)}")
+        answer = self._ask(TENDER_ASSIGN_TASK, TENDER_ASSIGN_PROMPT, prompt)
+        unplaced = (self._apply(batch, names, answer.get("assign") or {}, "model")
+                    if answer else list(batch))
+        for unit in unplaced:
+            unit.scope, unit.naming = OTHER_GROUP_LABEL, "not placed"
+        if unplaced:
+            with self._lock:
+                self.statistics["purchases_not_placed"] += len(unplaced)
+
+    def _in_parallel(self, jobs: Sequence[Callable[[], Any]], what: str) -> List[Any]:
+        """Run model work a few requests at a time, stopping cleanly on a budget."""
+        if not jobs:
+            return []
+        workers = max(1, min(self.settings.workers, len(jobs)))
+        LOGGER.info("%s: %d piece(s) of work, %d at a time.", what, len(jobs), workers)
+        results: List[Any] = [None] * len(jobs)
+        if workers == 1:
+            for position, job in enumerate(jobs):
+                results[position] = job()
+            return results
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(job): position for position, job in enumerate(jobs)}
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    results[futures[future]] = future.result()
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                if self.model is not None:
+                    with self._lock:
+                        self.model.save_cache()
+                raise
+        return results
+
+    def group(self) -> None:
+        by_bucket: Dict[str, List[TenderUnit]] = defaultdict(list)
+        for unit in self.units.values():
+            by_bucket[unit.bucket].append(unit)
+        buckets = sorted(by_bucket, key=lambda bucket: -len(by_bucket[bucket]))
+
+        if self.model is None:
+            LOGGER.warning("The language model is off, so no category can be split. "
+                           "Every described line takes its category's own name.")
+            for bucket in buckets:
+                leaf = sentence_case(bucket.split(" > ")[-1])
+                self.scope_names[bucket] = [leaf]
+                for unit in by_bucket[bucket]:
+                    unit.scope, unit.naming = leaf, "category"
+            self.statistics["categories_not_split"] = len(buckets)
+            return
+
+        pending = self._in_parallel(
+            [lambda bucket=bucket: self._define(bucket, by_bucket[bucket])
+             for bucket in buckets], "Defining tender scopes")
+        # A category the model was asked to split and did not is a category
+        # named after itself. A few are tolerable and are reported; many mean
+        # the endpoint was failing, and a file written then would look finished
+        # and hold the old problem under a new name.
+        refused = self.statistics["categories_not_split"]
+        if refused > max(3, len(buckets) // 10):
+            self.model.save_cache()
+            raise SystemExit(
+                f"\nThe language model did not answer for {refused:,} of {len(buckets):,} "
+                f"categories, so they could not be split into tender scopes and "
+                f"nothing has been written.\n\n"
+                f"The answers it did give are in the cache. Run the same command "
+                f"again to ask only for the rest.")
+        batches: List[Tuple[str, List[TenderUnit]]] = []
+        for bucket, left in zip(buckets, pending):
+            left = left or []
+            for start in range(0, len(left), TENDER_ASSIGN_BATCH):
+                batches.append((bucket, left[start:start + TENDER_ASSIGN_BATCH]))
+        self._in_parallel(
+            [lambda bucket=bucket, batch=batch: self._assign(bucket, batch)
+             for bucket, batch in batches], "Placing the remaining purchases")
+        self.model.save_cache()
+
+    # -- after the model ------------------------------------------------------
+
+    def fold_small_scopes(self) -> None:
+        """Move scopes too small to tender into "Other"."""
+        lines: Counter = Counter()
+        for unit in self.units.values():
+            if unit.scope and unit.scope != OTHER_GROUP_LABEL and unit.naming != "category":
+                lines[(unit.bucket, unit.scope)] += unit.lines
+        small = {key for key, count in lines.items() if count < TENDER_MINIMUM_LINES}
+        for unit in self.units.values():
+            if (unit.bucket, unit.scope) in small and unit.naming != "category":
+                unit.scope, unit.naming = OTHER_GROUP_LABEL, "too small"
+                self.statistics["purchases_in_scopes_too_small"] += 1
+        self.statistics["scopes_too_small"] = len(small)
+
+    def learn_supplier_patterns(self) -> None:
+        """What each supplier's described lines in a category mostly are.
+
+        A line with no description still has a supplier and a category, and a
+        supplier usually sells one thing into one category. Where its described
+        lines agree, the undescribed ones are given the same scope and marked
+        as inferred, so they can be told apart and left out.
+        """
+        if not self.settings.infer_from_supplier:
+            return
+        seen: Dict[Tuple[str, str], Counter] = defaultdict(Counter)
+        for bucket, signature, supplier in self.row_keys:
+            if not signature or not supplier:
+                continue
+            unit = self.units[(bucket, signature)]
+            seen[(bucket, supplier)][unit.scope or OTHER_GROUP_LABEL] += 1
+        for key, counts in seen.items():
+            total = sum(counts.values())
+            scope, most = max(counts.items(), key=lambda item: (item[1], item[0]))
+            if (scope != OTHER_GROUP_LABEL and total >= SUPPLIER_PATTERN_LINES
+                    and most / total >= SUPPLIER_PATTERN_SHARE):
+                self.pattern[key] = (scope, most / total)
+
+    # -- writing --------------------------------------------------------------
+
+    @staticmethod
+    def _group_id(bucket: str, label: str) -> str:
+        if label == OTHER_GROUP_LABEL:
+            return OTHER_GROUP_ID
+        if label == NOT_DESCRIBED_LABEL:
+            return NOT_DESCRIBED_ID
+        return f"G-{stable_hash(bucket, lookup_key(label))[:10].upper()}"
+
+    def _placement(self, key: Tuple[str, str, str]) -> Tuple[str, str, int]:
+        """The scope, the route to it and the confidence for one row."""
+        bucket, signature, supplier = key
+        if signature:
+            unit = self.units[(bucket, signature)]
+            if unit.scope and unit.scope != OTHER_GROUP_LABEL:
+                return unit.scope, unit.naming, 85 if unit.naming == "model" else 60
+            return OTHER_GROUP_LABEL, unit.naming or "not placed", 0
+        found = self.pattern.get((bucket, supplier)) if supplier else None
+        if found:
+            return found[0], "supplier pattern", int(round(30 + 15 * found[1]))
+        return NOT_DESCRIBED_LABEL, "no description", 0
+
+    def write(self) -> Dict[str, Any]:
+        assert self.table is not None
+        results_dir = self.settings.results_dir
+        results_dir.mkdir(parents=True, exist_ok=True)
+        stem = self.settings.output_prefix
+        rows_path = results_dir / f"{stem}_purchase_groups.csv"
+        directory_path = results_dir / f"{stem}_group_directory.csv"
+
+        placements = [self._placement(key) for key in self.row_keys]
+        scopes: Dict[Tuple[str, str], TenderScope] = {}
+        for row, key, (label, naming, _) in zip(self.table.rows, self.row_keys, placements):
+            bucket = key[0]
+            home = "" if label in (OTHER_GROUP_LABEL, NOT_DESCRIBED_LABEL) else bucket
+            scope = scopes.get((home, label))
+            if scope is None:
+                scope = TenderScope(group_id=self._group_id(bucket, label), label=label,
+                                    bucket=home or "All categories", naming=naming)
+                scopes[(home, label)] = scope
+            scope.lines += 1
+            scope.spend += parse_amount(row.get("Spend_EUR", "")) or 0.0
+            if key[2]:
+                scope.suppliers.add(key[2])
+            if key[1]:
+                scope.described_lines += 1
+                if len(scope.examples) < 40:
+                    scope.examples[self.units[(bucket, key[1])].text] += 1
+
+        appended = ["AI_Purchase_Group_L5", "AI_Purchase_Group_Id",
+                    "AI_Purchase_Group_Confidence", "AI_Purchase_Group_Band",
+                    "AI_Purchase_Group_Size", "AI_Purchase_Group_Category",
+                    "AI_Purchase_Group_Cohesion", "AI_Purchase_Group_Naming",
+                    "AI_Purchase_Group_Is_New", "Agent2_Run_Id"]
+        headers = list(self.table.headers) + [name for name in appended
+                                              if name not in self.table.headers]
+        routes: Counter = Counter()
+        with rows_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=headers, extrasaction="ignore")
+            writer.writeheader()
+            for row, key, (label, naming, confidence) in zip(
+                    self.table.rows, self.row_keys, placements):
+                bucket = key[0]
+                home = "" if label in (OTHER_GROUP_LABEL, NOT_DESCRIBED_LABEL) else bucket
+                scope = scopes[(home, label)]
+                routes[naming] += 1
+                output = dict(row)
+                output.update({
+                    "AI_Purchase_Group_L5": label,
+                    "AI_Purchase_Group_Id": scope.group_id,
+                    "AI_Purchase_Group_Confidence": confidence,
+                    "AI_Purchase_Group_Band": ("High" if confidence >= 75
+                                               else "Medium" if confidence >= 50 else "Low"),
+                    "AI_Purchase_Group_Size": scope.lines if home else 0,
+                    "AI_Purchase_Group_Category": bucket,
+                    # Not measured here: a scope is defined by the model reading
+                    # the category, not by how alike its members' wordings are.
+                    "AI_Purchase_Group_Cohesion": 0.0,
+                    "AI_Purchase_Group_Naming": naming,
+                    "AI_Purchase_Group_Is_New": "Yes" if home else "No",
+                    "Agent2_Run_Id": self.run_id,
+                })
+                writer.writerow(output)
+
+        with directory_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["AI_Purchase_Group_Id", "AI_Purchase_Group_L5", "Category_Path",
+                             "Line_Count", "Described_Lines", "Supplier_Count",
+                             "Total_Spend_EUR", "Naming_Method", "Example_Descriptions"])
+            for scope in sorted(scopes.values(),
+                                key=lambda scope: (-scope.spend, -scope.lines, scope.group_id)):
+                examples = [text for text, _ in scope.examples.most_common(8)]
+                writer.writerow([scope.group_id, scope.label, scope.bucket, scope.lines,
+                                 scope.described_lines, len(scope.suppliers),
+                                 round(scope.spend, 2), scope.naming, " | ".join(examples)])
+
+        named = [scope for (home, _), scope in scopes.items() if home]
+        statistics: Dict[str, Any] = dict(self.statistics)
+        statistics.update({
+            "rows": len(self.row_keys),
+            "groups_total": len(named),
+            "group_names_total": len({scope.label for scope in named}),
+            "groups_with_one_line": sum(1 for scope in named if scope.lines == 1),
+            "groups_with_one_supplier": sum(1 for scope in named if len(scope.suppliers) <= 1),
+            "rows_by_route": dict(routes),
+            "rows_in_a_named_group": sum(scope.lines for scope in named),
+            "rows_in_other": routes["no scope"] + routes["not placed"] + routes["too small"],
+            "rows_not_described": routes["no description"],
+            "rows_grouped_by_supplier_pattern": routes["supplier pattern"],
+        })
+        if self.model is not None:
+            self.model.save_cache()
+            statistics["token_usage"] = {**self.model.usage.as_dict(),
+                                         **self.model.guard.as_dict()}
+        manifest = {
+            "agent": AGENT_NAME,
+            "agent_version": AGENT_VERSION,
+            "mode": "tender scopes",
+            "run_id": self.run_id,
+            "lexicon_version": self.lexicon.version,
+            "environment": describe_environment(),
+            "configuration": {
+                "input": str(self.settings.input_path),
+                "results_dir": str(self.settings.results_dir),
+                "language_model": self.settings.model.enabled,
+                "model": self.settings.model.model if self.settings.model.enabled else None,
+                "max_scopes_per_category": self.settings.max_scopes,
+                "minimum_lines_per_scope": TENDER_MINIMUM_LINES,
+                "infer_from_supplier": self.settings.infer_from_supplier,
+                "workers": self.settings.workers,
+            },
+            "outputs": [rows_path.name, directory_path.name],
+            "statistics": statistics,
+        }
+        (results_dir / f"{stem}_run_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return manifest
+
+    def run(self) -> Dict[str, Any]:
+        self.table = read_input(self.settings.input_path)
+        self.collect()
+        self.group()
+        self.fold_small_scopes()
+        self.learn_supplier_patterns()
+        return self.write()
+
+
+def print_tender_summary(manifest: Dict[str, Any], settings: Settings) -> None:
+    statistics = manifest["statistics"]
+    rows = statistics.get("rows", 0) or 1
+
+    def share(count: int) -> str:
+        return f"{count:,} ({count / rows:.1%})"
+
+    print("\n" + "=" * 79)
+    print(f"  {AGENT_NAME} {AGENT_VERSION} - tender scopes")
+    print("=" * 79)
+    print(f"  Lines                          : {statistics.get('rows', 0):,}")
+    print(f"  Categories                     : {statistics.get('categories', 0):,}")
+    print(f"  Groups (scope within category) : {statistics.get('groups_total', 0):,}")
+    print(f"  Distinct group names           : {statistics.get('group_names_total', 0):,}")
+    print(f"  Groups holding one line        : {statistics.get('groups_with_one_line', 0):,}")
+    print(f"  Lines in a named group         : {share(statistics.get('rows_in_a_named_group', 0))}")
+    print(f"    of which from the supplier's pattern : "
+          f"{share(statistics.get('rows_grouped_by_supplier_pattern', 0))}")
+    print(f"  Lines in Other                 : {share(statistics.get('rows_in_other', 0))}")
+    print(f"  Lines not described            : {share(statistics.get('rows_not_described', 0))}")
+    if statistics.get("categories_not_split"):
+        print(f"  Categories the model did not split : "
+              f"{statistics['categories_not_split']:,} (they carry the category's name)")
+    print_token_usage(statistics, settings)
+    print(f"  Results                        : {settings.results_dir}")
+    print("=" * 79 + "\n")
+
+
+# ===========================================================================
 # Command line interface
 # ===========================================================================
 
@@ -2972,6 +3674,20 @@ def build_parser() -> argparse.ArgumentParser:
                           help="ceiling on Category L5 names including 'Other'; "
                                "groups below the spend line join 'Other' "
                                "(default 8000, 0 disables the ceiling)")
+
+    tender = parser.add_argument_group("tender scopes")
+    tender.add_argument("--tender-scopes", action="store_true",
+                        help="split each Sievo category into the scopes a buyer would "
+                             "tender, instead of clustering wordings; needs --use-llm "
+                             "to split anything")
+    tender.add_argument("--max-scopes", type=int, default=20,
+                        help="most scopes one category may be split into (default 20)")
+    tender.add_argument("--no-supplier-inference", action="store_true",
+                        help="leave every line with no description as 'Not described' "
+                             "rather than giving it the scope its supplier's described "
+                             "lines in the same category mostly have")
+    tender.add_argument("--workers", type=int, default=3,
+                        help="model requests in flight at once (default 3)")
 
     tiers = parser.add_argument_group("processing tiers")
     tiers.add_argument("--no-embeddings", action="store_true",
@@ -3060,19 +3776,27 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         default_input = Path(ask("Agent 1 unified table", str(default_input)))
         default_results = Path(ask("Results folder", str(default_results)))
         default_lexicon = Path(ask("Controlled vocabulary file", str(default_lexicon)))
-        default_registry = Path(ask("Group registry (keeps labels stable across runs)",
-                                    str(default_registry)))
+        if not args.tender_scopes:
+            default_registry = Path(ask("Group registry (keeps labels stable across runs)",
+                                        str(default_registry)))
         default_cache = Path(ask("Cache folder", str(default_cache)))
 
         print()
-        if _sentence_transformers is None:
-            print("  Sentence embeddings are not installed; that view will be skipped.")
+        if args.tender_scopes:
             use_embeddings = False
+            use_llm = ask_yes_no(
+                "Let the language model split the categories into tender scopes "
+                "(without it nothing is split)?", True)
         else:
-            use_embeddings = ask_yes_no(
-                "Use multilingual sentence embeddings (recommended, free)?", True)
-        use_llm = ask_yes_no(
-            "Let the language model name groups the rules could not name well?", use_llm)
+            if _sentence_transformers is None:
+                print("  Sentence embeddings are not installed; that view will be skipped.")
+                use_embeddings = False
+            else:
+                use_embeddings = ask_yes_no(
+                    "Use multilingual sentence embeddings (recommended, free)?", True)
+            use_llm = ask_yes_no(
+                "Let the language model name groups the rules could not name well?",
+                use_llm)
         if use_llm:
             print()
             print(f"  Charged at ${INPUT_COST_PER_MTOK:,.2f} per million input tokens and "
@@ -3103,6 +3827,10 @@ def resolve_settings(args: argparse.Namespace, env: Dict[str, str]) -> Settings:
         write_jsonl=not args.no_jsonl,
         verbose=args.verbose,
         interactive=not args.non_interactive,
+        tender_scopes=args.tender_scopes,
+        max_scopes=max(1, args.max_scopes),
+        infer_from_supplier=not args.no_supplier_inference,
+        workers=max(1, args.workers),
     )
     settings.model = resolve_model_config(env, use_llm, spend_limit)
 
@@ -3251,7 +3979,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             LOGGER.info("No spend alert set; the model tier will run unmetered.")
 
     try:
-        manifest = Agent2(settings).run()
+        manifest = (TenderScopeGrouper(settings).run() if settings.tender_scopes
+                    else Agent2(settings).run())
     except SystemExit as error:
         print(f"\n{error}\n", file=sys.stderr)
         return 2
@@ -3259,7 +3988,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("\nInterrupted.\n", file=sys.stderr)
         return 130
 
-    print_summary(manifest, settings)
+    if settings.tender_scopes:
+        print_tender_summary(manifest, settings)
+    else:
+        print_summary(manifest, settings)
     return 0
 
 

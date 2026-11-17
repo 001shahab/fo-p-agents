@@ -115,7 +115,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent4")
 
 AGENT_NAME = "Agent 4 - AI Supplier Consolidation"
-AGENT_VERSION = "1.2.1"
+AGENT_VERSION = "1.2.2"
 
 csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
@@ -580,6 +580,11 @@ COUNTRY_SOURCE_COLUMN = "Country_Source"
 
 OTHER_GROUP_LABEL = "Other"
 OTHER_GROUP_ID = "G-OTHER"
+# Agent 2's tender-scope mode keeps lines with no description apart from lines
+# it could not place. Neither names a purchase, so neither is something two
+# suppliers can be said to share.
+UNGROUPED_LABELS = frozenset({OTHER_GROUP_LABEL, "Not described"})
+UNGROUPED_IDS = frozenset({OTHER_GROUP_ID, "G-UNDESCRIBED"})
 
 # Where every line lands that carries no purchase group and no usable
 # description. It counts towards a supplier's size and never towards an overlap.
@@ -1434,7 +1439,7 @@ class PortfolioBuilder:
         if self._use_groups:
             label = normalise_text(row.get(GROUP_LABEL_COLUMN, ""))
             identifier = normalise_text(row.get(GROUP_ID_COLUMN, "")) or label
-            if label and label != OTHER_GROUP_LABEL and identifier != OTHER_GROUP_ID:
+            if label and label not in UNGROUPED_LABELS and identifier not in UNGROUPED_IDS:
                 return f"G:{lookup_key(identifier)}", label, True
             return UNIDENTIFIED_ITEM_KEY, UNIDENTIFIED_ITEM_LABEL, False
 

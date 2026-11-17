@@ -144,6 +144,10 @@ Usage
     python3 all_agents.py --force             # rerun the agents, keep the table
     python3 all_agents.py --no-reuse          # rebuild everything from the extracts
     python3 all_agents.py --combine-agent4 A B  # one Agent 4 over finished runs A and B
+    python3 all_agents.py --final-dataset A B   # one corrected file over finished runs
+
+With finished runs beside the script, a plain interactive run asks first whether
+it is to correct them into one final file or to run the pipeline from the start.
 
 Author: Prof. Shahab Anbarjafari
 """
@@ -177,7 +181,7 @@ from runtime import (
 )
 
 AGENT_NAME = "All Agents - Input Table Widened With Agents 1 to 4"
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
 
 BANNER = f"""
 ===============================================================================
@@ -3650,6 +3654,754 @@ def combine_agent4(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# One corrected file over several finished runs
+# ---------------------------------------------------------------------------
+#
+# What goes to the dashboard. Fortum's review of the first dashboard found
+# three things that were this pipeline's doing, and one file that was not a
+# product of it at all:
+#
+# * Agent 1 wrote the invoice number into its sentences as an item number, and
+#   lost part of the supplier's name ("purchased from OY").
+# * Agent 2's groups were too many and too narrow to be a level below L4, and
+#   lines with no description were grouped on their invoice text.
+# * Agent 4 had been run per period, on spend that counted a Sievo row once
+#   for every copy of it in the extract.
+# * The file loaded was two datasets pasted together by hand, whose row
+#   numbers restart, so a join on the row number mixed the two periods up.
+#
+# This writes the file that replaces it, from the finished runs, without
+# running Agent 1 or Agent 3 again: the descriptions are corrected in place
+# from each line's own fields, Agent 2 regroups every line of every run
+# together, and Agent 4 then reads the result once. The runs themselves are
+# only read.
+
+FINAL_DATASET_NAME = "all_agents_final.csv"
+FINAL_GROUPS_NAME = "all_agents_final_groups.csv"
+FINAL_SUMMARY_NAME = "all_agents_final_summary.json"
+FINAL_WORK_DIR_NAME = "final_dataset"
+FINAL_LINES_NAME = "final_lines.csv"
+FINAL_PARTIAL_SUFFIX = ".final.partial"
+FINAL_DEFAULT_FOLDERS: Tuple[str, ...] = ("new_results_llm", "may_dec_results")
+FINAL_DEFAULT_CATEGORIES: Tuple[str, ...] = ("Energy assets",
+                                             "Indirect Services and Materials")
+FINAL_DEFAULT_BUDGET = 30.0
+# The hand-made file the first dashboard was loaded from, named in the closing
+# report so that nobody keeps it beside the one that replaces it.
+COMBINED_INPUT_NAME = "all_agents_combined.csv"
+LINE_KEY_COLUMN = "Line_Key"
+RUN_ROW_NUMBER_COLUMN = "Run_Row_Number"
+SIEVO_ROW_ID_COLUMN = "SourceRowId"
+
+# Written after the Agent 4 columns of the final file.
+FINAL_EXTRA_COLUMNS: Tuple[str, ...] = (
+    RUN_FOLDER_COLUMN, RUN_ROW_NUMBER_COLUMN, "Sievo_Row_Copies",
+    "Sievo_Row_Copy_Number", "Spend_EUR_Counted_Once", "Description_Corrected")
+
+GROUP_COLUMNS: Tuple[str, ...] = (
+    "AI_Purchase_Group_L5", "AI_Purchase_Group_Id", "AI_Purchase_Group_Confidence",
+    "AI_Purchase_Group_Band", "AI_Purchase_Group_Size", "AI_Purchase_Group_Category",
+    "AI_Purchase_Group_Cohesion", "AI_Purchase_Group_Naming",
+    "AI_Purchase_Group_Is_New", "Agent2_Run_Id")
+
+# What Agent 2 and Agent 4 are given for each line, under the names they read.
+FINAL_LINE_COLUMNS: Tuple[str, ...] = (
+    SOURCE_FILE_COLUMN, LINE_SUPPLIER_NAME, LINE_SUPPLIER_ID,
+    "Enriched_Purchase_Description", "Enriched_Description_Short", "Spend_EUR",
+    "Delivered_To_Country", "Delivery_Country", "Ship_To_Country", "Country",
+    "Country_Source", "Business_Area", "Division",
+    "Category_L1", "Category_L2", "Category_L3", "Category_L4",
+    "Item_Or_Service", "Item_Number", "Material_Group_Name", "Source_System")
+
+# Where a column sits where the merge put it, used to check that two datasets
+# line up before one is written under the other's header.
+FINAL_ANCHOR_COLUMNS: Tuple[str, ...] = (
+    "Enriched_Purchase_Description", LINE_SUPPLIER_NAME, ROW_NUMBER_COLUMN,
+    "AI_Purchase_Group_L5")
+
+_NOT_NAME_CHARACTER = re.compile(r"[^0-9a-z]")
+
+
+def agent_column(header: Sequence[str], name: str) -> Optional[int]:
+    """Where an agent's column sits in a merged dataset.
+
+    The merge prefixes an agent's column when the purchase table already has
+    one of that name, so Agent 1's Division is ``Agent1_Division`` in one run
+    and ``Division`` in another, depending on how that run's extract spelled
+    its own.
+    """
+    for candidate in (f"Agent1_{name}", name):
+        if candidate in header:
+            return list(header).index(candidate)
+    return None
+
+
+def loose_column(header: Sequence[str], name: str) -> Optional[int]:
+    """A column of the purchase table, however that extract spelled it."""
+    wanted = _NOT_NAME_CHARACTER.sub("", name.lower())
+    for position, column in enumerate(header):
+        if _NOT_NAME_CHARACTER.sub("", column.lower()) == wanted:
+            return position
+    return None
+
+
+@dataclass
+class FinalRun:
+    """One finished run as the final file reads it."""
+
+    folder: Path
+    header: List[str] = field(default_factory=list)
+    agent4_start: int = 0
+    offset: int = 0
+    at: Dict[str, Optional[int]] = field(default_factory=dict)
+    # For each column of the final header, where this run holds it.
+    mapping: List[Optional[int]] = field(default_factory=list)
+    rows: int = 0
+    kept: int = 0
+
+    @property
+    def dataset(self) -> Path:
+        return self.folder / OUTPUT_CSV
+
+    def cell(self, row: Sequence[str], name: str) -> str:
+        position = self.at.get(name)
+        return row[position] if position is not None and position < len(row) else ""
+
+
+class FinalDataset:
+    """The corrected dataset over several finished runs, in one file."""
+
+    def __init__(self, settings: Settings, folders: Sequence[Path], output_dir: Path,
+                 categories: Sequence[str], infer_from_supplier: bool = True,
+                 workers: int = 3) -> None:
+        self.settings = settings
+        self.runs = [FinalRun(folder=folder) for folder in folders]
+        self.output_dir = output_dir
+        self.categories = {normalise(category) for category in categories if category}
+        self.category_names = [category for category in categories if category]
+        self.infer_from_supplier = infer_from_supplier
+        self.workers = max(1, workers)
+        self.chain = AgentChain(settings)
+        self.lines = settings.work_dir / FINAL_LINES_NAME
+        self.output = output_dir / FINAL_DATASET_NAME
+        self.copies: Dict[str, int] = {}
+        self.summary: Dict[str, Any] = {
+            "folders": [str(folder) for folder in folders],
+            "categories": self.category_names or "all",
+            "output": str(self.output),
+        }
+        self._repair: Optional[Callable[..., str]] = None
+        self._repaired: Dict[Tuple[str, str, str, str, str], str] = {}
+
+    # -- checks ---------------------------------------------------------------
+
+    def check(self) -> None:
+        if not self.runs:
+            raise SystemExit("No finished run was named, so there is nothing to correct.")
+        if len({run.folder.resolve() for run in self.runs}) != len(self.runs):
+            raise SystemExit("The same results folder was named twice.")
+        for run in self.runs:
+            if not run.dataset.is_file():
+                raise SystemExit(f"{run.folder} is not a finished run: it has no "
+                                 f"{OUTPUT_CSV}. Nothing has been changed.")
+            run.header = read_header(run.dataset)
+            run.agent4_start = len(run.header)
+            while (run.agent4_start > 0
+                   and run.header[run.agent4_start - 1].startswith(AGENT4_PREFIX)):
+                run.agent4_start -= 1
+            for name in (*FINAL_LINE_COLUMNS, ROW_NUMBER_COLUMN, "Row_Id",
+                         "Invoice_Number", "Document_Number", "PO_Number", *GROUP_COLUMNS):
+                run.at[name] = agent_column(run.header, name)
+            run.at[SIEVO_ROW_ID_COLUMN] = loose_column(run.header, SIEVO_ROW_ID_COLUMN)
+            missing = [name for name in ("Enriched_Purchase_Description", LINE_SUPPLIER_NAME,
+                                         ROW_NUMBER_COLUMN, "Category_L1",
+                                         "AI_Purchase_Group_L5")
+                       if run.at.get(name) is None]
+            if missing:
+                raise SystemExit(f"{run.dataset} has no {', '.join(missing)} column, so it "
+                                 f"is not a dataset this script wrote. Nothing has been "
+                                 f"changed.")
+        self._align()
+
+    def _align(self) -> None:
+        """Decide where each run holds each column of the final header.
+
+        The first run's header is the final one, which is how the file the
+        dashboard already reads was put together. Two runs made by the same
+        merge hold the same columns in the same places even where the extracts
+        spelled their own columns differently, so those are read by position.
+        Anything else is matched by name, and what cannot be matched is left
+        blank and reported.
+        """
+        first = self.runs[0]
+        width = first.agent4_start
+        final = first.header[:width]
+        for run in self.runs:
+            same_shape = run.agent4_start == width and all(
+                agent_column(run.header, name) == agent_column(first.header, name)
+                for name in FINAL_ANCHOR_COLUMNS)
+            if same_shape:
+                run.mapping = list(range(width))
+                continue
+            run.mapping = []
+            unmatched = []
+            for name in final:
+                position = (run.header.index(name) if name in run.header[:run.agent4_start]
+                            else loose_column(run.header[:run.agent4_start], name))
+                run.mapping.append(position)
+                if position is None:
+                    unmatched.append(name)
+            LOGGER.warning("%s does not hold its columns where %s does, so its columns "
+                           "are matched by name. %d of %d could not be matched and are "
+                           "left blank%s.", run.folder.name, first.folder.name,
+                           len(unmatched), len(final),
+                           f": {', '.join(unmatched[:8])}" if unmatched else "")
+            self.summary.setdefault("columns_left_blank", {})[run.folder.name] = unmatched
+
+        # Row numbers restart in every run. The first run keeps its own and each
+        # later one is moved up by a round figure, so the original can be read
+        # off the end of the new one.
+        largest = max(count_rows(run.dataset) for run in self.runs) + HEADER_ROWS
+        step = 10 ** max(6, len(str(largest)))
+        for position, run in enumerate(self.runs):
+            run.offset = position * step
+
+    def explain(self, use_llm: bool) -> bool:
+        print()
+        print("  One corrected file is written from these finished runs:")
+        for run in self.runs:
+            print(f"    {run.folder}")
+        print(f"  Categories kept : "
+              f"{', '.join(self.category_names) if self.category_names else 'all'}")
+        print()
+        print("  Agent 1  is not run again. Its descriptions are corrected in place: the")
+        print("           invoice number is taken out and the supplier's name put back.")
+        if use_llm:
+            print("  Agent 2  regroups every line of all the runs together, into the scopes")
+            print("           a buyer would tender within each Sievo category. This is the")
+            print("           part that uses the language model.")
+        else:
+            print("  Agent 2  cannot split a category without the language model, so every")
+            print("           described line would take its category's own name.")
+        print("  Agent 3  is not run again. Its columns are carried over as they are.")
+        print("  Agent 4  runs once over all the runs, on the new groups, counting each")
+        print("           Sievo row once.")
+        print()
+        print("  The finished runs are only read. The file is written to")
+        print(f"    {self.output}")
+        if self.settings.interactive:
+            print()
+            return ask_yes_no("Go ahead", True)
+        return True
+
+    # -- the descriptions -----------------------------------------------------
+
+    def _corrected(self, text: str, run: FinalRun, row: Sequence[str]) -> str:
+        if not text:
+            return text
+        if self._repair is None:
+            # Agent 1 owns the rule, so a later full run and this correction
+            # cannot drift apart.
+            from agent1 import repair_published_description
+            self._repair = repair_published_description
+        supplier = run.cell(row, LINE_SUPPLIER_NAME)
+        references = (run.cell(row, "Invoice_Number"), run.cell(row, "Document_Number"),
+                      run.cell(row, "PO_Number"))
+        key = (text, supplier, *references)
+        found = self._repaired.get(key)
+        if found is None:
+            found = self._repair(text, supplier, references)
+            self._repaired[key] = found
+        return found
+
+    def _in_scope(self, run: FinalRun, row: Sequence[str]) -> bool:
+        return (not self.categories
+                or normalise(run.cell(row, "Category_L1")) in self.categories)
+
+    @staticmethod
+    def _line_key(run: FinalRun, row: Sequence[str]) -> str:
+        """What makes two rows the same Sievo row, or failing that the row itself."""
+        sievo = run.cell(row, SIEVO_ROW_ID_COLUMN).strip()
+        return sievo or f"{run.folder.name}:{run.cell(row, ROW_NUMBER_COLUMN).strip()}"
+
+    def _new_row_number(self, run: FinalRun, row: Sequence[str]) -> str:
+        number = run.cell(row, ROW_NUMBER_COLUMN).strip()
+        if not run.offset or not number.isdigit():
+            return number
+        return str(run.offset + int(number))
+
+    def _write_lines(self) -> None:
+        """Every Sievo row once, with its corrected description, for Agents 2 and 4.
+
+        The extracts repeat a Sievo row, text and amount unchanged, up to a
+        hundred times. Counting those copies would have Agent 2 weigh a purchase
+        by how often it was repeated and Agent 4 report spend that was never
+        made, so the first copy speaks for the row and the others take its
+        answer.
+        """
+        self.settings.work_dir.mkdir(parents=True, exist_ok=True)
+        partial = self.lines.with_name(self.lines.name + FINAL_PARTIAL_SUFFIX)
+        counts = {"rows": 0, "kept": 0, "distinct": 0, "described": 0, "corrected": 0}
+        print("\n  Reading the finished runs and correcting the descriptions ...",
+              flush=True)
+        with partial.open("w", encoding="utf-8", newline="") as target:
+            writer = csv.writer(target)
+            writer.writerow([LINE_KEY_COLUMN, RUN_FOLDER_COLUMN, ROW_NUMBER_COLUMN,
+                             *FINAL_LINE_COLUMNS])
+            for run in self.runs:
+                for row in stream_rows(run.dataset):
+                    run.rows += 1
+                    if not self._in_scope(run, row):
+                        continue
+                    run.kept += 1
+                    key = self._line_key(run, row)
+                    self.copies[key] = self.copies.get(key, 0) + 1
+                    if self.copies[key] > 1:
+                        continue
+                    values = []
+                    for name in FINAL_LINE_COLUMNS:
+                        value = run.cell(row, name)
+                        if name in ("Enriched_Purchase_Description",
+                                    "Enriched_Description_Short") and value.strip():
+                            fixed = self._corrected(value, run, row)
+                            if name == "Enriched_Purchase_Description":
+                                counts["described"] += 1
+                                counts["corrected"] += fixed != value
+                            value = fixed
+                        values.append(value)
+                    writer.writerow([key, run.folder.name,
+                                     self._new_row_number(run, row), *values])
+                counts["rows"] += run.rows
+                counts["kept"] += run.kept
+                print(f"    {run.folder.name}: {run.rows:,} row(s), {run.kept:,} in the "
+                      f"categories kept", flush=True)
+        partial.replace(self.lines)
+        counts["distinct"] = len(self.copies)
+        if not counts["distinct"]:
+            raise SystemExit("No row of these runs is in the categories kept, so there "
+                             "is nothing to write. Nothing has been changed.")
+        print(f"    {counts['distinct']:,} distinct Sievo row(s); "
+              f"{counts['described']:,} have a description and "
+              f"{counts['corrected']:,} of those were corrected.", flush=True)
+        self.summary["lines"] = counts
+        self.summary["runs"] = {run.folder.name: {"rows": run.rows, "kept": run.kept,
+                                                  "row_number_offset": run.offset}
+                                for run in self.runs}
+
+    # -- the agents -----------------------------------------------------------
+
+    def _run_agent(self, script: str, step_input: Path,
+                   extra: Sequence[str] = ()) -> AgentStep:
+        step = self.chain.new_step(script)
+        self.chain.origin_name = self.lines.name
+        self.chain._invoke(step, [*self.chain.arguments_for(script, step_input), *extra],
+                           step_input)
+        if not step.ok or not step.output_path:
+            raise SystemExit(f"{step.name} did not finish: {step.reason}. The final file "
+                             f"has not been written and the finished runs are unchanged. "
+                             f"Its log is {step.log_path or self.settings.work_dir}. Run "
+                             f"the same command again to carry on: answers already paid "
+                             f"for are read back from the cache.")
+        self.chain.journal.clear()
+        self.summary[step.tag or step.name] = {
+            "reused": step.reused, "seconds": round(step.seconds, 1),
+            "rows": step.rows, "usage": step.usage}
+        return step
+
+    def _regroup(self) -> Path:
+        print(f"\n  Agent 2 regroups all {len(self.copies):,} rows together.\n", flush=True)
+        extra = ["--tender-scopes", "--workers", str(self.workers)]
+        if not self.infer_from_supplier:
+            extra.append("--no-supplier-inference")
+        step = self._run_agent("agent2.py", self.lines, extra)
+        assert step.output_path is not None
+        return step.output_path
+
+    def _consolidate(self, groups: Path) -> SupplierConsolidation:
+        print(f"\n  Agent 4 reads all {len(self.copies):,} rows together.\n", flush=True)
+        self._run_agent("agent4.py", groups)
+        consolidation = SupplierConsolidation(self.settings.work_dir)
+        if not consolidation.load():
+            raise SystemExit("Agent 4's output cannot be attached to lines: "
+                             + " ".join(consolidation.notes)
+                             + " The final file has not been written.")
+        return consolidation
+
+    # -- the file -------------------------------------------------------------
+
+    def _load_groups(self, groups: Path) -> Dict[str, List[str]]:
+        answers: Dict[str, List[str]] = {}
+        with groups.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                answers[row.get(LINE_KEY_COLUMN) or ""] = [
+                    row.get(column) or "" for column in GROUP_COLUMNS]
+        missing = [key for key in self.copies if key not in answers]
+        if missing:
+            raise SystemExit(f"Agent 2 returned no group for {len(missing):,} of "
+                             f"{len(self.copies):,} rows, so the final file would have "
+                             f"holes in it and has not been written.")
+        return answers
+
+    def _write_final(self, groups: Dict[str, List[str]],
+                     consolidation: SupplierConsolidation) -> None:
+        first = self.runs[0]
+        width = first.agent4_start
+        base = list(first.header[:width])
+        taken = set(base)
+        agent4_names: List[str] = []
+        for column in consolidation.columns:
+            name = unique_name(f"{AGENT4_PREFIX}{column}", taken)
+            taken.add(name)
+            agent4_names.append(name)
+        extras = [unique_name(name, taken) for name in FINAL_EXTRA_COLUMNS]
+        header = base + agent4_names + extras
+
+        def final_at(name: str) -> Optional[int]:
+            return agent_column(base, name)
+
+        description_at = final_at("Enriched_Purchase_Description")
+        short_at = final_at("Enriched_Description_Short")
+        number_at = final_at(ROW_NUMBER_COLUMN)
+        group_at = [final_at(name) for name in GROUP_COLUMNS]
+        key_out = (width + consolidation.columns.index(SUPPLIER_KEY_COLUMN)
+                   if SUPPLIER_KEY_COLUMN in consolidation.columns else None)
+        label_at = GROUP_COLUMNS.index("AI_Purchase_Group_L5")
+        naming_at = GROUP_COLUMNS.index("AI_Purchase_Group_Naming")
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        partial = self.output.with_name(self.output.name + FINAL_PARTIAL_SUFFIX)
+        seen: Dict[str, int] = {}
+        counts: Dict[str, Any] = {
+            "rows": 0, "sievo_rows": 0, "spend_all_rows_eur": 0.0, "spend_once_eur": 0.0,
+            "descriptions": 0, "descriptions_corrected": 0, "with_agent4_finding": 0,
+            "in_named_group": 0, "in_named_group_by_supplier_pattern": 0,
+            "in_other": 0, "not_described": 0}
+        names: set = set()   # group ids met, for the count in the closing report
+        print(f"\n  Writing {self.output.name} ...", flush=True)
+        with partial.open("w", encoding="utf-8-sig", newline="") as target:
+            writer = csv.writer(target)
+            writer.writerow(header)
+            for run in self.runs:
+                scope_at = run.at.get(consolidation.primary_scope)
+                if scope_at is None:
+                    scope_at = agent_column(run.header, consolidation.primary_scope)
+                for row in stream_rows(run.dataset):
+                    if not self._in_scope(run, row):
+                        continue
+                    output = [row[position] if position is not None and position < len(row)
+                              else "" for position in run.mapping]
+
+                    corrected = False
+                    for position, name in ((description_at, "Enriched_Purchase_Description"),
+                                           (short_at, "Enriched_Description_Short")):
+                        value = run.cell(row, name)
+                        if position is None or not value.strip():
+                            continue
+                        fixed = self._corrected(value, run, row)
+                        corrected = corrected or fixed != value
+                        output[position] = fixed
+                    if run.cell(row, "Enriched_Purchase_Description").strip():
+                        counts["descriptions"] += 1
+                        counts["descriptions_corrected"] += corrected
+
+                    key = self._line_key(run, row)
+                    answer = groups[key]
+                    for position, value in zip(group_at, answer):
+                        if position is not None:
+                            output[position] = value
+                    label, naming = answer[label_at], answer[naming_at]
+                    if label == "Other":
+                        counts["in_other"] += 1
+                    elif label == "Not described":
+                        counts["not_described"] += 1
+                    else:
+                        counts["in_named_group"] += 1
+                        counts["in_named_group_by_supplier_pattern"] += (
+                            naming == "supplier pattern")
+                        names.add((answer[GROUP_COLUMNS.index("AI_Purchase_Group_Id")]))
+
+                    run_number = run.cell(row, ROW_NUMBER_COLUMN).strip()
+                    if number_at is not None:
+                        output[number_at] = self._new_row_number(run, row)
+
+                    findings = [""] * len(agent4_names)
+                    supplier_key = consolidation.key_for(
+                        run.cell(row, LINE_SUPPLIER_NAME), run.cell(row, LINE_SUPPLIER_ID))
+                    scope_value = (row[scope_at] if scope_at is not None
+                                   and scope_at < len(row) else "")
+                    values = consolidation.values_for(supplier_key, scope_value)
+                    if values is not None:
+                        counts["with_agent4_finding"] += 1
+                        for at, value in enumerate(values[:len(agent4_names)]):
+                            findings[at] = value
+                    if supplier_key and key_out is not None:
+                        findings[key_out - width] = supplier_key
+
+                    seen[key] = seen.get(key, 0) + 1
+                    spend = run.cell(row, "Spend_EUR")
+                    amount = _plain_amount(spend)
+                    counts["spend_all_rows_eur"] += amount
+                    if seen[key] == 1:
+                        counts["spend_once_eur"] += amount
+                    writer.writerow(output + findings + [
+                        run.folder.name, run_number, self.copies.get(key, 1), seen[key],
+                        spend if seen[key] == 1 else "0", "Yes" if corrected else "No"])
+                    counts["rows"] += 1
+        partial.replace(self.output)
+        counts["sievo_rows"] = len(seen)
+        counts["groups"] = len(names)
+        counts["spend_all_rows_eur"] = round(counts["spend_all_rows_eur"], 2)
+        counts["spend_once_eur"] = round(counts["spend_once_eur"], 2)
+        counts["columns"] = len(header)
+        self.summary["final"] = counts
+        self.summary["primary_scope"] = consolidation.primary_scope
+
+    def run(self) -> Dict[str, Any]:
+        started = time.time()
+        for stale in (*self.settings.work_dir.glob(f"*{FINAL_PARTIAL_SUFFIX}"),
+                      *self.output_dir.glob(f"*{FINAL_PARTIAL_SUFFIX}")):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        needed = sum(run.dataset.stat().st_size for run in self.runs)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(self.output_dir).free
+        if free < needed * 1.1:
+            raise SystemExit(f"The final file needs about {needed / 1e9:,.1f} GB free in "
+                             f"{self.output_dir} and only {free / 1e9:,.1f} GB is. Nothing "
+                             f"has been changed.")
+        self._write_lines()
+        groups_path = self._regroup()
+        consolidation = self._consolidate(groups_path)
+        self._write_final(self._load_groups(groups_path), consolidation)
+
+        directory = self.settings.work_dir / "agent2_group_directory.csv"
+        if directory.is_file():
+            shutil.copy2(directory, self.output_dir / FINAL_GROUPS_NAME)
+        self.summary.update({
+            "written": datetime.datetime.now().isoformat(timespec="seconds"),
+            "work_folder": str(self.settings.work_dir),
+            "seconds": round(time.time() - started, 1),
+            "script_version": AGENT_VERSION,
+        })
+        (self.output_dir / FINAL_SUMMARY_NAME).write_text(
+            json.dumps(self.summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._report()
+        return self.summary
+
+    def _model_gaps(self) -> Tuple[int, int]:
+        """Categories and purchases Agent 2 asked the model about in vain."""
+        try:
+            payload = json.loads((self.settings.work_dir / "agent2_run_manifest.json")
+                                 .read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return 0, 0
+        statistics = payload.get("statistics") or {}
+        return (int(statistics.get("categories_not_split") or 0),
+                int(statistics.get("purchases_not_placed") or 0))
+
+    def _report(self) -> None:
+        final = self.summary.get("final") or {}
+        rows = final.get("rows") or 1
+        spend = sum(float(((self.summary.get(tag) or {}).get("usage") or {})
+                          .get("estimated_cost_usd") or 0) for tag in ("Agent 2", "Agent 4"))
+
+        def share(count: int) -> str:
+            return f"{count:,} ({count / rows:.1%})"
+
+        print("\n" + "=" * 79)
+        print("  The final file")
+        print("=" * 79)
+        print(f"  Rows                              : {final.get('rows', 0):,}")
+        print(f"  Distinct Sievo rows               : {final.get('sievo_rows', 0):,}")
+        print(f"  Spend, every row                  : EUR {final.get('spend_all_rows_eur', 0):,.0f}")
+        print(f"  Spend, each Sievo row once        : EUR {final.get('spend_once_eur', 0):,.0f}")
+        print(f"  Descriptions                      : {final.get('descriptions', 0):,}, "
+              f"{final.get('descriptions_corrected', 0):,} corrected")
+        print(f"  Purchase groups                   : {final.get('groups', 0):,}")
+        print(f"  Rows in a named group             : {share(final.get('in_named_group', 0))}")
+        print(f"    of which from the supplier's pattern : "
+              f"{share(final.get('in_named_group_by_supplier_pattern', 0))}")
+        print(f"  Rows in Other                     : {share(final.get('in_other', 0))}")
+        print(f"  Rows not described                : {share(final.get('not_described', 0))}")
+        print(f"  Rows with an Agent 4 finding      : {share(final.get('with_agent4_finding', 0))}")
+        if spend:
+            print(f"  Model spend                       : ${spend:,.2f}")
+        print(f"  Time                              : "
+              f"{human_seconds(self.summary.get('seconds') or 0)}")
+        unsplit, unplaced = self._model_gaps()
+        if self.settings.use_llm and (unsplit or unplaced):
+            print()
+            print(f"  The model gave no usable answer for {unsplit:,} categor(ies), which "
+                  f"carry their")
+            print(f"  category's name, and {unplaced:,} purchase(s), which are in Other. "
+                  f"To ask again")
+            print("  for those only, run the same command with --force: every answer "
+                  "already given")
+            print("  is read back from the cache.")
+        print()
+        print("  Give the dashboard this one file:")
+        print(f"    {self.output}")
+        print(f"  It replaces {COMBINED_INPUT_NAME} and needs no other file joined to it:")
+        print("  the groups and the Agent 4 columns in it are the new ones.")
+        print(f"  {ROW_NUMBER_COLUMN} is now different on every row. {RUN_ROW_NUMBER_COLUMN} "
+              f"and {RUN_FOLDER_COLUMN}")
+        print("  hold what it was. To count each Sievo row once, keep the rows where")
+        print("  Sievo_Row_Copy_Number is 1, or add up Spend_EUR_Counted_Once.")
+        print(f"  The groups are listed in {FINAL_GROUPS_NAME}.")
+        print("=" * 79 + "\n")
+
+
+_AMOUNT_CHARACTERS = re.compile(r"[^0-9,.\-]")
+
+
+def _plain_amount(value: str) -> float:
+    """An amount as the agents write it, for the totals in the closing report."""
+    text = _AMOUNT_CHARACTERS.sub("", value or "")
+    if not text:
+        return 0.0
+    if "," in text and "." in text:
+        text = (text.replace(".", "").replace(",", ".")
+                if text.rfind(",") > text.rfind(".") else text.replace(",", ""))
+    elif "," in text:
+        text = text.replace(",", ".")
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def finished_runs(here: Path) -> List[Path]:
+    """The finished runs this script would offer to correct, oldest first."""
+    return [here / name for name in FINAL_DEFAULT_FOLDERS
+            if (here / name / OUTPUT_CSV).is_file()]
+
+
+def final_dataset(args: argparse.Namespace, folders: Optional[Sequence[str]] = None) -> int:
+    """``--final-dataset``, and the first choice of a plain interactive run."""
+    here = Path(__file__).resolve().parent
+
+    def located(name: str) -> Path:
+        path = Path(name.strip().strip("\"'")).expanduser()
+        if not path.is_absolute() and not path.exists() and (here / path).exists():
+            path = here / path
+        return path.resolve()
+
+    env = read_dotenv(here / ".env")
+    chosen = [located(name) for name in (folders or [])] or finished_runs(here)
+    output_dir = located(args.final_output) if args.final_output else None
+    categories: Sequence[str] = () if args.all_categories else FINAL_DEFAULT_CATEGORIES
+    infer = not args.no_supplier_inference
+    use_llm = not args.no_llm
+    spend_limit = spend_limit_from(args, env)
+    if spend_limit is None:
+        spend_limit = FINAL_DEFAULT_BUDGET
+    interactive = not args.non_interactive
+
+    if interactive:
+        print("\nPress Enter to accept the value shown in brackets.\n")
+        answer = ask("Finished run folders, oldest first, separated by commas",
+                     ", ".join(_shown(folder, here) for folder in chosen))
+        chosen = [located(name) for name in answer.split(",") if name.strip()]
+        default_output = output_dir or (chosen[-1] if chosen else here)
+        output_dir = located(ask("Folder to write the final file into",
+                                 _shown(default_output, here)))
+        if not args.all_categories:
+            print(f"\n  The file the dashboard has holds two Category L1 only: "
+                  f"{' and '.join(FINAL_DEFAULT_CATEGORIES)}.")
+            if not ask_yes_no("Keep only those two", True):
+                categories = ()
+        print("\n  More than half the lines have no description to group on. Such a line "
+              "can be given")
+        print("  the group its supplier's described lines in the same category mostly "
+              "have. Those")
+        print("  lines are marked 'supplier pattern' and low confidence; the rest stay "
+              "'Not described'.")
+        infer = ask_yes_no("Group undescribed lines by their supplier's pattern", infer)
+        print()
+        use_llm = ask_yes_no("Let Agent 2 use the language model (without it no category "
+                             "is split)", use_llm)
+        if use_llm:
+            print("\n  Only Agent 2 and Agent 4 call the model here. Expect roughly $10 "
+                  "to $20 and one")
+            print("  to three hours. Reaching the figure stops the run; running it again "
+                  "carries on.")
+            spend_limit = ask_amount(
+                "Budget for the language model, in dollars (0 for no ceiling)", spend_limit)
+    if output_dir is None:
+        output_dir = chosen[-1] if chosen else here
+
+    settings = Settings(
+        source_dir=here,
+        results_dir=(output_dir / FINAL_WORK_DIR_NAME).resolve(),
+        lexicon_path=(Path(args.lexicon) if args.lexicon
+                      else here / "lexicon" / "procurement_lexicon.json").expanduser().resolve(),
+        cache_dir=(Path(args.cache) if args.cache else here / "cache").expanduser().resolve(),
+        force=args.force,
+        reuse=not args.no_reuse,
+        use_llm=use_llm,
+        llm_spend_limit=spend_limit,
+        agent_timeout=args.agent_timeout,
+        write_jsonl=False,
+        interactive=interactive,
+    )
+    job = FinalDataset(settings, chosen, output_dir, categories, infer, args.workers)
+    job.check()
+    if not job.explain(use_llm):
+        print("  Nothing has been changed.")
+        return 0
+    if use_llm:
+        preflight_model(here, args.skip_model_check)
+
+    settings.work_dir.mkdir(parents=True, exist_ok=True)
+    lock = ResultsLock(settings.results_dir)
+    refusal = lock.acquire()
+    if refusal:
+        LOGGER.error("Not starting: %s", refusal)
+        return 1
+    try:
+        job.run()
+    except KeyboardInterrupt:
+        job.chain.stop_live_agents()
+        print("\n  Stopped. The final file has not been written and the finished runs "
+              "are unchanged.")
+        print("  Run the same command again to carry on: the model's answers so far are "
+              "kept.")
+        return 130
+    finally:
+        lock.release()
+    return 0
+
+
+def _shown(path: Path, here: Path) -> str:
+    """A path as someone would type it from the repository folder."""
+    try:
+        return str(path.resolve().relative_to(here))
+    except ValueError:
+        return str(path)
+
+
+def choose_mode(here: Path) -> str:
+    """Ask a plain interactive run what it is for, when there is a choice."""
+    found = finished_runs(here)
+    if not found:
+        return "pipeline"
+    print(BANNER)
+    print("  Finished runs found: " + ", ".join(folder.name for folder in found))
+    print()
+    print("  What should this run do?")
+    print("    1  Correct the finished runs and write one final file for the dashboard")
+    print("       (descriptions corrected, new purchase groups, Agent 4 once over all)")
+    print("    2  Run the agents over a purchase table from the start")
+    while True:
+        answer = ask("Choice", "1").strip()
+        if answer in ("1", "2"):
+            return "final" if answer == "1" else "pipeline"
+        print("    Enter 1 or 2.")
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -4271,6 +5023,25 @@ def build_parser() -> argparse.ArgumentParser:
                          help="where the combined Agent 4 run is kept "
                               f"(default: {COMBINED_AGENT4_DIR_NAME})")
 
+    final = parser.add_argument_group("one corrected file over finished runs")
+    final.add_argument("--final-dataset", metavar="DIR", nargs="*", default=None,
+                       help="finished results folders, oldest first, to correct and "
+                            f"write as one {FINAL_DATASET_NAME}: descriptions corrected "
+                            "in place, Agent 2 regrouping every line together, Agent 4 "
+                            "once over all. Agents 1 and 3 do not run. With no folder "
+                            f"named: {' and '.join(FINAL_DEFAULT_FOLDERS)}")
+    final.add_argument("--final-output", metavar="DIR",
+                       help="folder to write the final file into "
+                            "(default: the last folder named)")
+    final.add_argument("--all-categories", action="store_true",
+                       help="keep every Category L1 rather than only "
+                            f"{' and '.join(FINAL_DEFAULT_CATEGORIES)}")
+    final.add_argument("--no-supplier-inference", action="store_true",
+                       help="leave lines with no description as 'Not described' rather "
+                            "than giving them their supplier's usual group")
+    final.add_argument("--workers", metavar="N", type=int, default=3,
+                       help="model requests Agent 2 keeps in flight at once (default 3)")
+
     output = parser.add_argument_group("output")
     output.add_argument("--no-jsonl", action="store_true", help="skip the JSONL export")
 
@@ -4501,6 +5272,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.combine_agent4:
         return combine_agent4(args)
+    if args.final_dataset is not None:
+        print(BANNER, flush=True)
+        return final_dataset(args, args.final_dataset)
+    # A plain run with finished results beside it is asked what it is for,
+    # because by then the usual reason for running this is to correct them.
+    asked_for_pipeline = any((args.input, args.sources, args.results, args.catalogues,
+                              args.from_sources, args.no_reuse, args.force))
+    if not args.non_interactive and not asked_for_pipeline:
+        if choose_mode(Path(__file__).resolve().parent) == "final":
+            return final_dataset(args)
 
     settings = resolve_settings(args)
     if args.non_interactive:

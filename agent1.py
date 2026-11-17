@@ -100,7 +100,7 @@ from runtime import (
 LOGGER = logging.getLogger("agent1")
 
 AGENT_NAME = "Agent 1 - Improved Purchase Description"
-AGENT_VERSION = "1.11.0"
+AGENT_VERSION = "1.12.0"
 
 # The CSV module refuses very long fields by default. Procurement free-text
 # occasionally carries an entire pasted e-mail thread, and losing those rows to
@@ -1056,6 +1056,373 @@ def restore_source_specifications(published: str, *sources: str) -> str:
         lambda match: originals.get(_specification_signature(match.group(0)),
                                     match.group(0)),
         published)
+
+
+# ---------------------------------------------------------------------------
+# Paperwork numbers and cut-down supplier names in a published description
+# ---------------------------------------------------------------------------
+# Two faults Fortum reported in the published sentences, both of which come
+# from the source text rather than from the purchase. A line whose only text is
+# "MAALINJA OY/118" gives the model a supplier and an invoice number, and it
+# wrote the number up as an item number. And the foreign-word filter removed
+# the part of a company name that is an ordinary word in its own language,
+# leaving "purchased from OY". Both are repaired from the row's own fields, so
+# nothing here needs the model and a finished run can be corrected in place.
+
+_REFERENCE_FOLD = str.maketrans({"ł": "l", "Ł": "L", "ø": "o", "Ø": "O",
+                                 "æ": "ae", "Æ": "AE", "ß": "ss"})
+_NOT_ALPHANUMERIC = re.compile(r"[^0-9a-z]")
+
+
+def _plain_key(text: str) -> str:
+    """Letters and digits only, lower case and unaccented."""
+    decomposed = unicodedata.normalize("NFD", text or "")
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return _NOT_ALPHANUMERIC.sub("", stripped.translate(_REFERENCE_FOLD).lower())
+
+
+# What a sentence puts in front of a number to say what kind of number it is.
+# Any of these followed by the line's own invoice, document or order number is
+# a reference to the paperwork and not part of what was bought.
+_REFERENCE_LEAD = re.compile(
+    r"(?:[,;]\s*|\(\s*)?"
+    r"(?:\b(?:and|with|under|by|per|against|on|as|via|referenced\s+by|identified\s+by|"
+    r"identified\s+as|referenced\s+as|recorded\s+under|listed\s+under|billed\s+under|"
+    r"invoiced\s+under)\s+)?"
+    r"(?:\b(?:the|its|an|a)\s+)?"
+    r"\b(?:invoice\s+reference|invoice\s+number|invoice\s+no\.?|invoice|"
+    r"reference\s+number|reference\s+no\.?|references?|ref\.?|"
+    r"item\s+number|item\s+no\.?|items?|document\s+number|document|"
+    r"order\s+number|order|policy\s+number|customer\s+number|"
+    r"number|no\.?)\s*[:#]?\s*$",
+    re.IGNORECASE)
+_BARE_REFERENCE_LEAD = re.compile(r"(?:[,;]\s*|\(\s*|/\s*|[-\u2013]\s+)$")
+_REFERENCE_JOINER = re.compile(r"[\s/\-\u2013]+$")
+_LAST_CHUNK = re.compile(r"[^\s/]+$")
+_REFERENCE_TIDY = (
+    (re.compile(r"\(\s*\)"), ""),
+    (re.compile(r"\s+([.,;:)])"), r"\1"),
+    (re.compile(r",\s*(?=[.,;])"), ""),
+    (re.compile(r"([.;])\s*\."), r"\1"),
+    (re.compile(r"\s{2,}"), " "),
+)
+_DANGLING_REFERENCE_TAIL = re.compile(
+    r"[\s,;/\-\u2013]+(?:and|or|with|under|by|per|of|for|to|in|on|at|from|as|via|the|a|an|"
+    r"reference|references|ref|item|items|invoice|number|no|identified|policy|code)"
+    r"\s*([.]?)\s*$",
+    re.IGNORECASE)
+# A number shorter than this can be a quantity, a size or a year, so it is
+# removed only where the sentence calls it a reference or hangs it on the
+# supplier's name.
+REFERENCE_BARE_MINIMUM = 5
+_REFERENCE_PATTERNS: Dict[str, Optional["re.Pattern[str]"]] = {}
+
+
+def _reference_pattern(reference: str) -> Optional["re.Pattern[str]"]:
+    """The reference as a sentence may write it, separators moved or dropped."""
+    if reference in _REFERENCE_PATTERNS:
+        return _REFERENCE_PATTERNS[reference]
+    core = _plain_key(reference)
+    pattern = None
+    if len(core) >= 2 and any(ch.isdigit() for ch in core):
+        body = r"[\s\-/._]*".join(re.escape(ch) for ch in core)
+        pattern = re.compile(r"(?<![0-9A-Za-z])" + body + r"(?![0-9A-Za-z])",
+                             re.IGNORECASE)
+    if len(_REFERENCE_PATTERNS) > 50000:
+        _REFERENCE_PATTERNS.clear()
+    _REFERENCE_PATTERNS[reference] = pattern
+    return pattern
+
+
+def _reads_as_name(word: str) -> bool:
+    """Written the way these extracts write a company: no lower-case letters."""
+    return any(ch.isalpha() for ch in word) and not any(ch.islower() for ch in word)
+
+
+def drop_document_references(text: str, references: Iterable[str],
+                             supplier: str = "") -> str:
+    """Take the line's own invoice, document and order numbers out of a sentence.
+
+    Only the numbers this row carries are removed, so a real article number in
+    the same sentence stays. Long numbers go wherever they stand. Short ones go
+    only where the sentence itself calls them a reference, or where they hang
+    on the supplier's name the way "MAALINJA OY - 118" does.
+    """
+    if not text:
+        return text
+    original = text
+    supplier_keys = {_plain_key(part) for part in (supplier or "").split()}
+    supplier_keys.discard("")
+    distinct = {str(value).strip() for value in references
+                if value is not None and str(value).strip()}
+    for reference in sorted(distinct, key=len, reverse=True):
+        pattern = _reference_pattern(reference)
+        if pattern is None:
+            continue
+        long_enough = len(_plain_key(reference)) >= REFERENCE_BARE_MINIMUM
+        position = 0
+        while True:
+            match = pattern.search(text, position)
+            if match is None:
+                break
+            before = text[:match.start()]
+            start: Optional[int] = None
+            lead = _REFERENCE_LEAD.search(before)
+            if lead is not None:
+                start = lead.start()
+            else:
+                joined = _REFERENCE_JOINER.sub("", before)
+                chunk = _LAST_CHUNK.search(joined)
+                word = chunk.group(0).strip(".,;:()\"'") if chunk else ""
+                if (word and _reads_as_name(word)
+                        and _plain_key(word) in supplier_keys):
+                    start = len(joined)
+                elif long_enough:
+                    bare = _BARE_REFERENCE_LEAD.search(before)
+                    start = bare.start() if bare is not None else match.start()
+            if start is None:
+                position = match.end()
+                continue
+            end = match.end()
+            removed = text[start:match.start()]
+            if "(" in removed:
+                closing = re.match(r"\s*\)", text[end:])
+                if closing is not None:
+                    end += closing.end()
+            rest = text[end:].lstrip()
+            # ", reference 123, was carried out" loses both of its commas.
+            if removed.lstrip()[:1] in (",", ";") and rest[:1] in (",", ";"):
+                rest = rest[1:].lstrip()
+            text = text[:start].rstrip() + " " + rest
+            position = max(0, start - 1)
+    if text == original:
+        return original
+    for tidy, replacement in _REFERENCE_TIDY:
+        text = tidy.sub(replacement, text)
+    previous = None
+    while previous != text:
+        previous = text
+        text = _DANGLING_REFERENCE_TAIL.sub(r"\1", text).strip()
+    text = text.strip(" ,;:-/")
+    return text if re.search(r"[A-Za-z]{3}", text) else ""
+
+
+# Legal forms that make a supplier a company. A supplier without one is very
+# often a sole trader, whose name is a person's and is left as it is written.
+SUPPLIER_LEGAL_FORMS = frozenset("""
+    oy oyj ab abp as asa aps ltd limited plc llc inc gmbh ag kg bv nv sa sas srl
+    spa kft doo ou ky ry hf ehf kb hb ay osk
+""".split())
+_RETIRED_SUPPLIER_MARK = re.compile(
+    r"[\s\-\u2013(]*\b(?:DO\s+NOT\s+USE|NOT\s+IN\s+USE|EI\s+K[ÄA]YT[ÖO]SS[ÄA])\b\)?",
+    re.IGNORECASE)
+_NAME_EDGE = ".,;:()\"'"
+_NAME_BREAK = ",;:)"
+_NAME_CONNECTORS = frozenset({"&", "+", "-", "\u2013"})
+_WORD = re.compile(r"\S+")
+_REPEATED_LEGAL_FORM = re.compile(r"\b([A-Z]{2,5})\s+\1\b")
+_BARE_LEGAL_FORM = re.compile(
+    r"\b(from|by)\s+(" + "|".join(sorted((form.upper() for form in SUPPLIER_LEGAL_FORMS),
+                                         key=len, reverse=True))
+    + r")(?=\s*[.,;]|\s*$|\s+[a-z])")
+_SUPPLIER_CLAUSE_LEAD = (r"(?:under\s+reference|with\s+reference|reference|identified\s+as|"
+                         r"identified\s+by|referenced\s+as|under)")
+_DELIVERED_VERB = re.compile(
+    r"\b(?:carried\s+out|provided|performed|supplied|delivered|completed|conducted)\b",
+    re.IGNORECASE)
+
+
+def supplier_display_name(supplier: str) -> str:
+    """The supplier's name without the housekeeping marks the ERP adds to it."""
+    name = _RETIRED_SUPPLIER_MARK.sub("", supplier or "")
+    return _WHITESPACE.sub(" ", name).strip(" -\u2013,")
+
+
+def _supplier_layout(name: str) -> Tuple[List[str], List[int], str]:
+    """The name's words as keys, where each starts in the joined key, and the key."""
+    keys: List[str] = []
+    offsets: List[int] = []
+    joined = ""
+    for part in name.split():
+        key = _plain_key(part)
+        if not key:
+            continue
+        keys.append(key)
+        offsets.append(len(joined))
+        joined += key
+    return keys, offsets, joined
+
+
+def _is_company_name(keys: Sequence[str], joined: str) -> bool:
+    return (any(key in SUPPLIER_LEGAL_FORMS for key in keys)
+            or joined.endswith(("spzoo", "spj", "spk")))
+
+
+def restore_supplier_name(text: str, supplier: str) -> str:
+    """Write the supplier's name in full where only part of it was left.
+
+    A run of capital words that are the supplier's own, in the order its name
+    has them, is the supplier with a word missing: "from OY" for LINDSTRÖM OY,
+    "ARKKITEHDIT OY" for L ARKKITEHDIT OY. It is replaced with the name as the
+    ERP holds it. A run with another capital word beside it is a different
+    company and is left alone.
+    """
+    name = supplier_display_name(supplier)
+    if not text or not name:
+        return text
+    keys, offsets, joined = _supplier_layout(name)
+    if _is_company_name(keys, joined) and len(keys) >= 2:
+        text = _restore_runs(text, name, keys, offsets, joined)
+    if len(joined) >= 3:
+        text = _BARE_LEGAL_FORM.sub(lambda match: f"{match.group(1)} {name}", text)
+        text = _collapse_supplier_mentions(text, name)
+    return text
+
+
+def _restore_runs(text: str, name: str, keys: Sequence[str],
+                  offsets: Sequence[int], joined: str) -> str:
+    text = _REPEATED_LEGAL_FORM.sub(
+        lambda match: (match.group(1) if match.group(1).lower() in SUPPLIER_LEGAL_FORMS
+                       else match.group(0)), text)
+    # Where the name already stands in full there is nothing to restore, and
+    # its words must not be read as the start of a shorter mention.
+    whole_name = re.compile(r"\s+".join(re.escape(part) for part in name.split()),
+                            re.IGNORECASE)
+    settled = [match.span() for match in whole_name.finditer(text)]
+
+    def is_settled(position: int) -> bool:
+        return any(begin <= position < finish for begin, finish in settled)
+
+    # A supplier the ERP holds in mixed case is written that way in a sentence
+    # too, so a capital first letter is all that can be asked of its words.
+    mixed_case = any(ch.islower() for ch in name)
+    name_breaks = "".join(mark for mark in _NAME_BREAK if mark not in name)
+    bracketed = "(" in name
+
+    def could_be_name(core: str) -> bool:
+        return _reads_as_name(core) or (mixed_case and core[:1].isupper())
+
+    words = [(match.start(), match.end(), match.group(0))
+             for match in _WORD.finditer(text)]
+    pieces: List[str] = []
+    cursor = 0
+    index = 0
+    while index < len(words):
+        start, _, word = words[index]
+        core = word.strip(_NAME_EDGE)
+        key = _plain_key(core)
+        if is_settled(start) or not (could_be_name(core) and key in keys):
+            index += 1
+            continue
+        at = keys.index(key)
+        reached = offsets[at] + len(key)
+        taken = key
+        whole = [key]
+        last = index
+        while last + 1 < len(words) and words[last][2][-1:] not in name_breaks:
+            if is_settled(words[last + 1][0]):
+                break
+            follower = words[last + 1][2]
+            follower_core = follower.strip(_NAME_EDGE)
+            follower_key = _plain_key(follower_core)
+            step = 1
+            if (follower in _NAME_CONNECTORS and last + 2 < len(words)
+                    and not is_settled(words[last + 2][0])):
+                # "TRANSPORT & LOGISTICS": the sign is part of the name.
+                follower = words[last + 2][2]
+                follower_core = follower.strip(_NAME_EDGE)
+                follower_key = _plain_key(follower_core)
+                step = 2
+            if ((follower.startswith("(") and not bracketed) or not follower_key
+                    or not could_be_name(follower_core)):
+                break
+            found = joined.find(follower_key, reached)
+            if found < 0:
+                break
+            reached = found + len(follower_key)
+            taken += follower_key
+            if follower_key in keys:
+                whole.append(follower_key)
+            last += step
+
+        before = words[index - 1][2] if index else ""
+        after = words[last + 1][2] if last + 1 < len(words) else ""
+        before_core = before.strip(_NAME_EDGE)
+        after_core = after.strip(_NAME_EDGE)
+        beside_another_name = (
+            (before_core and _reads_as_name(before_core) and len(before_core) > 1
+             and before[-1:] not in _NAME_BREAK + ".")
+            or (after_core and _reads_as_name(after_core) and len(after_core) > 1
+                and words[last][2][-1:] not in _NAME_BREAK + "."
+                and not after.startswith("(")))
+        holds_form = any(part in SUPPLIER_LEGAL_FORMS for part in whole)
+        distinctive = any(len(part) >= 4 and part not in SUPPLIER_LEGAL_FORMS
+                          for part in whole)
+        # Without its legal form a supplier's word is as likely a brand or a
+        # building: "TONISCO shut-off valves". It is taken for the supplier only
+        # where the sentence ends on it after "from" or "by".
+        introduced = before_core.lower() in ("from", "by")
+        closes = last + 1 >= len(words) or words[last][2][-1:] in ".,;"
+        complete = taken == joined
+        wanted = complete or holds_form or (distinctive and introduced and closes)
+        if (beside_another_name and not complete) or not wanted:
+            index = last + 1
+            continue
+
+        final = words[last][2]
+        trailing = final[len(final.rstrip(_NAME_EDGE)):]
+        if trailing.startswith(")") and "(" in final:
+            trailing = trailing[1:]
+        # A full stop that is part of the legal form is not written twice.
+        if trailing.startswith(".") and name.endswith("."):
+            trailing = trailing[1:]
+        leading = word[:len(word) - len(word.lstrip("(\"'"))]
+        if leading.startswith("(") and name.startswith("("):
+            leading = leading[1:]
+        pieces.append(text[cursor:start])
+        pieces.append(leading + name + trailing)
+        cursor = words[last][1]
+        index = last + 1
+    if not pieces:
+        return text
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _collapse_supplier_mentions(text: str, name: str) -> str:
+    """One mention of the supplier where the source text repeated it."""
+    escaped = re.escape(name)
+    text = re.sub(rf"({escaped})(?:\s*[-\u2013/,]?\s*{escaped})+", r"\1", text,
+                  flags=re.IGNORECASE)
+    clause = re.compile(rf"(,?\s*)\b{_SUPPLIER_CLAUSE_LEAD}\s+({escaped})", re.IGNORECASE)
+    match = clause.search(text)
+    if match is None:
+        return text
+    elsewhere = text[:match.start()] + text[match.end():]
+    if re.search(escaped, elsewhere, re.IGNORECASE):
+        replacement = ""
+    else:
+        joiner = "by" if _DELIVERED_VERB.search(text[:match.start()]) else "from"
+        replacement = f" {joiner} {match.group(2)}"
+    text = text[:match.start()] + replacement + text[match.end():]
+    text = re.sub(r"\s+([.,;:)])", r"\1", text)
+    return _WHITESPACE.sub(" ", text).strip()
+
+
+def repair_published_description(text: str, supplier: str,
+                                 references: Iterable[str]) -> str:
+    """A published description without paperwork numbers or a cut-down supplier.
+
+    Never returns less than it was given: a sentence that would be emptied by
+    the repair is a sentence that said nothing else, and it is kept so that the
+    row does not silently change from described to undescribed.
+    """
+    if not text:
+        return text
+    name = supplier_display_name(supplier)
+    repaired = drop_document_references(text, references, name)
+    repaired = restore_supplier_name(repaired, name)
+    return repaired or text
 
 
 def tidy_published_english(text: str) -> str:
@@ -5028,6 +5395,11 @@ class Agent1:
                     description.description = mended
                     description.short_description = mended_short
 
+        # The supplier's own name is a name whatever language its words are in.
+        # Without this the foreign-word filter took the Finnish or Swedish part
+        # out of it and published "purchased from OY".
+        description.protected_names = frozenset(description.protected_names) | protected_keys(
+            [record.business.get("supplier_name", "")])
         protected = description.protected_names
         description.description = self.translator.ensure_english(
             description.description, published=True, protected=protected)
@@ -5073,16 +5445,26 @@ class Agent1:
         """Assemble one row of the unified table."""
         business = record.business
         sources = list(record.own_descriptions_raw) + [record.primary_text]
+        supplier = business.get("supplier_name", "")
+        # The line's own paperwork numbers. A sentence that quotes one of them
+        # is describing the invoice, not the purchase.
+        references = (record.keys.get("invoice_number", ""),
+                      record.keys.get("document_number", ""),
+                      record.keys.get("po_number", ""))
         return {
             # A leftover source-language noun costs that word, not the row. This
             # gate used to blank the whole description, which is how a good
             # English sentence disappeared over a single Finnish token.
-            "Enriched_Purchase_Description": restore_source_specifications(
-                keep_published_english(description.description,
-                                      description.protected_names), *sources),
-            "Enriched_Description_Short": restore_source_specifications(
-                keep_published_english(description.short_description,
-                                      description.protected_names), *sources),
+            "Enriched_Purchase_Description": repair_published_description(
+                restore_source_specifications(
+                    keep_published_english(description.description,
+                                           description.protected_names), *sources),
+                supplier, references),
+            "Enriched_Description_Short": repair_published_description(
+                restore_source_specifications(
+                    keep_published_english(description.short_description,
+                                           description.protected_names), *sources),
+                supplier, references),
             # Never blank. Fortum asked for "Unclear" rather than an empty cell,
             # and a header, subtotal or empty row is the clearest case of a line
             # that does not say what was purchased.
@@ -5406,14 +5788,22 @@ class Agent1:
                     match_tier=line.get("Match_Tier") or "none",
                     described=True)
                 source = line.get("Original_Description", "")
+                supplier = line.get("Supplier_Name", "")
+                references = (line.get("Invoice_Number", ""),
+                              line.get("Document_Number", ""),
+                              line.get("PO_Number", ""))
                 writer.writerow([
                     line.get("Source_Row_Number", ""), line.get("Row_Id", ""),
-                    restore_source_specifications(
-                        keep_published_english(result.description,
-                                               result.protected_names), source),
-                    restore_source_specifications(
-                        keep_published_english(result.short_description,
-                                               result.protected_names), source),
+                    repair_published_description(
+                        restore_source_specifications(
+                            keep_published_english(result.description,
+                                                   result.protected_names), source),
+                        supplier, references),
+                    repair_published_description(
+                        restore_source_specifications(
+                            keep_published_english(result.short_description,
+                                                   result.protected_names), source),
+                        supplier, references),
                     result.item_or_service or "Unclear",
                     confidence, band, json.dumps(factors, sort_keys=True),
                     result.basis,

@@ -18,6 +18,11 @@ Answers the questions of the spend analytics deck
     its agent outputs), those purchase groups replace the ones in the dataset,
     joined on the source row number. --keep-dataset-groups turns that off.
 
+    Where all_agents.py has written its final file (all_agents_final.csv), that
+    one file is read instead of the runs' own datasets. It already carries the
+    corrected descriptions and the regrouping, so nothing is joined to it, and
+    each Sievo row is counted once however often the extract repeats it.
+
     The figures and the words
     -------------------------
     Every number is computed here, deterministically, from the lines. The model
@@ -76,13 +81,17 @@ from runtime import SpendLimitReached, configure_process_logging, model_environm
 LOGGER = logging.getLogger("spend_analysis")
 
 AGENT_NAME = "Spend Analysis - AI Spend Analytics"
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "1.4.0"
 
 DEFAULT_RUN_FOLDERS = ("new_results_llm", "may_dec_results")
 DEFAULT_CATEGORIES_L1 = ("Energy assets", "Indirect Services and Materials")
 DATASET_NAME = "all_agents_dataset.csv"
 COMBINED_DATASET_NAME = "all_agents_combined.csv"
 DATASET_NAMES = (COMBINED_DATASET_NAME, DATASET_NAME)
+# Written by all_agents.py --final-dataset over all the runs together. Where it
+# exists it is the whole input: reading a run's own dataset beside it would
+# count that run's lines twice.
+FINAL_DATASET_NAME = "all_agents_final.csv"
 REGROUPED_NAME = "updated_agent2_v3_purchase_groups.csv"
 COMBINED_MARKER = ".agent4_combined.json"
 ORDER_TEXT_MARKER = ".order_text_update.json"
@@ -126,6 +135,7 @@ FIELDS: Dict[str, Tuple[str, ...]] = {
                 "Document_Number", "DOCUMENT_NUMBER", "Document number"),
     "row_type": ("Row_Type",),
     "duplicate": ("Is_Duplicate",),
+    "sievo_copy": ("Sievo_Row_Copy_Number",),
     "item_or_service": ("Agent1_Item_Or_Service",),
     "description": ("Enriched_Purchase_Description",),
     "short": ("Enriched_Description_Short",),
@@ -156,7 +166,7 @@ FIELDS: Dict[str, Tuple[str, ...]] = {
 }
 
 CATCH_ALL_GROUPS = {"", "other", "others", "unclassified", "unknown", "miscellaneous",
-                    "misc", "not classified", "(no group)"}
+                    "misc", "not classified", "(no group)", "not described"}
 NO_PO_VALUES = {"", "-", "0", "#", "n/a", "na", "none", "null", "no po", "no po number",
                 "not found", "missing", "(blank)", "blank"}
 
@@ -343,6 +353,10 @@ class RunInput:
 
 
 def default_inputs(here: Path) -> List[Path]:
+    for name in reversed(DEFAULT_RUN_FOLDERS):
+        for folder in (here / name, here / "results" / name):
+            if (folder / FINAL_DATASET_NAME).is_file():
+                return [folder / FINAL_DATASET_NAME]
     found = []
     for name in DEFAULT_RUN_FOLDERS:
         candidates = [folder / dataset for folder in (here / name, here / "results" / name)
@@ -379,6 +393,13 @@ def dataset_rows(handle) -> Iterable[List[str]]:
 
 def prepare_input(path: Path, keep_groups: bool) -> RunInput:
     run = RunInput(path=path, name=path.parent.name)
+    if path.name == FINAL_DATASET_NAME:
+        # Its row numbers were renumbered across the runs, so a regrouping file
+        # keyed on one run's row numbers must not be joined to it.
+        run.notes.append("The final file of all_agents.py --final-dataset: descriptions "
+                         "corrected, one regrouping and one Agent 4 over all the runs, "
+                         "each Sievo row counted once.")
+        return run
     regroup = run.work / REGROUPED_NAME
     if regroup.is_file() and not keep_groups:
         with regroup.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -566,6 +587,11 @@ class Aggregates:
             run.excluded_subtotal += 1
             return
         if get(row, "duplicate").casefold() == "yes":
+            run.excluded_duplicate += 1
+            return
+        # Only the final file has this. A second copy of a Sievo row is the same
+        # purchase again, not a second purchase.
+        if get(row, "sievo_copy") not in ("", "1"):
             run.excluded_duplicate += 1
             return
         year, month = get(row, "year"), get(row, "month")

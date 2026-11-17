@@ -905,6 +905,73 @@ weighted by spend, so a combination made before that fix should be run again.
 The combined Agent 4 is then rerun rather than reused, because the script has
 changed.
 
+### One corrected file for the dashboard
+
+Fortum's review of the first dashboard found faults in the agents' output and
+in the file the dashboard was loaded from. This writes the file that replaces
+it, from the finished runs, without running Agent 1 or Agent 3 again:
+
+```
+python all_agents.py
+```
+
+With finished runs beside the script it asks what the run is for. Choice 1
+then asks for the finished run folders (oldest first), where to write, which
+categories to keep and the model budget. Unattended, the same is:
+
+```
+python all_agents.py --final-dataset new_results_llm may_dec_results --non-interactive
+```
+
+What it does, in order:
+
+- **Agent 1 is not run.** Its descriptions are corrected in place from each
+  line's own fields. The line's invoice, document and order number is taken
+  out of the sentence, where it had been written up as an item number
+  ("under item number 7510349"). A supplier name the foreign-word filter had
+  cut down is written in full ("purchased from OY" becomes "purchased from
+  LINDSTRÖM OY"). The same rule now runs inside Agent 1, so a later full run
+  publishes the corrected form directly.
+- **Agent 2 regroups every line of all the runs together**, in its tender
+  scope mode (`agent2.py --tender-scopes`). Within each Sievo category the
+  model is shown what is bought and splits it into the scopes a buyer would
+  put into one request for quotation, at most 20 per category, and every
+  purchase is then placed in one. A group therefore sits inside one category,
+  is never named after a single line, and needs at least three lines. A line
+  with no description is not used to form groups. It is `Not described`, or,
+  unless `--no-supplier-inference` is given, takes the group that its
+  supplier's described lines in the same category mostly have, marked
+  `supplier pattern` in `AI_Purchase_Group_Naming` with low confidence.
+- **Agent 3 is not run.** Its columns are carried over as they are.
+- **Agent 4 runs once** over all the runs on the new groups, counting each
+  Sievo row once.
+
+The result is `all_agents_final.csv` in the last folder named, with the
+groups listed in `all_agents_final_groups.csv` and the counts in
+`all_agents_final_summary.json`. The finished runs are only read. The working
+files are in `final_dataset/all_agents/` beside the final file.
+
+The final file has the first run's columns, so a dashboard built on
+`all_agents_combined.csv` reads it without remapping, and it needs no other
+file joined to it. Three things differ and matter to whoever loads it:
+
+- `Source_Row_Number` is different on every row. It restarts in every run, so
+  removing duplicates on it, or joining another file on it, mixed the two
+  periods up. Each later run's numbers are moved up by a round figure;
+  `Run_Row_Number` and `Run_Folder` hold the original.
+- The extracts repeat a Sievo row up to a hundred times. Every copy is kept
+  and carries the same group. `Sievo_Row_Copies` says how many there are and
+  `Sievo_Row_Copy_Number` which one a row is; keep the rows numbered 1, or
+  add up `Spend_EUR_Counted_Once`, to count each Sievo row once.
+- `Description_Corrected` says whether the row's description was changed.
+
+Only Category L1 `Energy assets` and `Indirect Services and Materials` are
+kept, as in the file the dashboard has; `--all-categories` keeps everything.
+Only Agent 2 and Agent 4 call the model. If the run stops, at the budget or
+otherwise, running it again reads the answers already paid for from the cache
+and reuses a finished Agent 2. `SpendAnalysis.py` reads the final file in
+place of the runs' own datasets once it exists.
+
 ### Spend analysis over the twelve months
 
 `SpendAnalysis.py` answers the questions of the spend analytics deck from the
